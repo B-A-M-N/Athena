@@ -188,7 +188,6 @@ def sandbox_argv(
         bwrap,
         "--die-with-parent",
         "--new-session",
-        "--unshare-pid",
         "--proc",
         "/proc",
         "--dev",
@@ -199,6 +198,10 @@ def sandbox_argv(
         "--tmpfs",
         "/tmp",
     ]
+    # Network namespaces require NETLINK_ROUTE during Bubblewrap setup.  On
+    # locked-down hosts that already reject socket creation, retain that
+    # inherited deny boundary instead of making bwrap setup fail; a socket-
+    # capable host still receives an isolated namespace.
     if network_policy and network_policy != "allow" and not _network_syscalls_denied():
         command.append("--unshare-net")
 

@@ -60,6 +60,7 @@ class EventCategory(str, enum.Enum):
     VERIFICATION_STARTED = "VerificationStarted"
     VERIFICATION_CHECK_COMPLETED = "VerificationCheckCompleted"
     VERIFICATION_COMPLETED = "VerificationCompleted"
+    RELIABILITY_TELEMETRY = "ReliabilityTelemetry"
     CANDIDATE_READY_FOR_REVIEW = "CandidateReadyForReview"
     CANDIDATE_APPLY_REQUESTED = "CandidateApplyRequested"
     CANDIDATE_APPLIED = "CandidateApplied"

@@ -10,9 +10,9 @@ owns the semantics.
 """
 
 from __future__ import annotations
+from athena.capabilities.operations import native_descriptor
 
 from athena.protocol.capabilities import (
-    CapabilityDescriptor,
     CapabilityOrigin,
     CapabilityRequest,
     CapabilityResult,
@@ -20,7 +20,7 @@ from athena.protocol.capabilities import (
     EffectClass,
 )
 
-INPUT_REQUEST_DESCRIPTOR = CapabilityDescriptor(
+INPUT_REQUEST_DESCRIPTOR = native_descriptor(
     id="request_input",
     description=(
         "Ask the operator a clarifying question when required information is "

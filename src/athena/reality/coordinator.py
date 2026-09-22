@@ -20,22 +20,23 @@ from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any, Protocol
 
-from athena.kernel.termination import TerminationDecision
+from athena.concurrency.autonomy import resolve_autonomy_value
 from athena.protocol.events import EV, make_event
+from athena.protocol.reality import ExecutionDisposition
+from athena.protocol.termination import TerminationDecision
 from athena.protocol.tasks import (
     Criterion,
     MutationMode,
     TaskSpec,
     TaskStatus,
-    VerificationSpec,
-    VerificationType,
     WorkspaceSpec,
 )
-from athena.reality.gate import ExecutionDisposition
+from athena.reality.candidate_verification import CandidateVerificationService
 from athena.reality.completion import CompletionJournal
-from athena.verification import VerificationPlanner, proof_subsumes, verification_proof_id
+from athena.verification import VerificationPlanner
 
 __all__ = [
+    "CandidateVerificationService",
     "CandidateVerifier",
     "RealityCompletionResult",
     "RealityCoordinator",
@@ -133,16 +134,23 @@ class RealityCoordinator:
     ) -> None:
         self._shadow = shadow_engine
         self._gate = reality_gate
-        self._verifier = candidate_verifier
-        self._default_source = default_criteria_source
-        self._planner = verification_planner or VerificationPlanner()
-        self._project_index_provider = project_index_provider
-        self._plans: dict[str, dict[str, Any]] = {}
+        self._candidate_verification = CandidateVerificationService(
+            candidate_verifier=candidate_verifier,
+            default_criteria_source=default_criteria_source,
+            verification_planner=verification_planner,
+            project_index_provider=project_index_provider,
+        )
+        self._planner = self._candidate_verification.planner
         self._event_sink = event_sink
         state_root = getattr(shadow_engine, "_state_root", None)
         self._completion = completion_journal or CompletionJournal(
             state_root or "/tmp/athena-reality"
         )
+
+    @property
+    def _plans(self) -> dict[str, dict[str, Any]]:
+        """Compatibility view of the candidate-proof plans for focused tests."""
+        return self._candidate_verification.plans
 
     async def _emit(self, event_type: str, payload: dict[str, Any], task: TaskSpec) -> None:
         if self._event_sink is None:
@@ -201,7 +209,9 @@ class RealityCoordinator:
                     | set(changes.get("deleted", ()))
                 )
             )
-            impact = await self._impact_for(branch.base_workspace.root, changed_resources)
+            impact = await self._candidate_verification.impact_for(
+                branch.base_workspace.root, changed_resources
+            )
         except (OSError, RuntimeError, TypeError, ValueError, AttributeError) as exc:
             _logger.warning("candidate impact analysis failed: %s", exc)
 
@@ -210,6 +220,7 @@ class RealityCoordinator:
             workspace=branch.shadow_workspace,
             changed_resources=changed_resources,
             impact=impact,
+            profile_workspace=branch.base_workspace,
         )
 
         # Detach the branch from the gate's routing map up front.  This lets
@@ -222,7 +233,7 @@ class RealityCoordinator:
         # recording verification so the certificate and the later commit use
         # exactly the same policy identity.
         if branch.policy_profile is None and task.metadata:
-            branch.policy_profile = task.metadata.get("autonomy")
+            branch.policy_profile = resolve_autonomy_value(task.metadata.get("autonomy"))
 
         await self._emit(
             EV["VERIFICATION_STARTED"],
@@ -270,9 +281,28 @@ class RealityCoordinator:
         await self._shadow.record_verification(
             branch,
             results,
-            verification_plan=self._plans.get(task.id),
+            verification_plan=self._candidate_verification.plan_for(task.id),
             proof_authority=(task.metadata or {}).get("_athena_gate_bundle"),
         )
+
+        # Reliability telemetry (review item 31).
+        await self._candidate_verification.record_reliability(
+            task.id,
+            event_sink=self._event_sink,
+            phase="candidate_verification",
+            branch_id=branch.id,
+            criteria_count=len(criteria),
+            passed_count=sum(1 for r in results if r.get("passed")),
+            failed_count=sum(1 for r in results if not r.get("passed")),
+            required_strength=(
+                (self._candidate_verification.plan_for(task.id) or {}).get("required_strength")
+                or "standard"
+            ),
+            work_class=(task.metadata or {}).get("_athena_work_class"),
+        )
+
+        if branch.status == "VERIFIED":
+            self._mark_runtime_late_escalation(task.id)
 
         if branch.status != "VERIFIED":
             # Known unsupported resource types are rejected before commit and
@@ -392,7 +422,7 @@ class RealityCoordinator:
     ) -> RealityCompletionResult:
         """Verify an in-place candidate in an isolated verification clone."""
         resources = self._transaction_resources(task.id, task.workspace)
-        impact = await self._impact_for(
+        impact = await self._candidate_verification.impact_for(
             task.workspace.root if task.workspace else "",
             resources,
         )
@@ -451,7 +481,7 @@ class RealityCoordinator:
                 task_id=task.id,
                 base_workspace=direct,
                 proposal=[],
-                profile=(task.metadata or {}).get("autonomy"),
+                profile=resolve_autonomy_value((task.metadata or {}).get("autonomy")),
             )
             try:
                 results = await self._verify_or_fail(
@@ -730,90 +760,15 @@ class RealityCoordinator:
         workspace: WorkspaceSpec | None = None,
         changed_resources: tuple[str, ...] = (),
         impact: Mapping[str, Any] | None = None,
+        profile_workspace: WorkspaceSpec | None = None,
     ) -> tuple[Criterion, ...]:
-        explicit = tuple(c for c in task.acceptance_criteria if c.required)
-        metadata = task.metadata or {}
-        if bool(metadata.get("_athena_self_host")):
-            from athena.self_host.gates import SelfHostGatePolicy
-
-            explicit = SelfHostGatePolicy.select_criteria(
-                explicit,
-                changed_resources=changed_resources,
-                impact=impact,
-                task_id=task.id,
-            )
-
-            if SelfHostGatePolicy.requires_dependency_proof(changed_resources):
-                dependency_command = SelfHostGatePolicy.dependency_environment_command(task.id)
-                if not any(
-                    getattr(c.verification, "command", None) == dependency_command for c in explicit
-                ):
-                    explicit += (
-                        Criterion(
-                            id="self_host_dependency_environment_proof",
-                            description=(
-                                "self-host dependency proof: isolated offline sync and Python gates "
-                                f"{dependency_command}"
-                            ),
-                            verification=VerificationSpec(
-                                type=VerificationType.COMMAND,
-                                command=dependency_command,
-                            ),
-                            required=True,
-                        ),
-                    )
-        baseline = tuple(
-            await self._derive_default_criteria(
-                task,
-                workspace=workspace,
-                changed_resources=changed_resources,
-                impact=impact,
-            )
+        return await self._candidate_verification.criteria_for(
+            task,
+            workspace=workspace,
+            changed_resources=changed_resources,
+            impact=impact,
+            profile_workspace=profile_workspace,
         )
-        if not explicit:
-            criteria = tuple(baseline)
-            if bool(metadata.get("_athena_self_host")):
-                from athena.self_host.gates import SelfHostGatePolicy
-
-                return SelfHostGatePolicy.select_criteria(
-                    criteria,
-                    changed_resources=changed_resources,
-                    impact=impact,
-                    task_id=task.id,
-                )
-            return criteria
-
-        # Explicit criteria are semantic requirements supplied by the task;
-        # they strengthen the project-derived proof instead of replacing it.
-        criteria = _deduplicate_criteria((*explicit, *baseline))
-        plan = dict(self._plans.get(task.id) or {})
-        plan.update(
-            {
-                "plan_id": plan.get("plan_id") or f"explicit:{task.id}",
-                "impacted_tests": plan.get("impacted_tests") or list(_impact_tests(impact)),
-                "invariants": plan.get("invariants")
-                or list((task.metadata or {}).get("invariants") or ()),
-                "required_strength": plan.get("required_strength") or "standard",
-                "rationale": list(plan.get("rationale") or ())
-                + ["task supplied explicit acceptance criteria; baseline retained"],
-                "index_revision": plan.get("index_revision")
-                or (impact or {}).get("index_revision"),
-                "explicit_criteria": [criterion.id for criterion in explicit],
-            }
-        )
-        self._plans[task.id] = plan
-        if bool(metadata.get("_athena_self_host")):
-            from athena.self_host.gates import SelfHostGatePolicy
-
-            criteria = _deduplicate_criteria(
-                SelfHostGatePolicy.select_criteria(
-                    criteria,
-                    changed_resources=changed_resources,
-                    impact=impact,
-                    task_id=task.id,
-                )
-            )
-        return criteria
 
     async def _verify_or_fail(
         self,
@@ -821,24 +776,43 @@ class RealityCoordinator:
         criteria: tuple[Criterion, ...],
         workspace: WorkspaceSpec,
     ) -> list[dict]:
-        if not criteria:
-            # Nothing was derivable to prove, so there is no proof to fail.
-            # The candidate commits on the observable work evidence the
-            # turn-boundary gate already required.  The certificate records
-            # the absence of obligations explicitly rather than fabricating
-            # a passing check; a criteria-less workspace must not deadlock
-            # every completion into PARTIAL ("nothing to verify" is not
-            # "proof failed").
-            return [{"id": "no_criteria_derivable", "passed": True, "obligation": "none"}]
-        try:
-            results = await self._verifier.verify_against(task, criteria, workspace)
-        except Exception as exc:  # noqa: BLE001 - never accept unverified work
-            _logger.warning("candidate verification failed: %s", exc)
-            return [{"id": c.id, "passed": False} for c in criteria]
-        normalized = list(results or ())
-        if len(normalized) != len(criteria):
-            return [{"id": c.id, "passed": False} for c in criteria]
-        return normalized
+        return await self._candidate_verification.verify_or_fail(task, criteria, workspace)
+
+    async def verify_candidate(
+        self,
+        task: TaskSpec,
+        *,
+        workspace: WorkspaceSpec,
+        changed_resources: tuple[str, ...] = (),
+        impact: Mapping[str, Any] | None = None,
+        profile_workspace: WorkspaceSpec | None = None,
+        supplemental_criteria: tuple[Criterion, ...] = (),
+        deactivate_branch: Any = None,
+        task_id: str | None = None,
+    ) -> list[dict]:
+        """Public canonical candidate-proof operation shared with Fusion."""
+        return await self._candidate_verification.verify_candidate(
+            task,
+            workspace=workspace,
+            changed_resources=changed_resources,
+            impact=impact,
+            profile_workspace=profile_workspace,
+            supplemental_criteria=supplemental_criteria,
+            deactivate_branch=deactivate_branch,
+            task_id=task_id,
+        )
+
+    def _mark_runtime_late_escalation(self, task_id: str) -> None:
+        """Tell the dispatcher that a transactional task became complex late.
+
+        The branch is already verified and compensable; this marker keeps the
+        runtime decision durable through completion instead of silently
+        pretending the original route had been speculative.
+        """
+        dispatcher = getattr(self._gate, "dispatcher", None)
+        escalations = getattr(dispatcher, "_late_complexity_escalations", None)
+        if isinstance(escalations, set):
+            escalations.add(task_id)
 
     async def _discard_branch(self, branch: Any, *, reason: str) -> None:
         try:
@@ -873,80 +847,13 @@ class RealityCoordinator:
                 return TaskStatus.RECOVERY_REQUIRED
         return None
 
-    async def _derive_default_criteria(
-        self,
-        task: TaskSpec,
-        *,
-        workspace: WorkspaceSpec | None = None,
-        changed_resources: tuple[str, ...] = (),
-        impact: Mapping[str, Any] | None = None,
-    ) -> list[Criterion]:
-        """Derive a bounded verification plan when the user set no criteria.
-
-        Uses the project profile's configured commands so "the model said it
-        looks done" is never the only proof that lets a candidate cross into
-        reality.
-        """
-        if self._default_source is None:
-            return []
-        try:
-            profile_task = replace(task, workspace=workspace) if workspace is not None else task
-            profile = self._default_source(profile_task)
-            if hasattr(profile, "__await__"):
-                profile = await profile
-        except Exception as exc:  # noqa: BLE001
-            _logger.warning("default criteria derivation failed: %s", exc)
-            return []
-        if not profile:
-            return []
-        plan = self._planner.plan(
-            task,
-            profile,
-            changed_resources=changed_resources,
-            impact=impact,
-            invariants=tuple((task.metadata or {}).get("invariants") or ()),
-        )
-        self._plans[task.id] = {
-            "plan_id": plan.plan_id,
-            "impacted_resources": list(plan.impacted_resources),
-            "impacted_tests": list(plan.impacted_tests),
-            "invariants": list(plan.invariants),
-            "required_strength": plan.required_strength,
-            "rationale": list(plan.rationale),
-            "index_revision": plan.index_revision,
-        }
-        if plan.skipped_commands:
-            _logger.info(
-                "verification planner skipped %d unusable project probes",
-                len(plan.skipped_commands),
-            )
-        return list(plan.criteria)
-
-    async def _impact_for(
-        self,
-        root: str,
-        changed_resources: tuple[str, ...],
-    ) -> dict[str, Any]:
-        """Use the persisted project-index graph when deriving completion proof."""
-        if not root or not changed_resources or self._project_index_provider is None:
-            return {}
-        try:
-            index = self._project_index_provider(root)
-            if hasattr(index, "__await__"):
-                index = await index
-            impact = index.impact(list(changed_resources))
-            return dict(impact) if isinstance(impact, Mapping) else {}
-        except (OSError, RuntimeError, TypeError, ValueError, AttributeError) as exc:
-            _logger.warning("project index impact lookup failed: %s", exc)
-            return {}
-
     def _transaction_resources(
         self,
         task_id: str,
         workspace: WorkspaceSpec | None,
     ) -> tuple[str, ...]:
-        records = getattr(self._gate, "_transaction_records", {})
-        raw = records.get(task_id, {}).get("resources", [])
+        record = self._gate.transaction_record(task_id) or {}
+        raw = record.get("resources", [])
         root = workspace.root if workspace is not None else ""
         values: list[str] = []
         for resource in raw:
@@ -969,40 +876,3 @@ def disposition_for_metadata(metadata: dict | None) -> ExecutionDisposition | No
         return ExecutionDisposition(str(value))
     except ValueError:
         return None
-
-
-def _impact_tests(impact: Mapping[str, Any] | None) -> tuple[str, ...]:
-    """Extract concrete test resources from a project-index impact record."""
-    if not isinstance(impact, Mapping):
-        return ()
-    values = impact.get("affected_tests") or ()
-    if not isinstance(values, (list, tuple, set)):
-        return ()
-    return tuple(sorted({str(value) for value in values if str(value).strip()}))
-
-
-def _deduplicate_criteria(criteria: tuple[Criterion, ...]) -> tuple[Criterion, ...]:
-    """Keep one proof for equivalent checks, preferring stronger proofs."""
-    output: list[Criterion] = []
-    for criterion in criteria:
-        verification = criterion.verification
-        proof_id = (
-            verification_proof_id(verification)
-            if verification is not None
-            else f"criterion:{criterion.id}"
-        )
-        existing_ids = [
-            verification_proof_id(existing.verification)
-            if existing.verification is not None
-            else f"criterion:{existing.id}"
-            for existing in output
-        ]
-        if any(proof_subsumes(existing_id, proof_id) for existing_id in existing_ids):
-            continue
-        output = [
-            existing
-            for existing, existing_id in zip(output, existing_ids)
-            if not proof_subsumes(proof_id, existing_id)
-        ]
-        output.append(criterion)
-    return tuple(output)

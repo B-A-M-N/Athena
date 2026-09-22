@@ -1,8 +1,8 @@
 """Execution subsystem (BUILDSPEC 9).
 
-The public execution API is intentionally lazy.  Several durable state
-modules use the small :mod:`athena.execution.async_call` bridge, and eager
-import of every backend here used to pull those state modules back through
+The public execution API is intentionally lazy.  Blocking-call scheduling
+lives in the neutral :mod:`athena.concurrency` bridge, and eager import of
+every backend here used to pull durable state modules back through
 this package during interpreter startup.  That made isolated worker
 processes fail with a partially initialized ``Database`` module.  Lazy
 exports preserve ``from athena.execution import ...`` compatibility without
@@ -37,8 +37,11 @@ _EXPORTS = {
         "athena.execution.environment",
         "ProjectEnvironmentFingerprint",
     ),
-    "ToolchainBinding": ("athena.execution.environment", "ToolchainBinding"),
-    "VerificationEnvironment": ("athena.execution.environment", "VerificationEnvironment"),
+    "ToolchainBinding": ("athena.execution.verification_environment", "ToolchainBinding"),
+    "VerificationEnvironment": (
+        "athena.execution.verification_environment",
+        "VerificationEnvironment",
+    ),
     "ConformanceReceipt": ("athena.execution.conformance", "ConformanceReceipt"),
     "run_backend_conformance": ("athena.execution.conformance", "run_backend_conformance"),
     "MAX_FRAME_BYTES": ("athena.execution.ssh_protocol", "MAX_FRAME_BYTES"),

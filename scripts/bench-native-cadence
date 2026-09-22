@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd /home/bamn/Athena
+: "${DISPLAY:?run under a working X display (for example: xvfb-run -s '-screen 0 1024x768x24' scripts/bench-native-cadence)}"
+BIN=./native/target/debug/athena-terminal
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+for interval in 100 50; do
+  stats="$work/stats-$interval.json"
+  sync="$work/sync-$interval.json"
+  ATHENA_NATIVE_RENDER_STATS="$stats" ATHENA_NATIVE_PRESENTATION_SYNC="$sync" \
+  ATHENA_NATIVE_FRAME_INTERVAL_MS="$interval" \
+  timeout 90 "$BIN" --benchmark-frames 30 >/dev/null
+  echo "=== interval=${interval}ms ==="
+  cat "$stats"
+  echo
+done

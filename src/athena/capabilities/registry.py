@@ -17,6 +17,7 @@ from athena.protocol.capabilities import (
     CapabilityExecutor,
 )
 from athena.protocol.errors import CapabilityUnavailable, CapabilityValidationError
+from athena.schema import compile_validator, format_schema_errors, validate_schema
 
 
 class CapabilityRegistry:
@@ -46,7 +47,7 @@ class CapabilityRegistry:
         descriptor = getattr(executor, "descriptor", None)
         if descriptor is None or not isinstance(descriptor, CapabilityDescriptor):
             raise TypeError("executor must define a CapabilityDescriptor")
-        validator = _compile_validator(descriptor.input_schema)
+        validator = compile_validator(descriptor.input_schema)
         if descriptor.id in self._by_id and not replace:
             raise ValueError(
                 f"capability '{descriptor.id}' already registered "
@@ -97,6 +98,10 @@ class CapabilityRegistry:
             )
         return executor
 
+    def iter_executors(self) -> tuple[CapabilityExecutor, ...]:
+        """Return the canonical executor inventory without exposing storage."""
+        return tuple(self._by_id.values())
+
     def validate(
         self,
         capability_id: str,
@@ -138,119 +143,10 @@ class CapabilityRegistry:
     ) -> list[str]:
         validator = self._validators.get(descriptor.id)
         if validator is None:
-            validator = _compile_validator(descriptor.input_schema)
+            validator = compile_validator(descriptor.input_schema)
             self._validators[descriptor.id] = validator
         instance = arguments if isinstance(arguments, dict) else arguments
-        return _format_schema_errors(validator.iter_errors(instance))
-
-
-def validate_schema(schema: dict[str, Any], arguments: Any) -> list[str]:
-    """Exact JSON Schema validation used before policy evaluation (BHV-040).
-
-    Uses the version-pinned `jsonschema` library so integers/booleans,
-    arrays, nested objects, additionalProperties, bounds, and combinators
-    are enforced for real. The deterministic repair engine's strict
-    revalidation is exactly as strong as this function.
-
-    Falls back to the lightweight subset validator only if jsonschema is
-    unavailable (it is a hard dependency; fallback exists for resilience).
-    """
-    validator = _compile_validator(schema)
-    return _format_schema_errors(validator.iter_errors(arguments))
-
-
-def _effective_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
-    """Translate Athena's legacy alias without weakening JSON Schema."""
-    effective = dict(schema)
-    if effective.pop("allow_extra", True) is False and "additionalProperties" not in effective:
-        effective["additionalProperties"] = False
-    if "$schema" not in effective:
-        effective["$schema"] = "https://json-schema.org/draft/2020-12/schema"
-    return effective
-
-
-# Maximum nesting depth for a capability's JSON Schema (P2-3). Legitimate
-# tool schemas are a handful of levels deep; unbounded nesting lets an
-# attacker-supplied schema drive the recursive validator into
-# RecursionError at validation time instead of failing admission.
-_MAX_SCHEMA_DEPTH = 32
-
-
-def _schema_depth(node: Any, seen: int = 0) -> int:
-    if seen > _MAX_SCHEMA_DEPTH:
-        return seen
-    if isinstance(node, Mapping):
-        return max(
-            (_schema_depth(value, seen + 1) for value in node.values()),
-            default=seen,
-        )
-    if isinstance(node, (list, tuple)):
-        return max(
-            (_schema_depth(item, seen + 1) for item in node),
-            default=seen,
-        )
-    return seen
-
-
-def _compile_validator(schema: Mapping[str, Any]):
-    try:
-        from jsonschema.validators import validator_for  # type: ignore[import-untyped]
-    except ImportError as exc:  # pragma: no cover - dependency is mandatory
-        raise RuntimeError("jsonschema is required for capability schemas") from exc
-    effective = _effective_schema(schema)
-    if _schema_depth(effective) > _MAX_SCHEMA_DEPTH:
-        raise ValueError(f"capability schema exceeds maximum nesting depth {_MAX_SCHEMA_DEPTH}")
-    validator_cls = validator_for(effective)
-    validator_cls.check_schema(effective)
-    return validator_cls(effective)
-
-
-def _format_schema_errors(errors) -> list[str]:
-    formatted: list[str] = []
-    for err in sorted(errors, key=lambda e: list(e.absolute_path)):
-        path = "/".join(str(p) for p in err.absolute_path) or "(root)"
-        formatted.append(f"{path}: {err.message}")
-    return formatted
-
-
-def _validate_schema_subset(schema: dict[str, Any], arguments: Mapping[str, Any]) -> list[str]:
-    """Legacy dependency-free subset validator (fallback only)."""
-    errors: list[str] = []
-    if not hasattr(arguments, "get") or not hasattr(arguments, "items"):
-        return ["arguments must be an object"]
-
-    allowed_keys = schema.get("allow_extra", True)
-    properties = schema.get("properties") or {}
-    if allowed_keys is False:
-        extra = set(arguments) - set(properties)
-        if extra:
-            errors.append(f"unknown keys: {', '.join(sorted(extra))}")
-
-    for prop, spec in properties.items():
-        if prop not in arguments:
-            continue
-        value = arguments[prop]
-        expected = spec.get("type")
-        # bool is an int subclass in Python — exclude explicitly.
-        if expected == "string" and not isinstance(value, str):
-            errors.append(f"{prop}: expected string")
-        elif expected == "boolean" and not isinstance(value, bool):
-            errors.append(f"{prop}: expected boolean")
-        elif expected == "integer" and (not isinstance(value, int) or isinstance(value, bool)):
-            errors.append(f"{prop}: expected integer")
-        elif expected == "number" and (
-            isinstance(value, bool) or not isinstance(value, (int, float))
-        ):
-            errors.append(f"{prop}: expected number")
-        enum = spec.get("enum")
-        if enum is not None and value not in enum:
-            errors.append(f"{prop}: must be one of {enum}")
-
-    required = schema.get("required") or []
-    for prop in required:
-        if prop not in arguments:
-            errors.append(f"missing required field: {prop}")
-    return errors
+        return format_schema_errors(validator.iter_errors(instance))
 
 
 __all__ = ["CapabilityRegistry", "validate_schema"]

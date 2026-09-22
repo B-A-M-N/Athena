@@ -40,6 +40,7 @@ from athena.capabilities.environment_common import (  # noqa: F401 (facade re-ex
     _result,
     _run,
     _run_external_http_request,
+    run_external_http_request,
     _safe_external_response,
     _service_effects,
     _service_offload,

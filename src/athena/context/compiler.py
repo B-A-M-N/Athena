@@ -17,8 +17,6 @@ into a bounded, provider-neutral model request.  It:
 from __future__ import annotations
 
 import asyncio
-import enum
-import hashlib
 import json
 import logging
 import re
@@ -28,19 +26,25 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from athena.context.compression import (
-    CompressionMarker,
     CompressionRecord,
     ContextCompressor,
     is_capability_block,
 )
-from athena.context.digest import ContextDigestStore
+from athena.context.admission import bound_and_compress
+from athena.context.contracts import (
+    ContextEntry as _Entry,
+    ContextStaticContext as _StaticContext,
+    MemoryCacheKey as _MemoryCacheKey,
+    MemoryRetrievalMode,
+)
+from athena.protocol.context import ContextDigestStore
 from athena.context.digest_builder import ContextDigestBuilder
 from athena.context.instructions import (
     INSTRUCTION_ORDER,
     provider_role_for_source,
     render_instruction,
 )
-from athena.context.provenance import merge_provenance, prov, provenance_from_mapping
+from athena.context.provenance import prov, provenance_from_mapping
 from athena.context.selection import estimate_tokens
 from athena.context.retrieval import ContextRetrieval
 from athena.models.router import (
@@ -99,18 +103,6 @@ _DEFAULT_SAFETY = (
     "needed for this turn, and verify observable actions before claiming success."
 )
 
-# BHV-032 categories that must never be summarized away.
-_PROTECTED_CATEGORIES = frozenset(
-    {
-        "approval",
-        "pending_mutation",
-        "unresolved_error",
-        "security_boundary",
-        "workspace_boundary",
-    }
-)
-
-
 @dataclass(frozen=True)
 class CompiledContext:
     """Bounded, provider-neutral compiled context (§55)."""
@@ -149,23 +141,10 @@ class CompiledContext:
             model=model,
             provider=provider,
             request_id=request_id or new_id("call"),
-            max_tokens=self.requirements.reserved_output or None,
+            max_tokens=None,
             capabilities=self.capability_definitions,
             metadata=dict(metadata or {}),
         )
-
-
-@dataclass(frozen=True)
-class _MemoryCacheKey:
-    """Cache key for memory retrieval results.
-
-    Named (not a bare tuple) so future key-component changes surface as
-    type errors instead of silently colliding tuple shapes.
-    """
-
-    task_id: str
-    mode: str
-    store_generation: int
 
 
 @dataclass(frozen=True)
@@ -192,27 +171,6 @@ class ContextDegradation:
     """Optional narrower scope, e.g. the memory scope that raised."""
 
 
-@dataclass(frozen=True)
-class _Entry:
-    """Internal representation of one context element before final render."""
-
-    name: str
-    text: str
-    tokens: int
-    role: Role
-    category: str
-    trust: TrustClass
-    mandatory: bool
-    is_capability: bool = False
-    provenance: Provenance | None = None
-    created_at: Any = None
-    value: float = 0.5
-    message: Message | None = None  # original message kept verbatim
-    blocks: tuple[ContentBlock, ...] | None = None
-    droppable: bool = False  # memory/skill/artifact: removable under pressure
-    cache_zone: str = "dynamic"  # stable prefix or dynamic/history suffix
-
-
 _STABLE_CONTEXT_SCOPE_ORDER = {"global": 0, "project": 1, "user": 2}
 
 
@@ -220,40 +178,6 @@ def _stable_context_sort_key(entry: _Entry) -> tuple[int, str]:
     """Keep invariant attached context deterministic across store orderings."""
     scope = str(entry.provenance.scope) if entry.provenance is not None else ""
     return (_STABLE_CONTEXT_SCOPE_ORDER.get(scope, 99), entry.name)
-
-
-@dataclass(frozen=True)
-class _StaticContext:
-    """Revisioned context material that is stable across model turns."""
-
-    context_blocks: tuple[_Entry, ...] = ()
-    memories: tuple[Any, ...] = ()
-    skills: tuple[Any, ...] = ()
-    research: tuple[_Entry, ...] = ()
-    capabilities: tuple[CapabilityDescriptor, ...] = ()
-    discovery_state: str = "not_required"
-    strategy: StrategyGuidance = field(
-        default_factory=lambda: StrategyGuidance(
-            route="respond", rationale="No external action or evidence acquisition is required."
-        )
-    )
-
-
-class MemoryRetrievalMode(str, enum.Enum):
-    """Staged memory-retrieval gating (P1-12).
-
-    EXPLICIT — the objective uses referential language ("remember",
-    "the way we decided", "my usual format"): retrieve broadly; the
-    referent plausibly lives in durable memory.
-    WORK — ordinary repo/work turn: retrieve, but only content that
-    strongly matches; the durable store is not scanned for every turn.
-    SKIP — definitely a self-contained response turn (greeting, thanks):
-    no retrieval.
-    """
-
-    EXPLICIT = "explicit"
-    WORK = "work"
-    SKIP = "skip"
 
 
 # Referential vocabulary that justifies broad memory retrieval. Deliberately
@@ -515,13 +439,24 @@ class ContextCompiler:
         # ``_bound_and_compress`` starting from used = required, so required
         # tokens must NOT also be subtracted here (that double-counts them).
         effective_context_window = max(0, int(context_window or self.context_window))
-        input_budget = max(0, effective_context_window - self.reserve_output)
 
         corpus = await self._collect_entries(task, transcript, static)
 
         # Stable ordering prevents registry insertion order from needlessly
         # changing the provider's tool prefix.
         capabilities = tuple(sorted(static.capabilities, key=lambda item: item.id))
+        # Tool schemas are part of the provider request even though they are
+        # not conversation messages. Reserve their canonical serialized size
+        # before context admission; the final assembled-request measurement
+        # below repeats this accounting after all messages are rendered.
+        capability_tokens = _capability_schema_tokens(capabilities)
+        input_budget = max(
+            0,
+            effective_context_window
+            - self.reserve_output
+            - capability_tokens
+            - (len(capabilities) if capabilities else 0),
+        )
         # Strategy sees the same fabric records used for progressive
         # disclosure, including readiness and validation proof.  It remains
         # advisory, but it no longer has to infer route quality from an id.
@@ -540,7 +475,14 @@ class ContextCompiler:
                 break
             stable_count += 1
         provenance_map = _index_provenance(messages)
-        estimated = estimate_tokens("\n\n".join(m.conversation_text() for m in messages))
+        message_tokens = estimate_tokens("\n\n".join(m.conversation_text() for m in messages))
+        estimated = message_tokens + capability_tokens + (len(capabilities) if capabilities else 0)
+        if estimated + self.reserve_output > effective_context_window:
+            raise OverflowError(
+                "Final provider request exceeds the selected model input allowance "
+                f"({estimated} input tokens + {self.reserve_output} reserved > "
+                f"{effective_context_window} window)."
+            )
         requirements = self._build_requirements(
             task,
             normalized_attachments,
@@ -641,9 +583,7 @@ class ContextCompiler:
         requirements = ModelRequirements(
             # No CAP_TOOLS: an auxiliary subturn gets no tool surface.
             required_capabilities=frozenset(),
-            minimum_context_tokens=estimated + self.reserve_output + self.safety_margin,
-            needs_tools=False,
-            reserved_output=self.reserve_output,
+            minimum_context_window_tokens=estimated + self.reserve_output + self.safety_margin,
         )
         return CompiledContext(
             messages=messages,
@@ -1005,11 +945,7 @@ class ContextCompiler:
         minimum_tokens = compiled_tokens + self.reserve_output + self.safety_margin
         return ModelRequirements(
             required_capabilities=frozenset(caps),
-            minimum_context_tokens=minimum_tokens,
-            needs_tools=needs_tools,
-            vision=_has_visuals(visual_inputs),
-            audio=_has_audio(audio_inputs),
-            reserved_output=self.reserve_output,
+            minimum_context_window_tokens=minimum_tokens,
         )
 
     async def _collect_entries(
@@ -1045,134 +981,14 @@ class ContextCompiler:
         *,
         task: TaskSpec | None = None,
     ) -> tuple[list[_Entry], CompressionRecord, list[str]]:
-        """Keep required + recent/capability verbatim; summarize older; drop rest.
-
-        BHV-032 protection: objective, policy, acceptance criteria, project
-        instructions, approvals/work boundaries, recent turns, and every
-        capability call/result are never summarized away.  Older lower-value
-        transcript is collapsed into a single summarized entry whose provenance
-        is retained (BHV-033) and recorded as a reversible marker.
-        """
-        budget = max(budget, 0)
-        kept: list[_Entry] = []
-        used = 0
-        omitted: list[str] = []
-
-        def try_append(entry: _Entry) -> bool:
-            """Append through the single accounting path for every insertion."""
-            nonlocal used
-            candidate = (*kept, entry)
-            candidate_text = "\n\n".join(_entry_text(item) for item in candidate)
-            candidate_tokens = estimate_tokens(candidate_text)
-            if candidate_tokens > budget:
-                return False
-            kept.append(entry)
-            used = candidate_tokens
-            return True
-
-        for entry in required:
-            if not try_append(entry):
-                raise OverflowError(
-                    "Required context categories exceed the model context window; "
-                    "cannot form a bounded context."
-                )
-
-        transcript = [e for e in corpus if not e.droppable]
-        droppable = [e for e in corpus if e.droppable]
-
-        cap_positions = [i for i, e in enumerate(transcript) if e.is_capability]
-        cap_window = self.recent_verbatim_turns // 2
-        cap_protected: set[int] = {
-            i
-            for pos in cap_positions
-            for i in range(pos - cap_window, pos + cap_window + 1)
-            if 0 <= i < len(transcript)
-        }
-        fence = len(transcript) - self.recent_verbatim_turns
-
-        protected: list[_Entry] = []  # recent + capability verbatim
-        older: list[_Entry] = []  # compressible older transcript
-        for i, e in enumerate(transcript):
-            verbatim = (i >= fence) or (i in cap_protected) or (e.category in _PROTECTED_CATEGORIES)
-            if verbatim:
-                protected.append(e)
-            else:
-                older.append(e)
-
-        # Protected transcript MUST always be retained verbatim (BHV-032).
-        for e in protected:
-            if not try_append(e):
-                raise OverflowError(
-                    "protected recent/capability context exceeds budget; "
-                    "cannot satisfy BHV-032 without overflow."
-                )
-
-        # Fill remaining room by value and causal recency. Oldest-first made
-        # a bounded context retain stale chatter while dropping the decision
-        # or evidence immediately preceding the current turn.
-        for e in sorted(
-            older,
-            key=lambda item: (float(item.value), str(item.created_at or ""), item.name),
-            reverse=True,
-        ):
-            if not try_append(e):
-                continue
-
-        # Summarize what did not fit (older transcript) with provenance retained.
-        summarized_subject = [e for e in older if e not in kept]
-        markers: list[CompressionMarker] = []
-        if summarized_subject:
-            merged = _merged_provenance(summarized_subject)
-            summary_budget = max(0, budget - used - (1 if kept else 0))
-            summary_text = await self._compressor._summarize(
-                "\n".join(e.text for e in summarized_subject if e.text),
-                task=task,
-                cache_key=_entry_group_cache_key(summarized_subject, task=task),
-                max_tokens=summary_budget,
-            )
-            if not summary_text:
-                # The source range still needs an explicit reversible summary
-                # even when no provider tokens remain for the model-facing
-                # summary. The digest/receipt carries this marker.
-                summary_text = (
-                    f"{len(summarized_subject)} older context entries omitted; "
-                    "recover from transcript anchors"
-                )
-            markers.append(
-                CompressionMarker(
-                    message_ids=tuple(e.name for e in summarized_subject),
-                    summary=summary_text,
-                    provenance=merged,
-                )
-            )
-            summary_entry = _Entry(
-                name="summary:compressed",
-                text=summary_text,
-                tokens=estimate_tokens(summary_text),
-                role=Role.COMPRESSION,
-                category="recent_conversation",
-                trust=merged.trust,
-                mandatory=False,
-                provenance=merged,
-            )
-            if summary_text and not try_append(summary_entry):
-                # The shared accounting path is authoritative. A summary that
-                # cannot fit is retained in the compression receipt, not
-                # smuggled into an over-budget provider request.
-                omitted.append(summary_entry.name)
-
-        # Droppable evidence (memory/skill/artifact): include by value, else omit.
-        for e in sorted(droppable, key=lambda x: -x.value):
-            if not try_append(e):
-                omitted.append(e.name)
-
-        if used > budget:
-            raise OverflowError(
-                f"Compiled context exceeds input budget ({used} > {budget}); "
-                "cannot form a bounded context."
-            )
-
-        return kept, CompressionRecord(tuple(markers), self._compressor.consume_degraded()), omitted
+        return await bound_and_compress(
+            required,
+            corpus,
+            budget,
+            task=task,
+            recent_verbatim_turns=self.recent_verbatim_turns,
+            compressor=self._compressor,
+        )
 
     async def _persist_context_digest(
         self,
@@ -1743,13 +1559,6 @@ def _maybe_created(value: Any) -> Any:
     return value
 
 
-def _entry_text(entry: _Entry) -> str:
-    """Return exactly the text used by the provider-neutral token estimate."""
-    if entry.message is not None:
-        return entry.message.conversation_text()
-    return entry.text
-
-
 def _entry_time(e: _Entry):
     import datetime as _dt
 
@@ -1765,6 +1574,14 @@ def _entry_time(e: _Entry):
 
 def _msg_has_capability(msg: Message) -> bool:
     return any(is_capability_block(b) for b in msg.blocks)
+
+
+def _capability_schema_tokens(capabilities: Sequence[CapabilityDescriptor]) -> int:
+    """Estimate the canonical tool-schema portion of a model request."""
+    if not capabilities:
+        return 0
+    payload = [descriptor.to_record() for descriptor in capabilities]
+    return estimate_tokens(json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")))
 
 
 def _has_visuals(blocks: Sequence[Any]) -> bool:
@@ -1835,36 +1652,6 @@ def _index_provenance(messages: Sequence[Message]) -> dict[str, Provenance]:
             if isinstance(b, TextBlock) and b.provenance is not None:
                 index[f"{m.id}:{id(b)}"] = b.provenance
     return index
-
-
-def _merged_provenance(entries: Sequence[_Entry]) -> Provenance:
-    pros = [e.provenance for e in entries if e.provenance]
-    if not pros:
-        return prov(SourceType.RUNTIME, trust=TrustClass.AGENT_CURATED, scope="compression")
-    return merge_provenance(pros)
-
-
-def _entry_group_cache_key(entries: Sequence[_Entry], *, task: TaskSpec | None = None) -> str:
-    """Identify a compression input by ordered content, provenance, and policy."""
-    metadata = dict(getattr(task, "metadata", {}) or {}) if task is not None else {}
-    identity = {
-        "entries": [
-            {
-                "id": entry.name,
-                "content": hashlib.sha256(entry.text.encode("utf-8")).hexdigest(),
-                "category": entry.category,
-                "trust": str(entry.trust),
-            }
-            for entry in entries
-        ],
-        "compression_policy": {
-            "compiler": "context-v1",
-        },
-        "summarizer_profile": metadata.get("model_profile")
-        or metadata.get("summarizer_profile")
-        or metadata.get("model_id"),
-    }
-    return json.dumps(identity, sort_keys=True, default=str, separators=(",", ":"))
 
 
 # ---------------------------------------------------------------------------

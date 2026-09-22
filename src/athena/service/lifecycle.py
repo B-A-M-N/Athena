@@ -3,108 +3,68 @@
 ``start``/``_start_impl``/``stop`` moved verbatim from
 ``athena.service.service``. This is a subordinate mechanism, not a second
 authority: the lifecycle wires and tears down resources that all remain
-owned by the :class:`AthenaService` façade instance (``self._svc``) —
+owned by the :class:`AthenaService` façade instance (``self.ports``) —
 stores, kernel, worker, scheduler, dispatcher, compiler, recovery — and
 startup stays a transaction over resources acquired in dependency order.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
+from dataclasses import dataclass
 
 from athena.affordances import CapabilityFabric
-from athena.affordances import GeneratedCapabilityStore
-from athena.artifacts.store import ArtifactStore
-from athena.capabilities.dispatcher import CapabilityDispatcher
 from athena.capabilities.registry import CapabilityRegistry
 from athena.capabilities.schedule import ScheduleAPI
 from athena.capabilities.schedule import ScheduleCapability
-from athena.context.compiler import ContextCompiler
-from athena.context.digest import ContextDigestStore
-from athena.execution.container import ContainerBackend
-from athena.execution.ssh import SSHBackend, SSHProfile
 from athena.execution.manager import ExecutionManager
-from athena.execution.runtimes import PythonRuntime
-from athena.execution.runtimes import ShellRuntime
-from athena.execution.runtimes.node import NodeRuntime
-from athena.execution.runtimes.powershell import PowerShellRuntime
-from athena.kernel.continuations import ContinuationStore
-from athena.kernel.kernel import AgentKernel
-from athena.kernel.termination import TerminationEvaluator
 from athena.knowledge.pipeline import KnowledgePipeline
-from athena.mcp.adapter import MCPAdapter
-from athena.mcp.prompts import MCPPromptProvider
-from athena.mcp.resources import MCPResourceProvider
-from athena.memory.store import MemoryStore
-from athena.memory.embeddings import FastEmbedProvider
-from athena.models.registry import ProviderRegistry
-from athena.packs.store import PackStore
-from athena.policy.credentials import BitwardenSource, OnePasswordSource, SecretManager
-from athena.policy.engine import PolicyEngine
-from athena.project.index.builder import ProjectIndexBuilder
-from athena.project.index.coordinator import ProjectIndexCoordinator
-from athena.project.index.store import ProjectIndexStore
-from athena.protocol.tasks import TaskStatus
 from athena.protocol.tasks import WorkspaceSpec
-from athena.protocol.policy import Principal
-from athena.protocol.events import EV, make_event
 from athena.scheduler.scheduler import Scheduler
-from athena.service.config import DEFAULT_DB_PATH
+from athena.service.authority_composition import (
+    AuthorityComponents,
+    AuthorityComposer,
+    AuthorityCompositionPorts,
+)
+from athena.service.lifecycle_ports import LifecyclePorts
+from athena.service.startup_recovery import StartupRecovery, StartupRecoveryPorts
+from athena.service.startup_state import StoreComponents
 from athena.skills.lifecycle import SkillLifecycle
-from athena.skills.lifecycle import SkillStore
-from athena.skills.loader import SkillLoader
-from athena.state.approvals import ApprovalStore
-from athena.state.context_blocks import ContextBlockStore
-from athena.state.database import Database
-from athena.state.delegate_sessions import DelegateSessionStore
 from athena.state.events import EventStore
 from athena.state.events import FAST_EVENT_TYPES
-from athena.state.executions import ExecutionStore
-from athena.state.external_effects import ExternalEffectStore
-from athena.state.failure_memory import FailureMemory
-from athena.state.messages import MessageStore
-from athena.state.mutations import MutationStore
-from athena.state.runtime_sessions import RuntimeSessionStore
-from athena.state.resource_obligations import ResourceObligationStore
-from athena.state.task_finalizations import TaskFinalizationStore
-from athena.state.schedules import ScheduleStore
-from athena.state.self_host import SelfHostMissionStore
-from athena.state.sessions import SessionRepository
-from athena.state.tasks import TaskStore
-from athena.state.steering import TaskSteeringStore
-from athena.state.tool_repairs import ToolRepairStore
-from athena.tasks.budgets import BudgetTracker
-from athena.tasks.cancellation import CancellationManager
-from athena.tasks.delegation import DelegationManager
 from athena.tasks.manager import TaskManager
-from athena.tasks.worker import TaskWorker
-from athena.tasks.worker import WorkerConfig
 from typing import Any
 import asyncio
 import logging
 import json
-import os
-import tempfile
 
 
 _logger = logging.getLogger("athena.service")
 
 
+@dataclass
+class FinalizerComponents:
+    """Startup phase 7.5 outputs: observers bounded after task finalization."""
+
+    knowledge: KnowledgePipeline
+    delivery: Any
+
+
 class ServiceLifecycle:
     """Owns the start/stop transaction of the service façade."""
 
-    def __init__(self, service: Any) -> None:
-        self._svc = service
+    def __init__(self, service: Any, *, ports: LifecyclePorts | None = None) -> None:
+        self.ports = ports or LifecyclePorts(service)
+        self._authority_composer = AuthorityComposer(ports=AuthorityCompositionPorts(service))
 
     async def start(self) -> None:
-        if self._svc._started:
+        if self.ports.started:
             return
 
         try:
-            await self._svc._start_impl()
+            await self.ports.start_impl()
         except BaseException:
-            self._svc._startup_health = {
-                **self._svc._startup_health,
+            self.ports.startup_health = {
+                **self.ports.startup_health,
                 "status": "failed",
                 "blocking_failures": ["service_startup"],
             }
@@ -112,648 +72,183 @@ class ServiceLifecycle:
             # service must not leak a DB, worker, poller, scheduler, client, or
             # runtime when a later stage fails.
             try:
-                await asyncio.shield(self._svc.stop())
+                await asyncio.shield(self.ports.stop())
             except BaseException as cleanup_error:
                 _logger.error("startup unwind failed: %s", cleanup_error, exc_info=True)
             raise
 
-    async def _start_impl(self) -> None:
-        """Acquire service resources in dependency order.
+    async def _build_authorities(
+        self,
+        *,
+        store_components: StoreComponents,
+        execution: ExecutionManager,
+    ) -> AuthorityComponents:
+        """Startup phases 4-7: compose authorities on explicit store inputs."""
+        authorities = await self._authority_composer.build(store_components, execution)
+        for attr, value in {
+            "_memory": authorities.memory,
+            "_skills": authorities.skills,
+            "_skill_lifecycle": authorities.skill_lifecycle,
+            "_skill_discovery_status": authorities.skill_discovery_status,
+            "_policy": authorities.policy,
+            "_artifacts": authorities.artifacts,
+            "_registry": authorities.registry,
+            "_fabric": authorities.fabric,
+            "_dispatcher": authorities.dispatcher,
+            "_reality_gate": authorities.reality_gate,
+            "_budgets": authorities.budgets,
+            "_task_manager": authorities.task_manager,
+            "_cancellations": authorities.cancellations,
+        }.items():
+            setattr(self.ports, attr.removeprefix("_"), value)
+        return authorities
 
-        ``start`` owns the unwind boundary; keeping acquisition in this helper
-        makes it impossible for a new stage to accidentally bypass cleanup.
-        """
+    async def _build_finalize_observers(
+        self,
+        *,
+        store_components: StoreComponents,
+    ) -> FinalizerComponents:
+        """Startup phase 7.5: post-finalization knowledge and delivery."""
+        messages = store_components.messages
+        events = store_components.events
+        memory = self.ports.memory
+        skill_lifecycle = self.ports.skill_lifecycle
 
-        cfg = self._svc.config
-        self._svc._startup_health = {
-            "status": "starting",
-            "checks": {},
-            "blocking_failures": [],
-        }
-        self._svc._shutdown_status = {"state": "running"}
-        self._svc._recovery_status = "starting"
-        self._svc._recovery_summary = {}
-        self._svc._recovery_error = None
-        workspace = WorkspaceSpec(
-            id="root",
-            root=cfg.workspace_root or self._svc._default_workspace.root,
-        )
-        self._svc._default_workspace = workspace
-
-        # 1. State: DB + stores (migrations apply lazily on first query).
-        db_path = cfg.db_path or DEFAULT_DB_PATH()
-        db = Database(db_path)
-        self._svc._db = db
-        try:
-            await db._ensure_ready()  # noqa: SLF001 - apply migrations exactly once, deterministically
-        except Exception as exc:
-            diagnostics = await db.diagnostics()
-            self._svc._startup_health["checks"]["database"] = {
-                "status": "recovery_required",
-                "blocking": True,
-                "error": f"{type(exc).__name__}: {exc}",
-                "diagnostics": diagnostics,
-            }
-            raise
-        self._svc._startup_health["checks"]["database"] = {
-            "status": "ok",
-            "blocking": False,
-            "diagnostics": await db.diagnostics(),
-        }
-        self._svc._runtime_state_root = (
-            tempfile.mkdtemp(prefix="athena-runtime-")
-            if db_path == ":memory:"
-            else os.path.join(os.path.dirname(os.path.abspath(db_path)), "fusion")
-        )
-        sessions = SessionRepository(db)
-        tasks = TaskStore(db)
-        events = EventStore(db)
-        messages = MessageStore(db)
-        approvals = ApprovalStore(db)
-        mutations = MutationStore(db)
-        schedules = ScheduleStore(db)
-        continuations = ContinuationStore(db)
-        from athena.state.input_requests import InputRequestStore
-
-        input_requests = InputRequestStore(db)
-        self._svc._sessions = sessions
-        self._svc._store_tasks = tasks
-        self._svc._store_events = events
-        self._svc._store_messages = messages
-        self._svc._store_approvals = approvals
-        self._svc._store_mutations = mutations
-        self._svc._external_effect_store = ExternalEffectStore(db)
-        self._svc._resource_obligation_store = ResourceObligationStore(db)
-        self._svc._pending_finalization_store = TaskFinalizationStore(db)
-        self._svc._store_schedules = schedules
-        self._svc._store_continuations = continuations
-        self._svc._store_input_requests = input_requests
-        self._svc._steering_store = TaskSteeringStore(db)
-        from athena.worldstate import WorldStateStore
-
-        self._svc._world_state_store = WorldStateStore(db)
-        from athena.workflows import WorkflowStore
-
-        self._svc._workflow_store = WorkflowStore(db)
-        from athena.workflows import WorkflowRunStore
-
-        self._svc._workflow_run_store = WorkflowRunStore(db)
-        self._svc._generated_store = GeneratedCapabilityStore(db)
-        from athena.research import ResearchStore
-
-        self._svc._research_store = ResearchStore(db)
-        from athena.state.provider_usage import ProviderUsageStore
-
-        self._svc._provider_usage_store = ProviderUsageStore(db)
-        from athena.state.model_responses import ModelResponseStore
-
-        self._svc._model_response_store = ModelResponseStore(db)
-        self._svc._project_index_store = ProjectIndexStore(db)
-        self._svc._project_index_builder = ProjectIndexBuilder()
-        self._svc._project_index_coordinator = ProjectIndexCoordinator(
-            self._svc._project_index_store,
-            self._svc._project_index_builder,
-        )
-        self._svc._failure_memory = FailureMemory(db)
-
-        # 2. Credentials (SecretManager owns resolution + leases).
-        self._svc._secrets = SecretManager()
-        # CLI vaults are explicit opt-ins. Their binaries remain absent from
-        # the default lookup path, but operators can enable either store
-        # without writing its secret into Athena configuration.
-        onepassword_vault = os.environ.get("ATHENA_1PASSWORD_VAULT", "").strip()
-        if onepassword_vault:
-            self._svc._secrets.register_source(OnePasswordSource(vault=onepassword_vault))
-        if os.environ.get("ATHENA_BITWARDEN_ENABLED", "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }:
-            self._svc._secrets.register_source(BitwardenSource())
-        self._svc._configure_hermes_referee()
-        await self._svc._preflight_hermes_referee()
-
-        # 3. Execution + runtimes.
-        runtime_sessions = RuntimeSessionStore(db)
-        execution_store = ExecutionStore(db)
-        execution = ExecutionManager(
-            runtime_session_store=runtime_sessions,
-            execution_store=execution_store,
-            event_sink=self._svc._forward_events(events),
-            durability_mandatory=True,
-        )
-        if cfg.local_runtime_supervisor:
-            from athena.execution.runtime_host import (
-                LocalRuntimeSupervisor,
-                SupervisedLocalBackend,
-            )
-
-            runtime_host = LocalRuntimeSupervisor(
-                os.path.join(str(self._svc._runtime_state_root), "runtime-host")
-            )
-            execution.set_local_backend(SupervisedLocalBackend(runtime_host))
-            self._svc._runtime_host_supervisor = runtime_host
-        # Keep container execution optional, but register the real backend so
-        # a workspace selecting ``execution_backend="container"`` reaches the
-        # same canonical execution authority as local execution.
-        execution.register_backend(ContainerBackend())
-        for backend_name, raw_profile in cfg.execution_backends.items():
-            if str(raw_profile.get("kind", "ssh")).casefold() != "ssh":
-                _logger.warning("unsupported execution backend kind for %s", backend_name)
-                continue
-            try:
-                profile = SSHProfile(
-                    name=str(backend_name),
-                    host=str(raw_profile["host"]),
-                    user=str(raw_profile["user"]),
-                    port=int(raw_profile.get("port", 22)),
-                    credential_id=(
-                        str(raw_profile["credential_id"])
-                        if raw_profile.get("credential_id")
-                        else None
-                    ),
-                    identity_file=(
-                        str(raw_profile["identity_file"])
-                        if raw_profile.get("identity_file")
-                        else None
-                    ),
-                    known_hosts=str(raw_profile["known_hosts"]),
-                    remote_root=str(raw_profile.get("remote_root", "~/athena-workspaces")),
-                    connect_timeout=float(raw_profile.get("connect_timeout", 15.0)),
-                )
-                execution.register_backend(SSHBackend(profile, secret_manager=self._svc._secrets))
-            except (KeyError, TypeError, ValueError) as exc:
-                raise RuntimeError(
-                    f"invalid SSH execution backend profile {backend_name!r}: {exc}"
-                ) from exc
-        execution.register_runtime(PythonRuntime())
-        execution.register_runtime(ShellRuntime())
-        if PowerShellRuntime.available():
-            execution.register_runtime(PowerShellRuntime())
-        if NodeRuntime.available():
-            execution.register_runtime(NodeRuntime())
-        self._svc._execution = execution
-        self._svc._store_runtime_sessions = runtime_sessions
-        self._svc._store_executions = execution_store
-        self._svc._self_host_missions = SelfHostMissionStore(db)
-        self._svc._tool_repair_store = ToolRepairStore(db)
-        self._svc._context_block_store = ContextBlockStore(db)
-        self._svc._pack_store = PackStore(db)
-        from athena.state.pack_hooks import PackHookOutbox
-
-        self._svc._pack_hook_outbox = PackHookOutbox(db)
-        from athena.packs.manager import PackManager
-
-        self._svc._pack_manager = PackManager(
-            self._svc._pack_store,
-            install_root=os.path.join(self._svc._runtime_state_root, "packs"),
-        )
-        self._svc._delegate_session_store = DelegateSessionStore(db)
-        from athena.state.capability_health import CapabilityHealthStore
-
-        self._svc._capability_health_store = CapabilityHealthStore(db)
-        from athena.capabilities.health import CapabilityHealth
-
-        self._svc._capability_health = CapabilityHealth(store=self._svc._capability_health_store)
-        try:
-            await self._svc._capability_health.load(await self._svc._capability_health_store.list())
-            self._svc._startup_health["checks"]["capability_health"] = {
-                "status": "ok",
-                "blocking": False,
-            }
-        except Exception as exc:
-            _logger.warning("capability health rehydration failed: %s", exc)
-            self._svc._startup_health["checks"]["capability_health"] = {
-                "status": "degraded",
-                "blocking": False,
-                "error": str(exc),
-            }
-
-        # 4. Memory + skills.
-        embedding_provider = cfg.memory_embedding_provider or FastEmbedProvider(
-            model=cfg.memory_embedding_model,
-            cache_dir=cfg.memory_embedding_cache_dir,
-        )
-        memory = MemoryStore(db, embedding_provider=embedding_provider)
-        self._svc._memory = memory
-        # Bundled skills are a small, versioned first-party library. Explicit
-        # project/user paths remain higher precedence and can shadow a bundled
-        # name+version, while an empty config still gives a useful out-of-box
-        # release/debugging workflow.
-        bundled_skills = Path(__file__).resolve().parents[1] / "bundled_skills"
-        skill_loader = SkillLoader(
-            search_paths=tuple(cfg.skills_paths),
-            bundled_dir=bundled_skills,
-        )
-        skill_lifecycle = SkillLifecycle(db, events=events)
-        skills_store = SkillStore(loader=skill_loader, lifecycle=skill_lifecycle)
-        self._svc._skills = skills_store
-        self._svc._skill_lifecycle = skill_lifecycle
-        try:
-            discovered = await skill_loader.load()
-            await self._svc._sync_skills(skill_lifecycle, discovered)
-            self._svc._skill_discovery_status = "ok"
-            self._svc._startup_health["checks"]["skills"] = {
-                "status": "ok",
-                "blocking": False,
-                "discovered": len(discovered),
-            }
-        except Exception as exc:
-            _logger.warning("skill discovery failed: %s", exc)
-            # Track skill discovery status for visibility
-            self._svc._skill_discovery_status = f"failed: {exc}"
-            self._svc._startup_health["checks"]["skills"] = {
-                "status": "degraded",
-                "blocking": False,
-                "error": str(exc),
-            }
-
-        # 4. Policy engine.
-        policy = PolicyEngine(profile=cfg.autonomy_level)
-        self._svc._policy = policy
-        await self._svc._rehydrate_approval_grants(approvals, continuations)
-
-        # 5. Artifacts (construct BEFORE dispatcher so it can be injected).
-        self._svc._artifacts = ArtifactStore(root=cfg.artifact_root)
-
-        # 6. Capability registry + dispatcher (single path, INV-004).
-        registry = CapabilityRegistry()
-        self._svc._registry = registry
-        fabric = CapabilityFabric(registry, store=self._svc._generated_store)
-        self._svc._fabric = fabric
-        dispatcher = CapabilityDispatcher(
-            registry,
-            policy,
-            principal=Principal("agent", cfg.cache_namespace),
-            mutation_store=mutations,
-            approval_store=approvals,
-            continuation_store=continuations,
-            repair_store=self._svc._tool_repair_store,
-            event_sink=self._svc._forward_events(events),
-            artifact_store=self._svc._artifacts,
-            mutation_observer=self._svc._on_mutation_completed,
-            fabric=fabric,
-            health=self._svc._capability_health,
-            failure_memory=self._svc._failure_memory,
-        )
-        self._svc._dispatcher = dispatcher
-        from athena.reality import RealityGate
-
-        self._svc._reality_gate = RealityGate(self._svc.shadow_engine())
-        dispatcher.set_reality_gate(self._svc._reality_gate)
-
-        # 7. TaskManager (needs budgets/cancellations, built a bit later).
-        budgets = BudgetTracker(task_store=tasks)
-        self._svc._budgets = budgets
-        dispatcher.set_budget_tracker(budgets)
-        self._svc._artifacts.set_budget_tracker(budgets)
-        task_manager = TaskManager(
-            task_store=tasks,
-            events=events,
-            sessions=sessions,
-            budgets=budgets,
-            admission=self._svc.require_task_ready,
-            principal_id=cfg.cache_namespace,
-            finalizations=self._svc._pending_finalization_store,
-            steering_store=self._svc._steering_store,
-        )
-        task_manager.set_model_response_store(self._svc._model_response_store)
-        self._svc._task_manager = task_manager
-        execution.set_recovery_sink(self._svc._mark_execution_uncertain)
-
-        cancellations = CancellationManager(
-            task_manager=task_manager,
-            execution_manager=execution,
-            task_store=tasks,
-        )
-        self._svc._cancellations = cancellations
-        task_manager._cancellations = cancellations  # noqa: SLF001
-
-        # Post-finalization knowledge pipeline (BUILDSPEC 64/68): eligible
-        # completed/partial tasks may feed memory + skill candidates. Bound
-        # after all stores exist; the observer itself is failure-isolated.
-        self._svc._knowledge = KnowledgePipeline(
+        self.ports.knowledge = KnowledgePipeline(
             messages=messages,
             memory_store=memory,
             skill_lifecycle=skill_lifecycle,
-            workflow_store=self._svc._workflow_store,
+            workflow_store=self.ports.workflow_store,
             events=events,
-            principal_id=cfg.cache_namespace,
+            principal_id=self.ports.config.cache_namespace,
         )
-        task_manager.add_finalize_observer(self._svc._knowledge)
 
-        # Terminal-result delivery (P1-19): TaskSpec.delivery finally has a
-        # consumer. Bound as a finalize observer — delivery runs after the
-        # result is durable and its failures never destabilize finalization.
         from athena.delivery import DeliveryManager
 
-        self._svc._delivery = DeliveryManager(
+        self.ports.delivery = DeliveryManager(
             event_store=events,
-            external_store=self._svc._external_effect_store,
+            external_store=self.ports.external_effect_store,
         )
-        task_manager.add_finalize_observer(self._svc._delivery)
+        return FinalizerComponents(knowledge=self.ports.knowledge, delivery=self.ports.delivery)
 
-        # 8. Models + router (with role-divided policies: "summarizer",
-        # "judge", etc. can be pinned to specific models in config; roles
-        # without an entry fall back to the user's primary/global choice).
-        model_registry = ProviderRegistry()
-        self._svc._register_providers(model_registry)
-        self._svc._model_registry = model_registry
-        from athena.voice import VoiceManager
-
-        self._svc._voice = VoiceManager(
-            model_registry,
-            cfg.voice,
-            self._svc._artifacts,
-        )
-        provider_readiness = model_registry.readiness()
-        if provider_readiness.get("state") == "ready":
-            self._svc._startup_health["checks"]["model_provider"] = {
-                "status": "ok",
-                "blocking": False,
-                "providers": list(model_registry.names()),
-                "readiness": provider_readiness,
-            }
-        else:
-            # A production service must never pretend that a built-in fake
-            # model is configured. Starting without a provider is useful for
-            # setup/inspection, but every interface must expose the explicit
-            # first-run state and model requests must fail clearly.
-            model_provider_check: dict[str, Any] = {
-                "status": "unconfigured"
-                if provider_readiness.get("state") == "unconfigured"
-                else "degraded",
-                "blocking": False,
-                "providers": list(model_registry.names()),
-                "reason": (
-                    "configure a model provider before submitting agent work"
-                    if provider_readiness.get("state") == "unconfigured"
-                    else "no configured model provider is ready for submission"
-                ),
-            }
-            if provider_readiness.get("state") != "unconfigured":
-                model_provider_check["readiness"] = provider_readiness
-            self._svc._startup_health["checks"]["model_provider"] = model_provider_check
-        router = self._svc._build_model_router(model_registry, cfg)
-        self._svc._router = router
-
-        # 9. Context compiler (with a model-backed compression summarizer so older
-        # transcript is genuinely summarized, not just truncated).
-        compiler = ContextCompiler(
-            message_store=messages,
-            memory_store=memory,
-            skill_loader=skills_store,
-            capability_registry=fabric,
-            artifact_store=self._svc._artifacts,
-            research_store=self._svc._research_store,
-            context_block_store=self._svc._context_block_store,
-            context_digest_store=ContextDigestStore(db),
-            summarizer=self._svc._make_model_summarizer(model_registry),
-            context_window=cfg.context_window,
-            reserve_output=cfg.reserve_output,
-            principal_id=cfg.cache_namespace,
-            workspace_reader=self._svc._workspace_reader(),
-        )
-        self._svc._compiler = compiler
-
-        # 10. Kernel.
-        verifier = self._svc._build_verifier(
-            execution=execution,
-            dispatcher=self._svc._dispatcher,
-            artifact_store=self._svc._artifacts,
-            capability_registry=fabric,
-            model_registry=router,  # ModelRouter: judge role routing
-            evidence_provider=self._svc._verification_evidence,
-            inference_broker=self._svc._make_judge_broker(),
-        )
-        self._svc._acceptance_verifier = verifier
-        from athena.reality import RealityCoordinator, ShadowCandidateVerifier
-
-        coordinator = RealityCoordinator(
-            shadow_engine=self._svc.shadow_engine(),
-            reality_gate=self._svc._reality_gate,
-            candidate_verifier=ShadowCandidateVerifier(verifier),
-            event_sink=self._svc._forward_events(events),
-            default_criteria_source=self._svc._project_profile_for_completion,
-            project_index_provider=self._svc._project_index_for_completion,
-        )
-        self._svc._reality_coordinator = coordinator
-        kernel = AgentKernel(
-            task_store=tasks,
-            events=events,
-            task_manager=task_manager,
-            messages=messages,
-            registry=model_registry,
-            router=router,
-            budgets=budgets,
-            context_compiler=compiler,
-            termination=TerminationEvaluator(
-                acceptance_verifier=verifier,
-                required_child_state=task_manager.required_child_state,
-                defer_reality_verification=lambda task: (
-                    self._svc._reality_gate.active_branch(task.id) is not None
-                    or self._svc._reality_gate.checkpoint_id(task.id) is not None
-                ),
-            ),
-            dispatch_factory=self._svc._dispatch_factory,
-            continuation_store=continuations,
-            workflow_run_store=self._svc._workflow_run_store,
-            input_request_store=input_requests,
-            steering_store=self._svc._steering_store,
-            parked_slot_wait_s=cfg.parked_slot_wait_s,
-            provider_usage_store=self._svc._provider_usage_store,
-            model_response_store=self._svc._model_response_store,
-            interpreter=self._svc._make_interpreter(),
-            reality_coordinator=coordinator,
-            secret_manager=self._svc._secrets,
-            workflow_store=self._svc._workflow_store,
-            workflow_fabric=self._svc._fabric,
-        )
-        self._svc._kernel = kernel
-
-        # 10.9 Body-observation bridge (P1-15): terminal sessions announce
-        # large screen renders as RuntimeScreenChanged events; the bridge
-        # converts them into typed TerminalScreenChanged observations and
-        # offers them to the kernel's interpreter path. The kernel enforces
-        # the same triggering/budget rules as loop-side offers.
-        def _on_runtime_screen_changed(event) -> None:
-            payload = getattr(event, "payload", None) or {}
-            observation = _body_observation_from_screen_event(event, payload)
-            if observation is not None:
-                asyncio.ensure_future(kernel.offer_body_observation(observation))
-
-        events.subscribe(
-            _on_runtime_screen_changed,
-            event_types={"RuntimeScreenChanged"},
-        )
-
-        def _on_debugger_stopped(event) -> None:
-            payload = dict(getattr(event, "payload", None) or {})
-            if not payload.get("session"):
-                return
-            from athena.interpreter.protocol import BodyObservationKind, InterpreterObservation
-
-            observation = InterpreterObservation(
-                kind=BodyObservationKind.DEBUGGER_STOPPED,
-                payload={
-                    "reason": payload.get("reason"),
-                    "thread_id": payload.get("thread_id"),
-                    "location": payload.get("location"),
-                    "frames": list(payload.get("frames") or [])[:8],
-                    "frames_head": "\n".join(
-                        str(frame.get("name") or "")
-                        for frame in list(payload.get("frames") or [])[:8]
-                    ),
-                },
-                task_id=getattr(event, "task_id", None),
-                session_id=getattr(event, "session_id", None),
-                runtime_session_id=payload.get("runtime_session_id"),
+    async def _validate_startup_readiness(self) -> None:
+        """Check deployment capability and durable intake contracts."""
+        capability_profile = await self.ports.validate_required_capabilities()
+        self.ports.startup_health["checks"]["capability_profile"] = capability_profile
+        if capability_profile.get("status") != "ok":
+            missing = ", ".join(
+                f"{item['id']}: {item['reason']}" for item in capability_profile.get("missing", ())
             )
-            asyncio.ensure_future(kernel.offer_body_observation(observation))
+            raise RuntimeError(f"required capability profile is not ready: {missing}")
+        intake_recovery = await self.ports.reconcile_created_intake()
+        self.ports.startup_health["checks"]["task_intake"] = {
+            "status": "degraded" if intake_recovery["quarantined"] else "ok",
+            "blocking": bool(intake_recovery["quarantined"]),
+            **intake_recovery,
+        }
 
-        events.subscribe(_on_debugger_stopped, event_types={"DebuggerStopped"})
-
-        # 11. Delegation (needs kernel).
-        delegation = DelegationManager(
-            task_manager=task_manager,
-            kernel=kernel,
-            budgets=budgets,
-            cancellations=cancellations,
-            steering_store=self._svc._steering_store,
-            execution_manager=execution,
-            principal_id=cfg.cache_namespace,
+    async def _validate_generated_record(self, generated: Any) -> bool:
+        """Retain current records; persist stale state and reject stale proof."""
+        status = await self.ports.synthesis.evidence_status(
+            generated,
+            self.ports.research_store,
         )
-        self._svc._delegation = delegation
+        if status["status"] == "CURRENT":
+            return True
+        owner = (
+            generated.project_scope if generated.scope.value == "project" else generated.user_scope
+        ) or str(generated.provenance.get("owner") or "")
+        if owner and self.ports.generated_store is not None:
+            try:
+                await self.ports.generated_store.transition(
+                    generated.id,
+                    "STALE",
+                    owner=owner,
+                    reason=json.dumps(status, sort_keys=True),
+                )
+            except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                _logger.warning(
+                    "could not persist stale generated capability %s: %s",
+                    generated.id,
+                    exc,
+                )
+        return False
 
-        from athena.service.resource_finalizer import (
-            TaskResourceFinalizer,
-            TaskResourceRetentionPolicy,
-        )
-
-        # Install the resource barrier before capability observers are
-        # registered. Logical affordance observers may run afterward, but no
-        # process/session owner can be forgotten before this proof runs.
-        finalizer = TaskResourceFinalizer(
-            event_sink=self._svc._forward_events(events),
-            retention_policy=TaskResourceRetentionPolicy(
-                mode=cfg.parked_resource_retention_mode,
-                retain_seconds=cfg.parked_resource_retain_seconds,
-            ),
-        )
-        finalizer.bind_obligation_store(self._svc._resource_obligation_store)
-        finalizer.bind_service(self._svc)
-        self._svc._resource_finalizer = finalizer
-        kernel.set_parked_resource_releaser(finalizer.release_parked)
-        kernel.set_parked_resource_resumption_handler(finalizer.cancel_parked_release)
-        task_manager.set_finalization_barrier(finalizer.quiesce)
-        task_manager.add_finalize_observer(finalizer.finalize)
-
-        # 12. Register core capabilities (bind executors to current handles).
-        await self._svc._register_core_capabilities(
-            registry=registry,
-            workspace=workspace,
-            execution=execution,
-            memory=memory,
-            skills_store=skills_store,
-            research_store=self._svc._research_store,
-        )
-
-        # Rehydrate only validated project/user machinery. Task-local
-        # capabilities are intentionally recreated by the owning task and
-        # never survive terminal cleanup or a process restart.
+    async def _register_generated_capabilities(
+        self,
+        *,
+        registry: CapabilityRegistry,
+        fabric: CapabilityFabric,
+        workspace: WorkspaceSpec,
+        events: EventStore,
+    ) -> None:
+        """Restore generated machinery and rebuild proof metrics from events."""
+        cfg = self.ports.config
         from athena.capabilities.synthesis import SynthesisCapability
 
         registry.register(
             SynthesisCapability(
-                self._svc._synthesis,
+                self.ports.synthesis,
                 fabric,
-                research_store=self._svc._research_store,
-                scratch=self._svc._scratch,
+                research_store=self.ports.research_store,
+                scratch=self.ports.scratch,
             )
         )
 
-        async def _current_generated_evidence(generated):
-            status = await self._svc._synthesis.evidence_status(
-                generated,
-                self._svc._research_store,
-            )
-            if status["status"] == "CURRENT":
-                return True
-            owner = (
-                generated.project_scope
-                if generated.scope.value == "project"
-                else generated.user_scope
-            ) or str(generated.provenance.get("owner") or "")
-            if owner and self._svc._generated_store is not None:
-                try:
-                    await self._svc._generated_store.transition(
-                        generated.id,
-                        "STALE",
-                        owner=owner,
-                        reason=json.dumps(status, sort_keys=True),
-                    )
-                except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
-                    _logger.warning(
-                        "could not persist stale generated capability %s: %s",
-                        generated.id,
-                        exc,
-                    )
-            return False
-
         await fabric.load_persisted(
-            lambda generated: self._svc._synthesis.restore_executor(
+            lambda generated: self.ports.synthesis.restore_executor(
                 generated,
                 proof_sink=fabric.update_generated_proof,
                 workspace_root=workspace.root,
             ),
             project_id=workspace.id,
             user_id=cfg.cache_namespace,
-            record_validator=_current_generated_evidence,
+            record_validator=lambda generated: self._validate_generated_record(generated),
         )
-        # Generated proof metrics are rebuilt from canonical events and then
-        # kept current by the same append-only event stream.  This makes a
-        # verification count evidence, not caller-supplied promotion metadata.
-        await self._svc._synthesis.replay_event_metrics(events)
-        self._svc._synthesis_event_observer = self._svc._synthesis.observe_event
+        await self.ports.synthesis.replay_event_metrics(events)
+        self.ports.synthesis_event_observer = self.ports.synthesis.observe_event
         events.subscribe(
-            self._svc._synthesis_event_observer,
+            self.ports.synthesis_event_observer,
             event_types={"CapabilityCompleted", "VerificationCompleted"},
         )
 
-        # 12b. Register schedule capability AFTER the scheduler is constructed
-        # (P1-25: ScheduleAPI must capture a live scheduler, not None).
+    async def _register_schedule_capabilities(
+        self,
+        *,
+        registry: CapabilityRegistry,
+        workspace: WorkspaceSpec,
+        task_manager: TaskManager,
+    ) -> None:
+        """Build scheduler/maintenance owners, then register their capabilities."""
+        cfg = self.ports.config
+        events = self.ports.store_events
         scheduler = Scheduler(
-            store=schedules,
+            store=self.ports.store_schedules,
             task_manager=task_manager,
-            admission=self._svc.require_task_ready,
-            intake=self._svc.submit_spec,
+            admission=self.ports.require_task_ready,
+            intake=self.ports.submit_spec,
             max_concurrent=cfg.scheduler_max_concurrent,
             loop_interval_seconds=cfg.scheduler_interval_seconds,
         )
-        self._svc._scheduler = scheduler
+        self.ports.scheduler = scheduler
         events.subscribe(scheduler.notify_event, exclude_event_types=FAST_EVENT_TYPES)
         schedule_api = ScheduleAPI(scheduler, task_manager)
-        self._svc._schedule_api = schedule_api
+        self.ports.schedule_api = schedule_api
         registry.register(ScheduleCapability(schedule_api))
-        # Maintenance contracts are rehydrated before the core capability
-        # bundle finishes registering. Create the live watcher owner first so
-        # durable contracts can reconnect to the same observer surface rather
-        # than silently degrading to scheduler-only polling.
         from athena.capabilities.watch import WatchRegistry
 
-        if getattr(self._svc, "_watch_registry", None) is None:
-            self._svc._watch_registry = WatchRegistry(
-                observer_runner=self._svc._run_watch_observer,
+        if self.ports.watch_registry is None:
+            self.ports.watch_registry = WatchRegistry(
+                observer_runner=self.ports.run_watch_observer,
             )
         from athena.capabilities.maintain import MaintenanceCapability
 
         maintenance = MaintenanceCapability(
             schedule_api,
-            watch_registry=getattr(self._svc, "_watch_registry", None),
+            watch_registry=self.ports.watch_registry,
             workspace=workspace,
-            execution_manager=self._svc._execution,
-            fabric=self._svc._fabric,
+            execution_manager=self.ports.execution,
+            fabric=self.ports.fabric,
             principal_id=cfg.cache_namespace,
         )
         registry.register(maintenance)
@@ -762,513 +257,143 @@ class ServiceLifecycle:
             if restored:
                 _logger.info("rehydrated %d maintenance observers", restored)
         except Exception as exc:
-            self._svc._watch_registry.record_rehydration_failure(
+            self.ports.watch_registry.record_rehydration_failure(
                 exc, contract_id="maintenance_contracts"
             )
             _logger.warning("maintenance observer rehydration failed: %s", exc)
 
-        # 12.5 Crash recovery: reconcile orphaned state before claiming new work.
-        from athena.recovery.manager import RecoveryManager
-
-        # Resource obligations are loaded and reconciled before the worker is
-        # created below. Any remaining ownership keeps readiness degraded and
-        # blocks new admissions until an explicit proof arrives.
-        await finalizer.load_unresolved()
-        await finalizer.reconcile_unresolved()
-        resource_health = finalizer.health()
-        self._svc._startup_health["checks"]["resource_obligations"] = {
-            "status": "ok" if resource_health["unresolved_count"] == 0 else "degraded",
-            "blocking": resource_health["unresolved_count"] > 0,
-            "unresolved_count": resource_health["unresolved_count"],
-        }
-
-        # A terminal claim may have been write-ahead before a crash and parked
-        # in RECOVERY_REQUIRED. Retry resource closure and commit the exact
-        # retained result before generic recovery or worker startup can move
-        # the task elsewhere.
-        pending_recovered = await task_manager.reconcile_pending_finalizations(finalizer)
-        pending_remaining = await self._svc._pending_finalization_store.list_recoverable()
-        self._svc._startup_health["checks"]["pending_finalizations"] = {
-            "status": "ok" if not pending_remaining else "degraded",
-            "blocking": bool(pending_remaining),
-            "recovered": pending_recovered,
-            "remaining": len(pending_remaining),
-        }
-
-        # A proven reality commit may have completed just before a process
-        # stopped, leaving the task row non-terminal. Finish that saga before
-        # generic RUNNING -> INTERRUPTED recovery can hide the proven result.
-        completion_recovered = await coordinator.reconcile_startup(task_manager)
-        if completion_recovered:
-            _logger.info(
-                "recovered proven reality completions: %d",
-                completion_recovered,
-            )
-
-        recovery = RecoveryManager(
-            task_store=tasks,
-            mutation_store=mutations,
-            execution_store=execution_store,
-            runtime_session_store=runtime_sessions,
-            execution_manager=execution,
+    def _bind_pack_lifecycle(
+        self,
+        *,
+        skill_lifecycle: SkillLifecycle,
+        workspace: WorkspaceSpec,
+        events: EventStore,
+        task_manager: TaskManager,
+    ) -> None:
+        """Bind pack integrations to the live canonical service authorities."""
+        self.ports.pack_manager.lifecycle.bind_integrations(
+            skill_lifecycle=skill_lifecycle,
+            workflow_store=self.ports.workflow_store,
+            fabric=self.ports.fabric,
+            dispatcher=self.ports.dispatcher,
+            mcp_adapter=self.ports.mcp,
+            mcp_client_sink=self.ports.mcp_clients.append,
             event_store=events,
+            hook_outbox=self.ports.pack_hook_outbox,
+            task_intake=self.ports.submit,
+            task_lookup=task_manager.get,
+            workspace=workspace,
         )
-        recovery_result = await recovery.recover()
-        self._svc._recovery_status = recovery_result.status.value
-        self._svc._recovery_summary = dict(recovery_result.summary)
-        self._svc._recovery_error = recovery_result.error
-        if recovery_result.status.value not in {"healthy", "recovered"}:
-            raise RuntimeError(
-                "service startup aborted: durable recovery state is "
-                f"{recovery_result.status.value}"
-                + (f": {recovery_result.error}" if recovery_result.error else "")
-            )
-        if any(recovery_result.summary.values()):
-            _logger.info("crash recovery reconciled: %s", recovery_result.summary)
 
-        # Provider dispositions are committed separately from task effects.
-        # Replay the task-side half before workers start so a crash after the
-        # provider resolution cannot leave a terminal disposition attached to
-        # an inert RECOVERY_REQUIRED task (or a retry authorization unused).
-        provider_recovery = await self._svc.reconcile_provider_outcomes()
-        unresolved_provider = await self._svc._model_response_store.list_unresolved_attempts()
-        self._svc._provider_recovery_health = {
+    async def _rehydrate_enabled_packs(self, *, task_manager: TaskManager) -> None:
+        """Rehydrate packs, replay hooks, and quarantine dependent tasks."""
+        lifecycle = self.ports.pack_manager.lifecycle
+        try:
+            activated = await lifecycle.rehydrate_enabled()
+            await lifecycle.replay_hook_outbox()
+            await lifecycle.start_hook_dispatcher()
+            failures = lifecycle.rehydration_failures()
+            unavailable = {str(item["pack_id"]) for item in failures}
+            quarantined = await self.ports.quarantine_tasks_for_packs(
+                task_store=self.ports.store_tasks,
+                task_manager=task_manager,
+                unavailable=unavailable,
+            )
+            self.ports.startup_health["checks"]["enabled_packs"] = {
+                "status": "degraded" if failures else "ok",
+                "blocking": False,
+                "activated": activated,
+                "failures": failures,
+                "quarantined_tasks": quarantined,
+            }
+        except Exception as exc:
+            _logger.warning("enabled capability-pack rehydration failed: %s", exc)
+            self.ports.startup_health["checks"]["enabled_packs"] = {
+                "status": "degraded",
+                "blocking": False,
+                "error": str(exc),
+            }
+
+    async def _run_startup_recovery(self, *, coordinator: Any, finalizer: Any) -> None:
+        """Reconcile durable resource, task, provider, and external sagas."""
+        result = await StartupRecovery(
+            StartupRecoveryPorts(
+                events=self.ports.store_events,
+                tasks=self.ports.store_tasks,
+                mutations=self.ports.store_mutations,
+                execution_store=self.ports.store_executions,
+                runtime_sessions=self.ports.store_runtime_sessions,
+                execution=self.ports.execution,
+                task_manager=self.ports.task_manager,
+                pending_finalization_store=self.ports.pending_finalization_store,
+            )
+        ).reconcile(coordinator=coordinator, finalizer=finalizer)
+        self.ports.startup_health["checks"]["resource_obligations"] = {
+            "status": "ok" if result.resource_health["unresolved_count"] == 0 else "degraded",
+            "blocking": result.resource_health["unresolved_count"] > 0,
+            "unresolved_count": result.resource_health["unresolved_count"],
+        }
+        self.ports.startup_health["checks"]["pending_finalizations"] = {
+            "status": "ok" if result.pending_remaining == 0 else "degraded",
+            "blocking": result.pending_remaining > 0,
+            "recovered": result.pending_recovered,
+            "remaining": result.pending_remaining,
+        }
+        if result.completion_recovered:
+            _logger.info("recovered proven reality completions: %d", result.completion_recovered)
+        self.ports.recovery_status = result.recovery_status
+        self.ports.recovery_summary = result.recovery_summary
+        self.ports.recovery_error = result.recovery_error
+        if any(result.recovery_summary.values()):
+            _logger.info("crash recovery reconciled: %s", result.recovery_summary)
+
+    async def _reconcile_provider_sagas(self) -> None:
+        """Replay task-side provider outcomes before worker startup."""
+        provider_recovery = await self.ports.reconcile_provider_outcomes()
+        unresolved_provider = await self.ports.model_response_store.list_unresolved_attempts()
+        self.ports.provider_recovery_health = {
             "state": "degraded" if unresolved_provider else "ready",
             "unresolved_count": len(unresolved_provider),
             "replayed": provider_recovery["replayed"],
             "error": None,
         }
-        self._svc._startup_health["checks"]["provider_outcomes"] = {
+        self.ports.startup_health["checks"]["provider_outcomes"] = {
             "status": "degraded" if unresolved_provider else "ok",
             "blocking": bool(unresolved_provider),
             "unresolved_count": len(unresolved_provider),
             "replayed": provider_recovery["replayed"],
         }
 
-        # Reconcile transaction ownership after the mutation ledger has
-        # classified any in-flight effects, but before workers can route new
-        # calls into a durable in-place candidate.
-        transaction_recovered = await self._svc._reality_gate.reconcile_startup()
+    async def _reconcile_external_sagas(self) -> None:
+        """Fail closed if transaction, fusion, or external receipts are uncertain."""
+        events = self.ports.store_events
+
+        transaction_recovered = await self.ports.reality_gate.reconcile_startup()
         if transaction_recovered:
-            _logger.warning(
-                "transactional work requires operator reconciliation: %d",
-                transaction_recovered,
-            )
-
-        # Fusion branches have a separate durable batch boundary. A branch
-        # interrupted while applying real-workspace mutations must be marked
-        # recovery-required before workers can claim fresh work; never replay
-        # or infer a partially applied speculative commit at startup.
-        shadow_recovered = await self._svc.shadow_engine().reconcile_startup(events)
+            _logger.warning("transactional work requires reconciliation: %d", transaction_recovered)
+        shadow_recovered = await self.ports.shadow_engine().reconcile_startup(events)
         if shadow_recovered:
-            _logger.warning(
-                "shadow branches require operator reconciliation: %d",
-                shadow_recovered,
-            )
-
-        # External systems sit beyond Athena's transaction boundary.  Any
-        # receipt left in APPLYING/VERIFYING/COMPENSATING belongs to an
-        # interrupted operation whose remote outcome is unknown; reconcile it
-        # before workers can issue another request.  Unlike an observational
-        # startup metric, failure here must abort startup fail-closed.
-        external_recovered = await self._svc._external_effect_store.reconcile_startup()
+            _logger.warning("fusion branches require reconciliation: %d", shadow_recovered)
+        external_recovered = await self.ports.external_effect_store.reconcile_startup()
         if external_recovered:
             _logger.warning(
                 "external effects require operator reconciliation: %d",
                 len(external_recovered),
             )
             for receipt in external_recovered:
-                recovery_evidence = dict((receipt.get("response") or {}).get("recovery") or {})
+                evidence = dict((receipt.get("response") or {}).get("recovery") or {})
                 await events.append_event(
-                    "ExternalEffectRecoveryRequired",
-                    recovery_evidence,
-                    task_id=receipt.get("task_id"),
+                    "ExternalEffectRecoveryRequired", evidence, task_id=receipt.get("task_id")
                 )
 
-        # 12.75 Durable approval recovery: a resolved continuation is not
-        # ordinary queued work. It belongs to a task that was already parked
-        # in WAITING_APPROVAL, so the worker would never claim it. Recover the
-        # exact task before the worker starts and let the kernel consume the
-        # canonical call without asking the model to reproduce it.
-        await self._svc._recover_approved_continuations(
-            continuations=continuations,
-            task_store=tasks,
-            task_manager=task_manager,
-            kernel=kernel,
-        )
+    async def _start_impl(self) -> None:
+        """Acquire service resources in dependency order; ``start`` unwinds."""
+        from athena.service.startup import StartupPhaseRunner
 
-        # 12.76 Durable input-request recovery: a WAITING_INPUT task whose
-        # answer arrived while the process was down. The answer is durable
-        # (ANSWERED_PENDING_RESUME); the old kernel coroutine is not.
-        if self._svc._store_input_requests is not None:
-            await self._svc._recover_answered_input_requests(
-                input_requests=self._svc._store_input_requests,
-                task_store=tasks,
-                task_manager=task_manager,
-                kernel=kernel,
-            )
-
-        # 13. MCP (best-effort).
-        self._svc._mcp = MCPAdapter(registry)
-        self._svc._mcp_resources = MCPResourceProvider()
-        self._svc._mcp_prompts = MCPPromptProvider()
-        await self._svc._connect_mcp()
-        from athena.capabilities.mcp_context import MCPContextCapability
-
-        registry.register(MCPContextCapability(self._svc._mcp_resources, self._svc._mcp_prompts))
-        await self._svc.start_mcp_supervisor()
-
-        # Packs are rehydrated only after every native capability, durable
-        # generated overlay, and configured MCP surface is available. This
-        # lets declarative aliases and MCP contributions enter the same live
-        # fabric on startup as they do during runtime installation.
-        if self._svc._pack_manager is not None:
-            self._svc._pack_manager.bind_integrations(
-                skill_lifecycle=skill_lifecycle,
-                workflow_store=self._svc._workflow_store,
-                fabric=self._svc._fabric,
-                dispatcher=self._svc._dispatcher,
-                mcp_adapter=self._svc._mcp,
-                mcp_client_sink=self._svc._mcp_clients.append,
-                event_store=events,
-                hook_outbox=self._svc._pack_hook_outbox,
-                task_intake=self._svc.submit,
-                task_lookup=task_manager.get,
-                workspace=workspace,
-            )
-            try:
-                activated = await self._svc._pack_manager.rehydrate_enabled()
-                await self._svc._pack_manager.replay_hook_outbox()
-                await self._svc._pack_manager.start_hook_dispatcher()
-                failures = self._svc._pack_manager.rehydration_failures()
-                unavailable = {str(item["pack_id"]) for item in failures}
-                quarantined = await self._svc._quarantine_tasks_for_packs(
-                    task_store=tasks,
-                    task_manager=task_manager,
-                    unavailable=unavailable,
-                )
-                self._svc._startup_health["checks"]["enabled_packs"] = {
-                    "status": "degraded" if failures else "ok",
-                    "blocking": False,
-                    "activated": activated,
-                    "failures": failures,
-                    "quarantined_tasks": quarantined,
-                }
-            except Exception as exc:
-                _logger.warning("enabled capability-pack rehydration failed: %s", exc)
-                self._svc._startup_health["checks"]["enabled_packs"] = {
-                    "status": "degraded",
-                    "blocking": False,
-                    "error": str(exc),
-                }
-
-        # 13.5 Deployment capability contract. This runs after MCP discovery
-        # and pack rehydration so every configured surface is checked in its
-        # live, final form before a worker can claim work.
-        capability_profile = await self._svc._validate_required_capabilities()
-        self._svc._startup_health["checks"]["capability_profile"] = capability_profile
-        if capability_profile.get("status") != "ok":
-            missing = ", ".join(
-                f"{item['id']}: {item['reason']}" for item in capability_profile.get("missing", ())
-            )
-            raise RuntimeError(f"required capability profile is not ready: {missing}")
-
-        # Ordinary intake has a three-step durable protocol: task row, causal
-        # user turn, then queue transition. Repair CREATED rows left between
-        # those steps before a worker can start claiming work. Scheduler-owned
-        # occurrence rows are intentionally left to scheduler reconciliation.
-        intake_recovery = await self._svc._reconcile_created_intake()
-        self._svc._startup_health["checks"]["task_intake"] = {
-            "status": "degraded" if intake_recovery["quarantined"] else "ok",
-            "blocking": bool(intake_recovery["quarantined"]),
-            **intake_recovery,
-        }
-
-        # 14. Worker + scheduler. Packs and any dependent resumable tasks are
-        # settled before a worker can claim fresh work.
-        worker = TaskWorker(
-            task_manager=task_manager,
-            kernel=kernel,
-            config=WorkerConfig(
-                max_parallel=cfg.max_parallel_tasks,
-                lease_duration_seconds=cfg.worker_lease_duration_seconds,
-                lease_renewal_divisor=cfg.worker_lease_renewal_divisor,
-            ),
-        )
-        self._svc._worker = worker
-        task_manager.set_wakeup_callback(worker.notify)
-        self._svc._worker_task = asyncio.create_task(self._svc._worker.run_forever())
-
-        # 15. Start background scheduler loop.
-        await scheduler.start()
-        # Watch polling begins only after stores, capability registry, model
-        # routing, recovery, packs, and MCP integrations are ready. A watcher
-        # must never publish events into a half-constructed service.
-        self._svc._watch_poll_task = asyncio.create_task(self._svc._poll_watches())
-        self._svc._started = True
-        degraded = any(
-            value.get("status") != "ok"
-            for value in self._svc._startup_health["checks"].values()
-            if isinstance(value, dict)
-        )
-        self._svc._startup_health["status"] = "degraded" if degraded else "ok"
-        self._svc._startup_health["blocking_failures"] = [
-            name
-            for name, value in self._svc._startup_health["checks"].items()
-            if isinstance(value, dict) and value.get("blocking") and value.get("status") != "ok"
-        ]
+        await StartupPhaseRunner(self).run()
 
     async def stop(self) -> None:
-        if not self._svc._started and self._svc._db is None:
-            return
+        """Run the canonical stop transaction through extracted phases."""
+        from athena.service.stop_sequence import stop
 
-        # 1. Stop accepting/claiming new work first (P0-23).
-        if self._svc._worker_task is not None:
-            if self._svc._worker is not None:
-                try:
-                    await self._svc._worker.stop()
-                except Exception as exc:
-                    _logger.warning("worker stop failed: %s", exc)
-            try:
-                await self._svc._worker_task
-            except Exception as exc:
-                _logger.warning("worker task teardown failed: %s", exc)
-            self._svc._worker_task = None
-
-        # Approval recovery runs are not owned by TaskWorker, but they still
-        # execute through the kernel and must not outlive service shutdown.
-        # Cancelling the coroutine leaves the task recoverable; the normal
-        # RUNNING -> INTERRUPTED pass below records that boundary.
-        recovery_tasks = list(getattr(self._svc, "_approval_recovery_tasks", ()))
-        for recovery in recovery_tasks:
-            recovery.cancel()
-        if recovery_tasks:
-            await asyncio.gather(*recovery_tasks, return_exceptions=True)
-        self._svc._approval_recovery_tasks.clear()
-
-        # 2. Stop the scheduler (no new claims).
-        if self._svc._scheduler is not None:
-            try:
-                await self._svc._scheduler.stop()
-            except Exception as exc:
-                _logger.warning("scheduler stop failed: %s", exc)
-            if self._svc._store_events is not None:
-                self._svc._store_events.unsubscribe(self._svc._scheduler.notify_event)
-            self._svc._scheduler = None
-
-        if self._svc._store_events is not None and self._svc._synthesis_event_observer is not None:
-            self._svc._store_events.unsubscribe(self._svc._synthesis_event_observer)
-            self._svc._synthesis_event_observer = None
-
-        # 3. INTERRUPT active tasks (recoverable), never CANCEL (P0-23).
-        #    Graceful shutdown parks in-flight work as INTERRUPTED so it can be
-        #    resumed on next startup; only explicit user cancellation is a
-        #    terminal CANCELLED. QUEUED tasks stay QUEUED and run next startup.
-        if self._svc._store_tasks is not None and self._svc._task_manager is not None:
-            try:
-                rows = await self._svc._store_tasks.list_by_status(TaskStatus.RUNNING)
-                for row in rows or []:
-                    tid = row.get("id") if isinstance(row, dict) else getattr(row, "id", None)
-                    if not tid:
-                        continue
-                    if self._svc._execution is not None:
-                        try:
-                            await self._svc._execution.cancel_task(tid)
-                        except Exception as exc:
-                            _logger.warning("cancel task %s on stop failed: %s", tid, exc)
-                    try:
-                        await self._svc._task_manager.transition(
-                            tid, TaskStatus.INTERRUPTED, reason="service stopping"
-                        )
-                    except Exception as exc:
-                        _logger.warning("interrupt task %s on stop failed: %s", tid, exc)
-            except Exception as exc:
-                _logger.warning("interrupt-running-tasks on stop failed: %s", exc)
-
-        # Watch poller (P1-31): cancel and await before closing resources.
-        poll_task = getattr(self._svc, "_watch_poll_task", None)
-        if poll_task is not None:
-            poll_task.cancel()
-            try:
-                await poll_task
-            except asyncio.CancelledError:
-                pass
-            except Exception as exc:
-                _logger.warning("watch poller teardown failed: %s", exc)
-            self._svc._watch_poll_task = None
-
-        if self._svc._resource_finalizer is not None:
-            try:
-                await self._svc._resource_finalizer.shutdown()
-            except Exception as exc:
-                _logger.warning("parked-resource retention teardown failed: %s", exc)
-
-        # Capability-owned resources via shutdown registry (P1-32).
-        hook_outcome = await self._svc._run_shutdown_hooks()
-        self._svc._computer = None
-        self._svc._browser = None
-        self._svc._terminals = None
-        self._svc._debugger = None
-        self._svc._computer_health = {
-            "state": "stopped",
-            "backend": "unknown",
-        }
-        self._svc._browser_health = {
-            "state": "stopped",
-            "configured": False,
-            "active_sessions": 0,
-        }
-
-        # MCP clients.
-        if self._svc._pack_manager is not None:
-            await self._svc._pack_manager.stop_hook_dispatcher()
-        if self._svc._mcp_supervisor is not None:
-            await self._svc._mcp_supervisor.stop()
-            self._svc._mcp_supervisor = None
-        for client in self._svc._mcp_clients:
-            try:
-                await client.close()
-            except Exception as exc:
-                _logger.warning("MCP client close failed: %s", exc)
-        self._svc._mcp_clients = []
-        for status in self._svc._mcp_connection_status.values():
-            status["state"] = "stopped"
-            status["tool_count"] = 0
-
-        # External Hermes transport is optional and owns only its HTTP client.
-        if self._svc._hermes_adapter is not None:
-            try:
-                await self._svc._hermes_adapter.aclose()
-            except Exception as exc:
-                _logger.warning("Hermes referee close failed: %s", exc)
-            self._svc._hermes_adapter = None
-            if self._svc._hermes_referee_owned:
-                self._svc._hermes_referee = None
-                self._svc._hermes_referee_owned = False
-
-        # Runtimes / execution. ExecutionManager is the SOLE cleanup owner
-        # (P0-2): its close_all covers task sessions, adopted execution
-        # sessions, registered runtimes, and non-local backends. The service
-        # must not reach into the manager's private runtime collection.
-        execution_outcome: dict = {
-            "runtime_failures": [],
-            "backend_failures": [],
-            "sessions_remaining": [],
-            "unproven_process_kills": [],
-        }
-        if self._svc._execution is not None:
-            try:
-                outcome = await self._svc._execution.close_all()
-                execution_outcome = dict(outcome)
-            except Exception as exc:
-                _logger.warning("execution close_all failed: %s", exc)
-            else:
-                if outcome.get("runtime_failures") or outcome.get("sessions_remaining"):
-                    _logger.warning(
-                        "execution shutdown incomplete: %d runtime failures, %d sessions remaining",
-                        len(outcome.get("runtime_failures", ())),
-                        len(outcome.get("sessions_remaining", ())),
-                    )
-            if self._svc._execution.live_resource_count() > 0:
-                _logger.warning(
-                    "execution manager still holds %d live resources after close_all",
-                    self._svc._execution.live_resource_count(),
-                )
-            self._svc._execution = None
-
-        shutdown_clean = not (
-            hook_outcome.get("failures")
-            or execution_outcome.get("runtime_failures")
-            or execution_outcome.get("backend_failures")
-            or execution_outcome.get("sessions_remaining")
-            or execution_outcome.get("unproven_process_kills")
-            or (
-                self._svc._resource_finalizer
-                and self._svc._resource_finalizer.health().get("failures")
-            )
-        )
-        self._svc._shutdown_status = {
-            "state": "clean" if shutdown_clean else "incomplete",
-            "hooks": hook_outcome,
-            "execution": execution_outcome,
-            "resources": (
-                self._svc._resource_finalizer.health()
-                if self._svc._resource_finalizer is not None
-                else None
-            ),
-        }
-        if not shutdown_clean and self._svc._store_events is not None:
-            try:
-                await self._svc._store_events.append(
-                    make_event(EV["SHUTDOWN_INCOMPLETE"], self._svc._shutdown_status)
-                )
-            except Exception as exc:
-                _logger.warning("shutdown incomplete marker failed: %s", exc)
-
-        # DB last.
-        if self._svc._db is not None:
-            if self._svc._store_events is not None:
-                try:
-                    await self._svc._store_events.close()
-                except Exception as exc:
-                    _logger.warning("event store close failed: %s", exc)
-            if self._svc._fabric is not None:
-                try:
-                    await self._svc._fabric.flush()
-                except Exception as exc:
-                    _logger.warning("generated capability flush failed: %s", exc)
-            try:
-                await self._svc._db.close()
-            except Exception as exc:
-                _logger.warning("db close failed: %s", exc)
-            self._svc._db = None
-
-        self._svc._cancellations = None
-        self._svc._world_state_store = None
-        self._svc._project_index_store = None
-        self._svc._project_index_builder = None
-        self._svc._project_index_coordinator = None
-        self._svc._failure_memory = None
-        self._svc._generated_store = None
-        self._svc._workflow_store = None
-        self._svc._workflow_run_store = None
-        self._svc._research_store = None
-        self._svc._context_block_store = None
-        self._svc._pack_store = None
-        self._svc._pack_manager = None
-        self._svc._pack_hook_outbox = None
-        self._svc._skill_lifecycle = None
-        self._svc._delegate_session_store = None
-        self._svc._external_delegate_manager = None
-        self._svc._capability_health_store = None
-        self._svc._capability_health = None
-        self._svc._synthesis = None
-        self._svc._world_states = {}
-        self._svc._started = False
-
-
-def _body_observation_from_screen_event(event, payload: dict):
-    """Convert a RuntimeScreenChanged event into a typed interpreter
-    observation (P1-15).
-    """
-    from athena.interpreter.protocol import (
-        BodyObservationKind,
-        InterpreterObservation,
-    )
-
-    session_id = str(payload.get("session") or "")
-    if not session_id:
-        return None
-    return InterpreterObservation(
-        kind=BodyObservationKind.TERMINAL_SCREEN_CHANGED,
-        payload={
-            "session": session_id,
-            "screen_chars": int(payload.get("screen_chars") or 0),
-            "screen_text": str(payload.get("screen_text") or "")[:16_000],
-            "rows": payload.get("rows"),
-            "cols": payload.get("cols"),
-        },
-        task_id=getattr(event, "task_id", None),
-        session_id=getattr(event, "session_id", None),
-        runtime_session_id=session_id,
-    )
+        await stop(self.ports)

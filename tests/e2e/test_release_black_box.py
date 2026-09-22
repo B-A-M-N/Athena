@@ -21,6 +21,7 @@ import zipfile
 import pytest
 
 
+@pytest.mark.athena_capability("NETWORK_EGRESS")
 @pytest.mark.dsh_release
 @pytest.mark.athena_claim("ATHENA-EXT-015")
 @pytest.mark.athena_claim("ATHENA-EXT-016")
@@ -123,28 +124,43 @@ scripts = [{match = {user_contains = "2+2"}, respond = {text = "4", done = true}
         install_env = os.environ.copy()
         install_env.pop("PYTHONPATH", None)
         install_env.pop("PYTHONHOME", None)
-        subprocess.run(
-            [
-                str(venv_python),
-                "-m",
-                "pip",
-                "install",
-                f"{artifact}[cli]",
-                str(native_wheel),
-            ],
-            cwd=tmp_path,
-            env=install_env,
-            check=True,
-        )
+        install_command = [
+            str(venv_python),
+            "-m",
+            "pip",
+            "install",
+        ]
+        if install_env.get("ATHENA_RELEASE_WHEELHOUSE"):
+            install_command += [
+                "--no-index",
+                "--find-links",
+                install_env["ATHENA_RELEASE_WHEELHOUSE"],
+            ]
+        install_command += [f"{artifact}[cli]", str(native_wheel)]
+        subprocess.run(install_command, cwd=tmp_path, env=install_env, check=True)
         purelib = _installed_purelib(prefix)
         env = os.environ.copy()
         env["PYTHONPATH"] = str(purelib)
         env.pop("PYTHONHOME", None)
+        # Acceptance is host-independent. An explicit --config still must not
+        # inherit the operator's global/project Athena configuration, and the
+        # artifact sandbox uses a private XDG/HOME boundary.
+        config_root = tmp_path / f"{artifact.stem}-config-home"
+        config_root.mkdir()
+        env["HOME"] = str(config_root)
+        env["XDG_CONFIG_HOME"] = str(config_root / ".config")
         # Release acceptance must exercise the deterministic built-in fake
         # provider. Do not let a developer's ambient provider credentials turn
         # this artifact test into a network/model-availability test.
-        env.pop("OPENROUTER_API_KEY", None)
-        env.pop("OPENROUTER_MODEL", None)
+        for credential in (
+            "OPENROUTER_API_KEY",
+            "OPENROUTER_MODEL",
+            "FREEINFERENCE_API_KEY",
+            "FREEINFERENCE_MODEL",
+            "FREEINFERENCE_API_BASE_URL",
+            "FREEINFERENCE_API_ENDPOINT",
+        ):
+            env.pop(credential, None)
 
         cli = prefix / "bin" / "athena"
         cli_help = subprocess.run(
@@ -156,7 +172,7 @@ scripts = [{match = {user_contains = "2+2"}, respond = {text = "4", done = true}
             text=True,
         )
         assert cli_help.returncode == 0, cli_help.stderr
-        assert "Usage" in cli_help.stdout
+        assert "usage:" in cli_help.stdout.lower()
         cli_workspace = tmp_path / f"{artifact.stem}.cli-workspace"
         cli_workspace.mkdir()
         empty_config = tmp_path / f"{artifact.stem}.empty.toml"
@@ -293,10 +309,14 @@ scripts = [{match = {user_contains = "2+2"}, respond = {text = "4", done = true}
 
 
 def _installed_purelib(prefix: Path) -> Path:
-    """Locate the target interpreter's purelib directory under a prefix."""
-    matches = list(prefix.glob("lib/python*/site-packages"))
-    assert len(matches) == 1, f"unexpected installed layout: {matches!r}"
-    return matches[0]
+    """Locate the target interpreter's site-packages under a prefix."""
+    candidates = [
+        *sorted(prefix.glob("lib/python*/site-packages")),
+        *sorted(prefix.glob("Lib/site-packages")),
+    ]
+    candidates = [path for path in candidates if path.is_dir()]
+    assert len(candidates) == 1, f"unexpected installed layout: {candidates!r}"
+    return candidates[0]
 
 
 def _installed_acceptance_program() -> str:
@@ -438,6 +458,10 @@ def _installed_acceptance_program() -> str:
                             },
                         }
                     },
+                },
+                {
+                    "match": {"last_capability_result_contains": "release-approval"},
+                    "respond": {"text": "RELEASE_APPROVAL_DONE", "done": True},
                 },
                 {"match": {"capability_result_ok": True},
                  "respond": {"text": "CAPABILITY_OK", "done": True}},
@@ -1047,9 +1071,9 @@ def _installed_acceptance_program() -> str:
                     {"operation": "run", "workflow_id": workflow_id},
                     "release-compose-workflow-run",
                 )
-                assert workflow_run.status is CapabilityResultStatus.OK
+                assert workflow_run.status is CapabilityResultStatus.OK, workflow_run.error
                 workflow_payload = json.loads(workflow_run.output)
-                assert workflow_payload["status"] == "completed"
+                assert workflow_payload["status"] == "completed", workflow_payload
                 assert workflow_payload["outputs"]["inventory"]
 
                 # Exercise the installed API through an external uvicorn

@@ -1,11 +1,7 @@
-"""Task intake and observation mechanism for the service façade (P1-10).
+"""Task intake and observation mechanism for the service façade.
 
-Moved verbatim from ``athena.service.service``. This is a subordinate
-mechanism, not a second authority: every store, worker, kernel, compiler,
-and validation seam resolves through the owning :class:`AthenaService`
-instance (``self._svc``), so admission, session allocation, canonical user
-persistence, enqueue ordering, and event replay remain single-sourced on
-the façade exactly as when these bodies lived there.
+The explicit port owns the support boundary; admission and task state remain
+authoritative on :class:`AthenaService`.
 """
 
 from __future__ import annotations
@@ -16,35 +12,98 @@ from datetime import datetime, timezone
 from typing import Any
 
 from athena.protocol.ids import new_id
+from athena.protocol.errors import ServiceNotReady
 from athena.protocol.tasks import TERMINAL_STATUSES, AgentRequest, TaskSpec, TaskStatus
 from athena.tasks.manager import TaskManager
 
 __all__ = ["TaskAPI"]
 
 
+class TaskAPIPorts:
+    """Allowlisted admission/runtime resources and application operations."""
+
+    _RESOURCE_NAMES = {
+        "require_task_manager": "_require_task_manager",
+        "require_worker": "_require_worker",
+        "require_events": "_require_events",
+        "sessions": "_sessions",
+        "task_manager": "_task_manager",
+        "kernel": "_kernel",
+        "store_tasks": "_store_tasks",
+        "config": "config",
+    }
+    _APPLICATION_OPERATIONS = {
+        "require_agent_ready": "require_agent_ready",
+        "validate_request_metadata": "_validate_request_metadata",
+        "build_task_spec": "_build_task_spec",
+        "_validate_request_metadata": "_validate_request_metadata",
+        "_build_task_spec": "_build_task_spec",
+        "require_task_ready": "require_task_ready",
+        "check_complex_coding_readiness": "check_complex_coding_readiness",
+        "_emit": "_emit",
+        "emit": "_emit",
+        "normalize_spec": "normalize_spec",
+        "_record_canonical_user_turn": "_record_canonical_user_turn",
+        "record_canonical_user_turn": "_record_canonical_user_turn",
+        "_spawn_static_prefetch": "_spawn_static_prefetch",
+        "spawn_static_prefetch": "_spawn_static_prefetch",
+    }
+
+    def __init__(self, owner: Any) -> None:
+        self._owner = owner
+
+    def __getattr__(self, name: str) -> Any:
+        resource_name = self._RESOURCE_NAMES.get(name)
+        if resource_name is None:
+            resource_name = self._APPLICATION_OPERATIONS.get(name)
+        if resource_name is None:
+            raise AttributeError(f"task api port is not allowed: {name}")
+        return getattr(self._owner, resource_name, None)
+
+
 class TaskAPI:
     """Task intake (submit/enqueue) and observation (wait/stream/get)."""
 
-    def __init__(self, service: Any) -> None:
-        self._svc = service
-
-    # ------------------------------------------------------------------ #
-    # Intake
-    # ------------------------------------------------------------------ #
+    def __init__(self, service: Any, *, ports: TaskAPIPorts | None = None) -> None:
+        self._ports = ports or TaskAPIPorts(service)
 
     async def submit(self, request: AgentRequest, *, wait: bool = True) -> TaskSpec:
         """Turn an :class:`AgentRequest` into a Task and optionally drive it
         through the worker to completion (BHV-002: all work becomes a Task)."""
-        tm = self._svc._require_task_manager()
-        await self._svc.require_agent_ready(request)
-        self._svc._validate_request_metadata(request.metadata)
+        tm = self._ports.require_task_manager()
+        await self._ports.require_agent_ready(request)
+        self._ports.validate_request_metadata(request.metadata)
         session_id = request.session_id or new_id("session")
-        spec = self._svc._build_task_spec(request, session_id)
+        spec = self._ports.build_task_spec(request, session_id)
         # Admission must inspect the canonical TaskSpec as well as the
         # request envelope. This keeps typed acceptance criteria and every
         # future authority field on the same preflight path.
-        await self._svc.require_task_ready(spec)
-        return await self._enqueue_spec(tm, spec, wait=wait, user_request=request)
+        await self._ports.require_task_ready(spec)
+        # Complex-coding readiness: surface structured gaps before the model
+        # starts planning around unavailable tooling (review item 18).
+        await self._reject_complex_readiness_gaps(spec)
+        return await self.enqueue_spec(tm, spec, wait=wait, user_request=request)
+
+    async def _reject_complex_readiness_gaps(self, spec: TaskSpec) -> None:
+        """Raise ServiceNotReady for required gaps; emit optional diagnostics."""
+        readiness = await self._ports.check_complex_coding_readiness(spec)
+        if not readiness.get("ready", False):
+            raise ServiceNotReady(
+                "complex coding requires candidate isolation and independent verification runtime",
+                missing=[gap["check"] for gap in readiness.get("required_gaps", ())],
+                gaps=readiness.get("required_gaps", ()),
+            )
+        if readiness.get("optional_gaps"):
+            from athena.protocol.events import EV
+
+            await self._ports.emit(
+                EV["DIAGNOSTICS_PRODUCED"],
+                {
+                    "kind": "complex_coding_readiness_gap",
+                    "gaps": readiness["optional_gaps"],
+                },
+                spec.id,
+            )
 
     async def submit_spec(
         self,
@@ -62,22 +121,26 @@ class TaskAPI:
         creation, or enqueue ordering. Keeping those operations here makes all
         transports share the same authority boundary.
         """
-        tm = self._svc._require_task_manager()
-        await self._svc.require_task_ready(spec)
+        tm = self._ports.require_task_manager()
+        spec = self._ports.normalize_spec(spec, trusted=trusted)
+        await self._ports.require_task_ready(spec)
         if not trusted:
-            self._svc._validate_request_metadata(spec.metadata)
+            self._ports.validate_request_metadata(spec.metadata)
         if not spec.session_id:
             session_id = new_id("session")
             spec = replace(spec, session_id=session_id)
-        if self._svc._sessions is not None and spec.session_id:
-            if await self._svc._sessions.get(spec.session_id) is None:
-                await self._svc._sessions.create(
+        if self._ports.sessions is not None and spec.session_id:
+            if await self._ports.sessions.get(spec.session_id) is None:
+                await self._ports.sessions.create(
                     spec.session_id,
                     metadata={"origin": "service"},
-                    principal_id=self._svc.config.cache_namespace,
+                    principal_id=self._ports.config.cache_namespace,
                     project_id=getattr(spec.workspace, "id", None),
                 )
-        return await self._enqueue_spec(
+        # Pre-built specs share submit's fail-closed readiness contract; this
+        # closes ACP's provisional TaskSpec admission bypass.
+        await self._reject_complex_readiness_gaps(spec)
+        return await self.enqueue_spec(
             tm,
             spec,
             wait=wait,
@@ -85,7 +148,7 @@ class TaskAPI:
             enqueue=enqueue,
         )
 
-    async def _enqueue_spec(
+    async def enqueue_spec(
         self,
         task_manager: TaskManager,
         spec: TaskSpec,
@@ -127,14 +190,14 @@ class TaskAPI:
         # callers provide the original request; internal/scheduled callers
         # use the TaskSpec objective. This prevents same-session tasks from
         # inheriting whichever unrelated turn happened to be most recent.
-        await self._svc._record_canonical_user_turn(user_request or created, created)
+        await self._ports.record_canonical_user_turn(user_request or created, created)
         await self._mark_intake_phase(created.id, "canonical_user_turn_persisted")
         # Precompute the revisioned static context concurrently with worker
         # pickup (P1: precompute before first inference). The compile path
         # remains the sole authority — this only warms its cache, guarded by
         # the same revisions, so a stale warm entry is recomputed, never
         # trusted. Failure is swallowed: prefetch must never fail admission.
-        self._svc._spawn_static_prefetch(created)
+        self._ports.spawn_static_prefetch(created)
         if enqueue:
             await task_manager.enqueue(created.id)
             await self._mark_intake_phase(created.id, "enqueued")
@@ -143,7 +206,7 @@ class TaskAPI:
         return created
 
     async def _mark_intake_phase(self, task_id: str, phase: str) -> None:
-        store = getattr(self._svc, "_store_tasks", None)
+        store = self._ports.store_tasks
         update = getattr(store, "update_metadata", None)
         if callable(update):
             await update(
@@ -168,16 +231,16 @@ class TaskAPI:
             # its task/claim transition before generic intake can enqueue it.
             return
         try:
-            await self._svc._record_canonical_user_turn(user_request or task, task)
+            await self._ports.record_canonical_user_turn(user_request or task, task)
             await self._mark_intake_phase(task.id, "canonical_user_turn_persisted")
             if enqueue:
-                await self._svc._require_task_manager().enqueue(task.id)
+                await self._ports.require_task_manager().enqueue(task.id)
                 await self._mark_intake_phase(task.id, "enqueued")
         except Exception:
             # A CREATED row is authoritative. If its causal root cannot be
             # reconstructed or queued, make the operator-visible recovery
             # state explicit instead of leaving inert work behind.
-            manager = self._svc._require_task_manager()
+            manager = self._ports.require_task_manager()
             await manager.transition(
                 task.id,
                 TaskStatus.RECOVERY_REQUIRED,
@@ -187,7 +250,7 @@ class TaskAPI:
 
     async def reconcile_created_intake(self) -> dict[str, int]:
         """Repair ordinary CREATED tasks before workers begin claiming work."""
-        manager = self._svc._require_task_manager()
+        manager = self._ports.require_task_manager()
         rows = await manager.list_by_status(TaskStatus.CREATED)
         recovered = 0
         quarantined = 0
@@ -205,17 +268,13 @@ class TaskAPI:
             recovered += 1
         return {"recovered": recovered, "quarantined": quarantined, "skipped": skipped}
 
-    # ------------------------------------------------------------------ #
-    # Observation
-    # ------------------------------------------------------------------ #
-
     async def run_task(self, task_id: str) -> TaskSpec:
         """Drive the NAMED task through the kernel synchronously.
 
         The named task is acquired by id and run by the kernel, so it does not
         race the background ``run_forever`` worker for the next claimed task.
         """
-        worker = self._svc._require_worker()
+        worker = self._ports.require_worker()
         await worker.run_task(task_id)
         return await self.get_task(task_id)
 
@@ -223,12 +282,12 @@ class TaskAPI:
         """Poll until the task reaches a terminal status (or timeout)."""
         import time
 
-        deadline = time.monotonic() + (timeout or 60.0)
+        deadline = time.monotonic() + (60.0 if timeout is None else max(0.0, float(timeout)))
         while True:
             task = await self.get_task(task_id)
             status = (task.metadata or {}).get("status")
             if status in {s.value for s in TERMINAL_STATUSES}:
-                manager = self._svc._task_manager
+                manager = self._ports.task_manager
                 if manager is not None and hasattr(manager, "wait_for_finalization"):
                     remaining = max(deadline - time.monotonic(), 0.0)
                     try:
@@ -241,7 +300,7 @@ class TaskAPI:
                         # optional observer must not turn a completed task
                         # into an unavailable one for callers with a deadline.
                         pass
-                kernel = self._svc._kernel
+                kernel = self._ports.kernel
                 if kernel is not None and hasattr(kernel, "wait_for_completion"):
                     remaining = max(deadline - time.monotonic(), 0.0)
                     try:
@@ -257,11 +316,11 @@ class TaskAPI:
 
     async def get_task(self, task_id: str) -> TaskSpec:
         """Return the persisted :class:`TaskSpec` (status in ``metadata["status"]``)."""
-        return await self._svc._require_task_manager().get(task_id)
+        return await self._ports.require_task_manager().get(task_id)
 
     async def get_result(self, task_id: str):
         """Return the :class:`TaskResult` (or None if not yet finalised)."""
-        mgr = self._svc._require_task_manager()
+        mgr = self._ports.require_task_manager()
         return await mgr.get_result(task_id)
 
     async def stream_events(self, task_id: str, after_sequence: int = 0):
@@ -272,7 +331,7 @@ class TaskAPI:
         out as they arrive. The generator stops once the task reaches a
         terminal status (and flushes any remaining events).
         """
-        events = self._svc._require_events()
+        events = self._ports.require_events()
         cursor = after_sequence
         while True:
             items = await events.list_for_task(task_id, after_sequence=cursor)
@@ -299,7 +358,7 @@ class TaskAPI:
         Backs the OI stream viewer: a read-only global subscription to the
         canonical event log. Never terminates; the caller cancels it.
         """
-        events = self._svc._require_events()
+        events = self._ports.require_events()
         cursor = after_rowid
         while True:
             items = await events.list_recent(after_rowid=cursor, limit=limit)

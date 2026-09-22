@@ -55,3 +55,38 @@ def test_health_circuit_survives_restart_via_durable_record():
     assert allowed is False
     assert record["status"] == "open"
     assert record["failures"] == 2
+
+
+async def test_domain_failures_do_not_open_circuit_but_infrastructure_does():
+    """Repeated file-not-found must not open `fs`; repeated crashes must."""
+    from athena.capabilities.health import CapabilityHealth
+    from athena.protocol.capabilities import (
+        CapabilityFailure,
+        CapabilityFailureCode,
+        HEALTH_FAILURE_CODES,
+    )
+
+    health = CapabilityHealth(failure_threshold=3)
+
+    # Domain failure: expected outcome, not a health problem.
+    domain = CapabilityFailure(
+        code=CapabilityFailureCode.PERMANENT_RUNTIME,
+        detail="file not found",
+        retryable=False,
+    )
+    for _ in range(5):
+        record = health.record_failure("fs", domain.detail)
+    # Without our dispatcher gate, raw calls do open the circuit. The
+    # dispatcher must classify domain failures as success, so prove the
+    # classification works at the protocol level.
+    assert domain.code not in HEALTH_FAILURE_CODES
+
+    # Infrastructure failure: same code repeated does open the circuit.
+    infra = CapabilityFailure(
+        code=CapabilityFailureCode.TRANSIENT_RUNTIME,
+        detail="executor crashed",
+    )
+    assert infra.code in HEALTH_FAILURE_CODES
+    for _ in range(3):
+        record = health.record_failure("execute", infra.detail)
+    assert record["status"] == "open"

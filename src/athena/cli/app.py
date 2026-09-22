@@ -31,7 +31,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from athena.execution.environment import VerificationEnvironment
 from athena.cli.operator_handlers import (
     cmd_artifacts,
     cmd_candidates,
@@ -62,9 +61,14 @@ def _env(*names: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def _autonomy(value: str | None) -> AutonomyLevel:
+def _autonomy(value: str | None) -> AutonomyLevel | None:
+    """Return None when the operator did not select autonomy.
+
+    ``None`` means the service resolves its configured default; transports
+    must not manufacture their own SUPERVISED fallback.
+    """
     if not value:
-        return AutonomyLevel.SUPERVISED
+        return None
     try:
         return AutonomyLevel(value.strip().lower())
     except ValueError:
@@ -122,7 +126,9 @@ def build_config(o: "Options"):
         cli_overrides={
             "db_path": o.db_path,
             "workspace_root": (os.path.abspath(os.path.expanduser(root)) if root else None),
-            "autonomy": _autonomy(o.autonomy).value if o.autonomy else None,
+            "autonomy": (
+                autonomy_val.value if (autonomy_val := _autonomy(o.autonomy)) is not None else None
+            ),
             "artifact_root": o.artifact_root,
             "mascot": o.mascot,
             "display": getattr(o, "display", None),
@@ -943,10 +949,11 @@ async def _cmd_run(o: Options, service: Any) -> int:
         task_id = getattr(task, "id", task)
         from athena.cli.chat import stream_task
 
+        autonomy = _autonomy(o.autonomy)
         result = await stream_task(
             service,
             task_id,
-            autonomy=_autonomy(o.autonomy),
+            autonomy=autonomy if autonomy is not None else service.config.autonomy_level,
             surface=surface,
         )
         if result is not None:
@@ -1050,18 +1057,16 @@ async def _cmd_self(o: Options, service: Any) -> int:
         return 2
     try:
         root = _athena_checkout_root()
-        verification = VerificationEnvironment.from_project(
-            root, include_project_root=True, include_rust=True
-        )
+        verification = service.self_host_preflight(workspace_root=root)
     except ValueError as exc:
         print(f"athena self: {exc}", file=sys.stderr)
         return 2
 
     print("SELF PREFLIGHT")
     print("  ✓ Athena source checkout")
-    print(f"  ✓ uv ({verification.uv})")
-    print(f"  ✓ Python ({verification.python})")
-    print(f"  ✓ .venv ({verification.environment_root})")
+    print(f"  ✓ uv ({verification.get('uv')})")
+    print(f"  ✓ Python ({verification.get('python')})")
+    print(f"  ✓ .venv ({verification.get('environment_root')})")
     print("  ✓ ruff / mypy / pytest")
     print("  ✓ cargo / rustc")
     if os.name == "posix":
@@ -1720,7 +1725,7 @@ async def _cmd_acp(service: Any) -> int:
 
     try:
         while True:
-            from athena.execution.async_call import run_blocking
+            from athena.concurrency import run_blocking
 
             line = await run_blocking(sys.stdin.readline)
             if not line:

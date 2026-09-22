@@ -7,8 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from athena.capabilities.dispatcher import SuspendedCall
-from athena.capabilities.registry import validate_schema
+from athena.protocol.continuations import SuspendedCall
 from athena.protocol.capabilities import (
     CapabilityRequest,
     CapabilityRequestOrigin,
@@ -17,6 +16,7 @@ from athena.protocol.capabilities import (
 )
 from athena.protocol.ids import new_id
 from athena.protocol.tasks import CapabilityPolicy, ResourceBudget, WorkspaceSpec
+from athena.schema import validate_schema
 from athena.workflows.models import Workflow
 from athena.workflows.runs import (
     WorkflowRunIdentityError,
@@ -480,7 +480,7 @@ class WorkflowExecutor:
                             task_budget=task_budget,
                             _generated_call_depth=generated_call_depth,
                             _generated_call_chain=generated_call_chain,
-                            _directives=(
+                            directives=(
                                 DispatchDirectives(
                                     workflow_run_id=run_id,
                                     workflow_step_id=step.id,

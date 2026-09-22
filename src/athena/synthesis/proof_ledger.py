@@ -18,7 +18,7 @@ from athena.affordances.models import GeneratedCapability
 from athena.protocol.events import EV, Event
 
 if TYPE_CHECKING:
-    from athena.synthesis.engine import SyntheticCapability
+    from athena.synthesis.models import SyntheticCapability
     from athena.synthesis.engine import SynthesisEngine
 
 _logger = logging.getLogger(__name__)

@@ -4,6 +4,7 @@ import pytest
 
 from athena.protocol.tasks import TaskStatus
 from athena.service.service import AthenaService
+from athena.service.recovery import RecoveryCoordinator
 
 
 class _TaskStore:
@@ -34,6 +35,7 @@ class _TaskManager:
 @pytest.mark.asyncio
 async def test_unavailable_required_pack_quarantines_resumable_task():
     service = AthenaService.__new__(AthenaService)
+    service._recovery = RecoveryCoordinator(service)
     task_manager = _TaskManager()
 
     quarantined = await service._quarantine_tasks_for_packs(

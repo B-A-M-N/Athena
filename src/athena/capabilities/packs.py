@@ -1,13 +1,13 @@
 """Governed capability-pack lifecycle."""
 
 from __future__ import annotations
+from athena.capabilities.operations import native_descriptor
 
 import json
 from typing import Any, Mapping
 
 from athena.packs.manager import PackManager
 from athena.protocol.capabilities import (
-    CapabilityDescriptor,
     CapabilityOrigin,
     CapabilityRequest,
     CapabilityResult,
@@ -33,7 +33,7 @@ def _pack_effects(arguments: Mapping[str, Any]) -> frozenset[EffectClass]:
 
 
 class PacksCapability:
-    descriptor = CapabilityDescriptor(
+    descriptor = native_descriptor(
         id="packs",
         description=(
             "Inspect and manage declarative Athena capability packs. Packs are "
@@ -88,6 +88,7 @@ class PacksCapability:
     async def invoke(self, request: CapabilityRequest, *, context=None, **kwargs):
         del kwargs
         args = dict(request.arguments or {})
+        lifecycle = getattr(self._manager, "lifecycle", self._manager)
         operation = str(args.get("operation") or "")
         try:
             if operation == "search":
@@ -124,7 +125,7 @@ class PacksCapability:
                         ok=False,
                         error="remote pack installation requires operator approval",
                     )
-                state = await self._manager.install_remote(
+                state = await lifecycle.install_remote(
                     str(args.get("source_url") or ""),
                     expected_sha256=args.get("expected_sha256"),
                     expected_sha256_source=(
@@ -154,9 +155,9 @@ class PacksCapability:
                 if not source:
                     return _result(request, ok=False, error=f"{operation} requires source_path")
                 state = (
-                    await self._manager.install(source, allowed_root=_workspace_root(context))
+                    await lifecycle.install(source, allowed_root=_workspace_root(context))
                     if operation == "install"
-                    else await self._manager.upgrade(source, allowed_root=_workspace_root(context))
+                    else await lifecycle.upgrade(source, allowed_root=_workspace_root(context))
                 )
                 return _result(request, output=json.dumps(state.to_record()))
             pack_id = str(args.get("pack_id") or "")
@@ -167,24 +168,24 @@ class PacksCapability:
                     return _result(
                         request, ok=False, error="pack activation requires operator promotion"
                     )
-                value = (await self._manager.enable(pack_id)).to_record()
+                value = (await lifecycle.enable(pack_id)).to_record()
             elif operation == "disable":
                 if request.origin.value == "model":
                     return _result(
                         request, ok=False, error="pack deactivation requires operator promotion"
                     )
-                value = (await self._manager.disable(pack_id)).to_record()
+                value = (await lifecycle.disable(pack_id)).to_record()
             elif operation == "uninstall":
                 if request.origin.value == "model":
                     return _result(
                         request, ok=False, error="pack removal requires operator promotion"
                     )
-                value = {"pack_id": pack_id, "uninstalled": await self._manager.uninstall(pack_id)}
+                value = {"pack_id": pack_id, "uninstalled": await lifecycle.uninstall(pack_id)}
             elif operation == "health":
-                state = await self._manager._store.get(pack_id)  # noqa: SLF001
-                if state is None:
+                health = await self._manager.health_for(pack_id)
+                if health is None:
                     return _result(request, ok=False, error=f"pack not found: {pack_id}")
-                value = self._manager.health(state)
+                value = health
             else:
                 return _result(request, ok=False, error=f"unknown operation: {operation}")
             return _result(request, output=json.dumps(value, default=str))

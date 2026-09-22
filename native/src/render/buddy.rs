@@ -1,3 +1,4 @@
+use super::owl_field::draw_sampled_owl;
 use super::primitives::draw_rect;
 use super::theme::{AMBER, FAILURE, PRIMARY, SECONDARY, SUCCESS};
 use crate::buddy::{
@@ -6,6 +7,10 @@ use crate::buddy::{
 };
 
 pub(crate) fn draw_buddy(x: f32, y: f32, state: &str, status: &str, character: &str, phase: f32) {
+    if character.eq_ignore_ascii_case("owl") {
+        draw_sampled_owl(x, y, status, phase, false);
+        return;
+    }
     let Some(kind) = BuddyKind::parse(character) else {
         return;
     };
@@ -82,7 +87,7 @@ pub(crate) fn draw_buddy(x: f32, y: f32, state: &str, status: &str, character: &
 
 #[cfg(test)]
 mod tests {
-    use super::super::buddy::{BuddyKind, REQUIRED_POSES, SPRITE_FRAME_COUNT, sprite_frame};
+    use crate::buddy::{BuddyKind, REQUIRED_POSES, SPRITE_FRAME_COUNT, sprite_frame};
 
     #[test]
     fn all_semantic_poses_have_multiple_matrix_frames() {

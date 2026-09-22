@@ -53,6 +53,14 @@ kernel-router-construction
     when the current tree is clean, so a future fallback cannot silently add a
     second routing authority.
 
+context-kernel-import
+    Context requirements and projections must not import kernel authority;
+    neutral evidence predicates belong below both packages.
+
+schema-private-import
+    Cross-package consumers must use the neutral JSON Schema utility rather
+    than importing the capability registry's compatibility-only private shim.
+
 Adding a rule is a one-line addition to the RULES table below plus (option
 ally) a checker entry in CHECKERS.
 
@@ -91,17 +99,12 @@ BROAD_EXCEPTION_ROOTS = frozenset(
 BROAD_EXCEPTION_POLICY = "docs/broad-exception-policy.json"
 ARCHITECTURE_DEBT_WAIVERS = "docs/architecture-debt-waivers.json"
 ARCHITECTURE_EXCEPTION_POLICY = "docs/architecture-exception-policy.json"
+ARCHITECTURE_DEPENDENCY_BASELINE = "docs/architecture-dependency-baseline.json"
 
 # These are deliberately checked-in debt ceilings, not a claim that the
 # modules are healthy.  The first follow-up refactor must lower these values;
 # until then a one-line increase is a visible architecture failure.
-LEGACY_SIZE_BUDGETS: dict[str, int] = {
-    "service/service.py": 3_617,
-    "kernel/kernel.py": 1_996,
-    "cli/app.py": 2_356,
-    "capabilities/research.py": 1_789,
-    "packs/manager.py": 1_795,
-}
+LEGACY_SIZE_BUDGETS: dict[str, int] = {}
 DEFAULT_MODULE_SIZE_BUDGET = 2_000
 
 # Native orchestration/rendering modules have the same ratcheted ceiling.
@@ -109,12 +112,11 @@ DEFAULT_MODULE_SIZE_BUDGET = 2_000
 # lower a value, never increase it. Feature work must first extract a helper
 # rather than silently expanding an authority module.
 RUST_SIZE_BUDGETS: dict[str, int] = {
-    "main.rs": 1_658,
-    "x11.rs": 3_294,
-    "render/oi.rs": 2_890,
     "render/chassis.rs": 1_169,
 }
 DEFAULT_RUST_MODULE_SIZE_BUDGET = 2_000
+
+EXCEPTION_ID_PATTERN = re.compile(r"architecture-exception:\s*([a-z0-9][a-z0-9_-]*)\b")
 
 # ---------------------------------------------------------------------------
 # Data tables — new rules are one-line additions here.
@@ -137,7 +139,174 @@ def _r(pattern: str) -> re.Pattern:
     return re.compile(pattern)
 
 
+AST_DOMAIN_HOST_RULE = "domain-host-attribute-reachthrough"
+AST_RULE_IDS = frozenset({AST_DOMAIN_HOST_RULE})
+DOMAIN_HOST_ROOTS = (
+    "fusion/",
+    "packs/",
+    "research/",
+    "synthesis/",
+    "scheduler/",
+    "service/",
+)
+
+
+def _domain_host_hits(root: Path, path: Path, rel: str, text: str) -> list[Hit]:
+    """AST detection with a committed per-file migration ratchet.
+
+    The baseline is a ratchet: reviewed existing sites may remain up to their
+    committed count. New sites fail the lane, and entries must be removed as
+    ports migration completes.
+    """
+    """AST detection of private reach-through across domain owner boundaries.
+
+    Flags:
+    * ``self._host._anything_private``
+    * ``self.service._anything_private``
+    * ``self._ports._anything_private``
+    * ``getattr(host/service/port receiver, "_private")``
+
+    Public port methods are allowed. A line-level allow annotation remains
+    available for narrow reviewed migrations.
+    """
+    if not rel.startswith(DOMAIN_HOST_ROOTS):
+        return []
+    try:
+        tree = ast.parse(text, filename=str(path))
+    except SyntaxError as exc:
+        return [
+            Hit(
+                AST_DOMAIN_HOST_RULE,
+                f"{SRC}/{rel}",
+                exc.lineno or 1,
+                str(exc),
+                "violation",
+            )
+        ]
+    lines = text.splitlines()
+    hits: list[Hit] = []
+
+    def _private(name: object) -> bool:
+        return isinstance(name, str) and name.startswith("_") and not name.startswith("__")
+
+    def _receiver_is_host(node: ast.AST) -> bool:
+        """Return whether the receiver is a host/service/port boundary."""
+        if not isinstance(node, ast.Attribute):
+            return False
+        base = node.value
+        if isinstance(base, ast.Attribute):
+            return base.attr in {"_host", "service", "_service", "host", "_ports"}
+        if isinstance(base, ast.Name):
+            return base.id in {"_host", "service", "_service", "host", "_ports"}
+        return False
+
+    def _hit(node: ast.AST, detail: str) -> None:
+        lineno = getattr(node, "lineno", 1)
+        line = lines[lineno - 1] if 0 < lineno <= len(lines) else ""
+        if _annotated_allow_by_id(line, AST_DOMAIN_HOST_RULE):
+            return
+        hits.append(
+            Hit(
+                AST_DOMAIN_HOST_RULE,
+                f"{SRC}/{rel}",
+                lineno,
+                detail,
+                "violation",
+            )
+        )
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and _private(node.attr) and _receiver_is_host(node):
+            _hit(node, f"private owner reach-through: .{node.attr}")
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+        ):
+            if node.args:
+                receiver = node.args[0]
+                name_arg = node.args[1] if len(node.args) > 1 else None
+                literal = name_arg.value if isinstance(name_arg, ast.Constant) else None
+                if _private(literal):
+                    receiver_is_host = isinstance(receiver, (ast.Attribute, ast.Name)) and (
+                        (
+                            isinstance(receiver, ast.Attribute)
+                            and receiver.attr
+                            in {"_host", "service", "_service", "host", "_ports"}
+                        )
+                        or (
+                            isinstance(receiver, ast.Name)
+                            and receiver.id in {"_host", "service", "_service", "host", "_ports"}
+                        )
+                    )
+                    if receiver_is_host:
+                        _hit(node, f"private owner getattr: {literal}")
+
+    allow_count = 0
+    baseline_path = root / "docs" / "architecture-size-baseline.json"
+    try:
+        baseline_payload = json.loads(baseline_path.read_text(encoding="utf-8"))
+        allow_count = int(
+            (baseline_payload.get("domain_host_allowlist", {}).get("files", {}) or {}).get(rel, 0)
+        )
+    except (OSError, ValueError, TypeError, AttributeError):
+        allow_count = 0
+    if allow_count and len(hits) <= allow_count:
+        return [
+            Hit(
+                AST_DOMAIN_HOST_RULE,
+                f"{SRC}/{rel}",
+                1,
+                f"migration site: {len(hits)} of {allow_count} allowed",
+                "info",
+            )
+        ]
+    if allow_count and len(hits) > allow_count:
+        hits.append(
+            Hit(
+                "domain-host-migration-ratchet",
+                f"{SRC}/{rel}",
+                1,
+                f"domain-host reach-through grew: {len(hits)} sites; baseline allows {allow_count}",
+                "violation",
+            )
+        )
+    return hits
+
+
+AST_IMPORT_RULES = frozenset(
+    {
+        "cross-package-private-import",
+        "protocol-implementation-import",
+        "state-authority-import",
+        "kernel-interface-import",
+        "interface-authority-import",
+        "context-kernel-import",
+        "task-kernel-import",
+        "schema-private-import",
+    }
+)
+
+
 RULES: tuple[Rule, ...] = (
+    Rule(
+        id="owner-backimport",
+        description="dynamically imported owner module helper (_mod) — new "
+        "extracted mechanisms must take explicit ports, not dynamic owner "
+        "imports (review item 15)",
+        pattern=_r(r"^def _mod\s*\("),
+        include=("",),
+        exclude=(),
+        allow=(),
+    ),
+    Rule(
+        id="cross-package-private-import",
+        description="cross-package imports of private modules or names",
+        pattern=_r(r"$^"),
+        include=("",),
+        exclude=(),
+        allow=(),
+    ),
     Rule(
         id="router-construction",
         description="ModelRouter constructed outside the sanctioned site "
@@ -201,6 +370,88 @@ RULES: tuple[Rule, ...] = (
         exclude=(),
         allow=(),
     ),
+    Rule(
+        id="protocol-implementation-import",
+        description="protocol imports an implementation package instead of receiving a contract",
+        pattern=_r(
+            r"^\s*(?:from\s+athena\.(?!protocol(?:\.|\b))|import\s+athena\.(?!protocol(?:\.|\b)))"
+        ),
+        include=("protocol/",),
+        exclude=(),
+        allow=(),
+    ),
+    Rule(
+        id="state-authority-import",
+        description="state imports kernel, service, interface, or execution authority",
+        pattern=_r(
+            r"^\s*(?:from|import)\s+athena\.(?:kernel|service|cli|api|acp|execution)(?:\.|\b)"
+        ),
+        include=("state/",),
+        exclude=(),
+        allow=(),
+    ),
+    Rule(
+        id="kernel-interface-import",
+        description="kernel imports an interface or application facade",
+        pattern=_r(r"^\s*(?:from|import)\s+athena\.(?:service|cli|api|acp)(?:\.|\b)"),
+        include=("kernel/",),
+        exclude=(),
+        allow=(),
+    ),
+    Rule(
+        id="interface-authority-import",
+        description="interface imports a reasoning, capability, model, or execution authority directly",
+        pattern=_r(
+            r"^\s*(?:from|import)\s+athena\.(?:kernel|capabilities|models|execution)(?:\.|\b)"
+        ),
+        include=("cli/", "api/", "acp/"),
+        exclude=(),
+        allow=(),
+    ),
+    Rule(
+        id="context-kernel-import",
+        description="context imports kernel authority instead of a neutral contract",
+        pattern=_r(r"^\s*(?:from|import)\s+athena\.kernel(?:\.|\b)"),
+        include=("context/",),
+        exclude=(),
+        allow=(),
+    ),
+    Rule(
+        id="task-kernel-import",
+        description="task lifecycle imports kernel implementation instead of protocol codecs",
+        pattern=_r(r"^\s*(?:from|import)\s+athena\.kernel(?:\.|\b)"),
+        include=("tasks/",),
+        exclude=(),
+        allow=(),
+    ),
+    Rule(
+        id="schema-private-import",
+        description="cross-package code imports the registry's private schema compiler",
+        pattern=_r(
+            r"^\s*from\s+athena\.capabilities\.registry\s+import[^\n]*\b_compile_validator\b"
+        ),
+        include=("",),
+        exclude=(),
+        allow=(),
+    ),
+    Rule(
+        id="domain-host-attribute-reachthrough",
+        description="extracted domain mechanism reaches through a whole-host "
+        "reference to owner internals; domain mechanisms must receive explicit "
+        "ports (review items 28-29, 48). AST rule: detects private attribute "
+        "loads through host/service receivers and private getattr.",
+        pattern=_r(r"AST_RULE"),
+        include=(
+            "fusion/",
+            "packs/",
+            "research/",
+            "synthesis/",
+            "scheduler/",
+            "service/",
+        ),
+        exclude=(),
+        allow=(),
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -230,6 +481,17 @@ def _classify(rule: Rule, rel: str) -> str | None:
     return "violation"
 
 
+def _annotated_allow_by_id(line: str, rule_id: str) -> bool:
+    """Allow one reviewed physical call site for a named AST rule."""
+    return bool(
+        re.search(
+            rf"#\s*architecture-lint:\s*allow\s+{re.escape(rule_id)}\b",
+            line,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
 def _annotated_allow(rule: Rule, line: str) -> bool:
     """Allow one reviewed physical call site, never an entire file."""
     return bool(
@@ -241,9 +503,14 @@ def _annotated_allow(rule: Rule, line: str) -> bool:
     )
 
 
+def _exception_id(line: str) -> str | None:
+    match = EXCEPTION_ID_PATTERN.search(line)
+    return match.group(1) if match else None
+
+
 def _load_exception_catalog(
     root: Path,
-) -> tuple[dict[tuple[str, str, int], dict[str, object]], list[Hit]]:
+) -> tuple[dict[tuple[str, str, str], dict[str, object]], list[Hit]]:
     """Load exact exception sites and reject malformed or duplicate entries."""
     path = root / ARCHITECTURE_EXCEPTION_POLICY
     if not path.exists():
@@ -262,19 +529,19 @@ def _load_exception_catalog(
         ]
     categories = payload.get("categories") if isinstance(payload, dict) else None
     allowed_categories = set(categories) if isinstance(categories, dict) else set()
-    catalog: dict[tuple[str, str, int], dict[str, object]] = {}
+    catalog: dict[tuple[str, str, str], dict[str, object]] = {}
     hits: list[Hit] = []
     rule_names = {
         "subprocess": "subprocess-outside-approved-backends",
         "raw_database": "raw-db-outside-state",
     }
-    if not isinstance(payload, dict) or payload.get("schema") != 1:
+    if not isinstance(payload, dict) or payload.get("schema") != 2:
         return {}, [
             Hit(
                 "architecture-exception-policy",
                 ARCHITECTURE_EXCEPTION_POLICY,
                 1,
-                "exception policy must declare schema 1",
+                "exception policy must declare schema 2",
                 "violation",
             )
         ]
@@ -293,6 +560,7 @@ def _load_exception_catalog(
             continue
         for index, entry in enumerate(entries, start=1):
             path_value = entry.get("path") if isinstance(entry, dict) else None
+            exception_id = entry.get("id") if isinstance(entry, dict) else None
             line_value = entry.get("line") if isinstance(entry, dict) else None
             category = entry.get("category") if isinstance(entry, dict) else None
             rationale = entry.get("rationale") if isinstance(entry, dict) else None
@@ -318,6 +586,8 @@ def _load_exception_catalog(
             valid = (
                 isinstance(path_value, str)
                 and path_value.startswith(f"{SRC}/")
+                and isinstance(exception_id, str)
+                and bool(re.fullmatch(r"[a-z0-9][a-z0-9_-]*", exception_id))
                 and isinstance(line_value, int)
                 and not isinstance(line_value, bool)
                 and line_value > 0
@@ -327,7 +597,7 @@ def _load_exception_catalog(
                 and bool(rationale.strip())
                 and classification_valid
             )
-            key = (rule_name, str(path_value), int(line_value or 0))
+            key = (rule_name, str(path_value), str(exception_id or ""))
             if not valid or key in catalog:
                 hits.append(
                     Hit(
@@ -402,6 +672,367 @@ def _broad_exception_hits(root: Path, path: Path, rel: str, text: str) -> list[H
     return hits
 
 
+def _package_names(src_dir: Path) -> set[str]:
+    return {path.name for path in src_dir.iterdir() if path.is_dir() and any(path.glob("*.py"))}
+
+
+def _athena_imports(tree: ast.AST) -> list[tuple[str, ast.AST, tuple[str, ...]]]:
+    """Return absolute Athena imports and their imported private names."""
+    imports: list[tuple[str, ast.AST, tuple[str, ...]]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.startswith("athena."):
+                    imports.append((alias.name, node, ()))
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            if node.module.startswith("athena."):
+                private_names = tuple(
+                    alias.name for alias in node.names if alias.name.startswith("_")
+                )
+                imports.append((node.module, node, private_names))
+    return imports
+
+
+def _ast_import_hits(
+    root: Path,
+    path: Path,
+    rel: str,
+    text: str,
+    package_names: set[str],
+) -> tuple[list[Hit], set[tuple[str, str]]]:
+    """Check import boundaries from parsed syntax, including multiline imports."""
+    try:
+        tree = ast.parse(text, filename=str(path))
+    except SyntaxError as exc:
+        return [
+            Hit(
+                "architecture-import-parse",
+                f"{SRC}/{rel}",
+                exc.lineno or 1,
+                str(exc),
+                "violation",
+            )
+        ], set()
+
+    parts = rel.split("/")
+    if len(parts) < 2 or parts[0] not in package_names:
+        return [], set()
+    source_package = parts[0]
+    hits: list[Hit] = []
+    edges: set[tuple[str, str]] = set()
+    forbidden_targets: dict[str, set[str]] = {
+        "state-authority-import": {"kernel", "service", "cli", "api", "acp", "execution"},
+        "kernel-interface-import": {"service", "cli", "api", "acp"},
+        "interface-authority-import": {"kernel", "capabilities", "models", "execution"},
+    }
+    for module, node, private_names in _athena_imports(tree):
+        module_parts = module.split(".")
+        if len(module_parts) < 2 or module_parts[1] not in package_names:
+            continue
+        target_package = module_parts[1]
+        edges.add((source_package, target_package))
+        line = getattr(node, "lineno", 1)
+        if source_package != target_package:
+            private_modules = tuple(part for part in module_parts[2:] if part.startswith("_"))
+            private_items = tuple(dict.fromkeys((*private_modules, *private_names)))
+            if private_items:
+                hits.append(
+                    Hit(
+                        "cross-package-private-import",
+                        f"{SRC}/{rel}",
+                        line,
+                        f"imports private cross-package names: {', '.join(private_items)}",
+                        "violation",
+                    )
+                )
+        if source_package == "protocol" and target_package != "protocol":
+            hits.append(
+                Hit(
+                    "protocol-implementation-import",
+                    f"{SRC}/{rel}",
+                    line,
+                    f"protocol imports implementation package {target_package!r}",
+                    "violation",
+                )
+            )
+        if target_package in forbidden_targets.get("state-authority-import", set()):
+            if source_package == "state":
+                hits.append(
+                    Hit(
+                        "state-authority-import",
+                        f"{SRC}/{rel}",
+                        line,
+                        f"state imports authority package {target_package!r}",
+                        "violation",
+                    )
+                )
+        if (
+            source_package == "kernel"
+            and target_package in forbidden_targets["kernel-interface-import"]
+        ):
+            hits.append(
+                Hit(
+                    "kernel-interface-import",
+                    f"{SRC}/{rel}",
+                    line,
+                    f"kernel imports interface/facade package {target_package!r}",
+                    "violation",
+                )
+            )
+        if (
+            source_package in {"cli", "api", "acp"}
+            and target_package in forbidden_targets["interface-authority-import"]
+        ):
+            hits.append(
+                Hit(
+                    "interface-authority-import",
+                    f"{SRC}/{rel}",
+                    line,
+                    f"interface imports authority package {target_package!r}",
+                    "violation",
+                )
+            )
+        if source_package == "context" and target_package == "kernel":
+            hits.append(
+                Hit(
+                    "context-kernel-import",
+                    f"{SRC}/{rel}",
+                    line,
+                    "context imports kernel authority",
+                    "violation",
+                )
+            )
+        if source_package == "tasks" and target_package == "kernel":
+            hits.append(
+                Hit(
+                    "task-kernel-import",
+                    f"{SRC}/{rel}",
+                    line,
+                    "task lifecycle imports kernel implementation",
+                    "violation",
+                )
+            )
+        if module == "athena.capabilities.registry" and "_compile_validator" in private_names:
+            hits.append(
+                Hit(
+                    "schema-private-import",
+                    f"{SRC}/{rel}",
+                    line,
+                    "imports the registry's private schema compiler",
+                    "violation",
+                )
+            )
+    return hits, edges
+
+
+def _strongly_connected_components(
+    graph: dict[str, set[str]],
+) -> tuple[tuple[str, ...], ...]:
+    """Return package cycles as sorted, deterministic strongly connected components."""
+    index = 0
+    indices: dict[str, int] = {}
+    lowlinks: dict[str, int] = {}
+    stack: list[str] = []
+    on_stack: set[str] = set()
+    components: list[tuple[str, ...]] = []
+
+    def visit(node: str) -> None:
+        nonlocal index
+        indices[node] = lowlinks[node] = index
+        index += 1
+        stack.append(node)
+        on_stack.add(node)
+        for target in sorted(graph.get(node, ())):
+            if target not in indices:
+                visit(target)
+                lowlinks[node] = min(lowlinks[node], lowlinks[target])
+            elif target in on_stack:
+                lowlinks[node] = min(lowlinks[node], indices[target])
+        if lowlinks[node] != indices[node]:
+            return
+        component: list[str] = []
+        while True:
+            target = stack.pop()
+            on_stack.remove(target)
+            component.append(target)
+            if target == node:
+                break
+        if len(component) > 1:
+            components.append(tuple(sorted(component)))
+
+    for node in sorted(graph):
+        if node not in indices:
+            visit(node)
+    return tuple(sorted(components))
+
+
+def _dependency_cycles(
+    root: Path,
+    files: list[Path],
+    package_names: set[str],
+) -> tuple[tuple[str, ...], ...]:
+    graph = {package: set() for package in package_names}
+    for path in files:
+        rel = str(path.relative_to(root / SRC))
+        rel_parts = rel.split("/")
+        if len(rel_parts) < 2 or rel_parts[0] not in package_names:
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"), filename=str(path))
+        except (OSError, SyntaxError):
+            continue
+        source_package = rel_parts[0]
+        for module, _node, _private_names in _athena_imports(tree):
+            module_parts = module.split(".")
+            if len(module_parts) > 1 and module_parts[1] in package_names:
+                graph[source_package].add(module_parts[1])
+    return _strongly_connected_components(graph)
+
+
+def _load_dependency_cycles(
+    root: Path,
+) -> tuple[set[tuple[str, ...]] | None, list[Hit]]:
+    path = root / ARCHITECTURE_DEPENDENCY_BASELINE
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return None, [
+            Hit(
+                "architecture-cycle-baseline",
+                ARCHITECTURE_DEPENDENCY_BASELINE,
+                1,
+                f"missing or invalid dependency baseline: {exc}",
+                "violation",
+            )
+        ]
+    cycles = payload.get("cycles") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict) or payload.get("schema") != 1 or not isinstance(cycles, list):
+        return None, [
+            Hit(
+                "architecture-cycle-baseline",
+                ARCHITECTURE_DEPENDENCY_BASELINE,
+                1,
+                "dependency baseline must declare schema 1 and a cycles list",
+                "violation",
+            )
+        ]
+    parsed: set[tuple[str, ...]] = set()
+    hits: list[Hit] = []
+    for line, cycle in enumerate(cycles, start=1):
+        valid = (
+            isinstance(cycle, list)
+            and len(cycle) > 1
+            and all(isinstance(item, str) and item for item in cycle)
+            and cycle == sorted(set(cycle))
+        )
+        normalized = tuple(cycle) if isinstance(cycle, list) else ()
+        if not valid or normalized in parsed:
+            hits.append(
+                Hit(
+                    "architecture-cycle-baseline",
+                    ARCHITECTURE_DEPENDENCY_BASELINE,
+                    line,
+                    "cycles must be unique, sorted lists containing at least two package names",
+                    "violation",
+                )
+            )
+            continue
+        parsed.add(normalized)
+    return parsed, hits
+
+
+def _is_allowed_cycle_refinement(
+    current: tuple[str, ...],
+    accepted: set[tuple[str, ...]],
+) -> bool:
+    """Return whether a current SCC is equal to or contained by an accepted SCC."""
+    current_set = set(current)
+    return any(current_set <= set(previous) for previous in accepted)
+
+
+def _dependency_cycle_hits(
+    root: Path,
+    files: list[Path],
+    package_names: set[str],
+) -> list[Hit]:
+    baseline, hits = _load_dependency_cycles(root)
+    if baseline is None:
+        return hits
+    current = set(_dependency_cycles(root, files, package_names))
+    for cycle in sorted(
+        cycle for cycle in current if not _is_allowed_cycle_refinement(cycle, baseline)
+    ):
+        hits.append(
+            Hit(
+                "architecture-cycle-baseline",
+                ARCHITECTURE_DEPENDENCY_BASELINE,
+                1,
+                "new package cycle is not in the committed ratchet baseline: " + " -> ".join(cycle),
+                "violation",
+            )
+        )
+    retired = sorted(
+        cycle
+        for cycle in baseline
+        if not any(set(current_cycle) <= set(cycle) for current_cycle in current)
+    )
+    severity = "info" if current else "violation"
+    for cycle in retired:
+        message_prefix = (
+            "retired package cycle: "
+            if severity == "info"
+            else "completely retired baseline requires a dependency-cycle update: "
+        )
+        hits.append(
+            Hit(
+                "architecture-cycle-baseline",
+                ARCHITECTURE_DEPENDENCY_BASELINE,
+                1,
+                message_prefix + " -> ".join(cycle),
+                severity,
+            )
+        )
+
+    reference = _architecture_reference(root)
+    if reference:
+        previous_text = _git_output(root, "show", f"{reference}:{ARCHITECTURE_DEPENDENCY_BASELINE}")
+        if previous_text is not None:
+            try:
+                previous_payload = json.loads(previous_text)
+                previous_cycles = {
+                    tuple(cycle)
+                    for cycle in previous_payload.get("cycles", [])
+                    if isinstance(cycle, list)
+                }
+            except (TypeError, ValueError, AttributeError):
+                previous_cycles = set()
+                hits.append(
+                    Hit(
+                        "architecture-cycle-baseline",
+                        ARCHITECTURE_DEPENDENCY_BASELINE,
+                        1,
+                        "historical dependency baseline is invalid JSON",
+                        "violation",
+                    )
+                )
+            for cycle in sorted(
+                cycle
+                for cycle in baseline
+                if baseline and not _is_allowed_cycle_refinement(cycle, previous_cycles)
+            ):
+                hits.append(
+                    Hit(
+                        "architecture-cycle-baseline",
+                        ARCHITECTURE_DEPENDENCY_BASELINE,
+                        1,
+                        "dependency cycle baseline cannot be retired without a historical ratchet entry: "
+                        + " -> ".join(cycle),
+                        "violation",
+                    )
+                )
+    return hits
+
+
 def _git_output(root: Path, *args: str) -> str | None:
     """Return a git value when this checkout has the requested history."""
     try:
@@ -460,7 +1091,16 @@ def _read_baseline_payload(
     if error:
         return None, error
     assert python is not None and rust is not None
-    return {"python": python, "rust": rust}, None
+    result = {"python": python, "rust": rust}
+    for key in (
+        "python-function-budgets",
+        "python-class-budgets",
+        "default-callable-lines",
+        "default-class-lines",
+    ):
+        if key in value:
+            result[key] = value[key]
+    return result, None
 
 
 def _load_debt_waivers(root: Path) -> tuple[dict[tuple[str, str], dict[str, object]], list[Hit]]:
@@ -536,6 +1176,60 @@ def _load_debt_waivers(root: Path) -> tuple[dict[tuple[str, str], dict[str, obje
             continue
         waivers[key] = entry
     return waivers, hits
+
+
+
+def _python_size_hits(
+    baseline: dict,
+    rel: str,
+    path,
+) -> list[Hit]:
+    """AST-based callable/class breadth ratchet for Python source.
+
+    Named hotspot budgets remain exact ratchets.  Every other callable and
+    class is subject to generic new-code ceilings so future growth cannot be
+    invisible merely because the enclosing module is below its legacy budget.
+    """
+    try:
+        import ast as _ast
+
+        tree = _ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError):
+        return []
+    function_budgets = (baseline.get("python-function-budgets") or {}).get(rel) or {}
+    class_budgets = (baseline.get("python-class-budgets") or {}).get(rel) or {}
+    default_callable = int(baseline.get("default-callable-lines", 200))
+    default_class = int(baseline.get("default-class-lines", 600))
+    hits: list[Hit] = []
+
+    def _check(node, *, kind: str, budget: int) -> None:
+        length = (node.end_lineno or node.lineno) - node.lineno
+        if length <= budget:
+            return
+        hits.append(
+            Hit(
+                f"{kind}-size-budget",
+                f"{SRC}/{rel}:{node.lineno}",
+                length,
+                f"{kind} {node.name}() has {length} lines; budget is {budget}",
+                "violation",
+            )
+        )
+
+    for node in _ast.walk(tree):
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+            _check(
+                node,
+                kind="function",
+                budget=int(function_budgets.get(node.name, default_callable)),
+            )
+        elif isinstance(node, _ast.ClassDef):
+            _check(
+                node,
+                kind="class",
+                budget=int(class_budgets.get(node.name, default_class)),
+            )
+    return hits
 
 
 def _budget_widening_hits(
@@ -630,7 +1324,7 @@ def scan(root: Path, *, skip_tests: bool = True) -> list[Hit]:
     hits: list[Hit] = []
     exception_catalog, exception_policy_hits = _load_exception_catalog(root)
     hits.extend(exception_policy_hits)
-    seen_exception_sites: set[tuple[str, str, int]] = set()
+    seen_exception_sites: set[tuple[str, str, str]] = set()
     src_dir = root / SRC
     if not src_dir.is_dir():
         raise SystemExit(f"architecture-lint: {src_dir} not found")
@@ -667,6 +1361,8 @@ def scan(root: Path, *, skip_tests: bool = True) -> list[Hit]:
     rust_budgets.update(baseline["rust"])
 
     files = sorted(p for p in src_dir.rglob("*.py") if not (skip_tests and "/tests/" in str(p)))
+    package_names = _package_names(src_dir)
+    hits.extend(_dependency_cycle_hits(root, files, package_names))
     for path in files:
         rel = str(path.relative_to(src_dir))
         try:
@@ -685,17 +1381,23 @@ def scan(root: Path, *, skip_tests: bool = True) -> list[Hit]:
                     "violation",
                 )
             )
+        hits.extend(_python_size_hits(baseline, rel, path))
         active = [(rule, _classify(rule, rel)) for rule in RULES]
         active = [(r, sev) for r, sev in active if sev]
         if not active:
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         hits.extend(_broad_exception_hits(Path(root), path, rel, text))
+        ast_hits, _edges = _ast_import_hits(root, path, rel, text, package_names)
+        hits.extend(ast_hits)
+        hits.extend(_domain_host_hits(Path(root), path, rel, text))
         for lineno, line in enumerate(text.splitlines(), start=1):
             stripped = line.lstrip()
             if stripped.startswith("#"):
                 continue  # comments are documentation, not construction
             for rule, sev in active:
+                if rule.id in AST_IMPORT_RULES or rule.id in AST_RULE_IDS:
+                    continue
                 m = rule.pattern.search(line)
                 if not m:
                     continue
@@ -708,14 +1410,25 @@ def scan(root: Path, *, skip_tests: bool = True) -> list[Hit]:
                     "subprocess-outside-approved-backends",
                     "raw-db-outside-state",
                 }:
-                    site = (rule.id, f"{SRC}/{rel}", lineno)
-                    if site not in exception_catalog:
+                    exception_id = _exception_id(line)
+                    if exception_id is None:
                         hits.append(
                             Hit(
                                 "architecture-exception-policy",
                                 f"{SRC}/{rel}",
                                 lineno,
-                                f"new {rule.id} exception site is not cataloged",
+                                f"{rule.id} exception site must declare a stable architecture-exception id",
+                                "violation",
+                            )
+                        )
+                    site = (rule.id, f"{SRC}/{rel}", exception_id or "")
+                    if exception_id is None or site not in exception_catalog:
+                        hits.append(
+                            Hit(
+                                "architecture-exception-policy",
+                                f"{SRC}/{rel}",
+                                lineno,
+                                f"new {rule.id} exception site is not cataloged by stable id",
                                 "violation",
                             )
                         )
@@ -744,13 +1457,13 @@ def scan(root: Path, *, skip_tests: bool = True) -> list[Hit]:
                     )
                 )
     for site in sorted(set(exception_catalog) - seen_exception_sites):
-        rule_name, path_name, lineno = site
+        rule_name, path_name, exception_id = site
         hits.append(
             Hit(
                 "architecture-exception-policy",
                 path_name,
-                lineno,
-                f"stale {rule_name} exception site is no longer annotated at this location",
+                int(exception_catalog[site].get("line", 1)),
+                f"stale {rule_name} exception id {exception_id!r} is no longer annotated",
                 "violation",
             )
         )

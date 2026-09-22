@@ -17,6 +17,8 @@ from typing import Any
 
 from athena.protocol.messages import utcnow
 from athena.protocol.capabilities import (
+    CapabilityFailure,
+    CapabilityFailureCode,
     CapabilityDescriptor,
     CapabilityOrigin,
     CapabilityRequest,
@@ -640,12 +642,23 @@ class WatchCapability:
 
 
 def _result(request, ok=True, output="", error="", meta=None):
-    return CapabilityResult(
-        request.call_id,
-        request.capability_id,
-        CapabilityResultStatus.OK if ok else CapabilityResultStatus.FAILED,
+    if ok:
+        return CapabilityResult(
+            request.call_id,
+            request.capability_id,
+            CapabilityResultStatus.OK,
+            output=output,
+            error=None if ok else error,
+            metadata=dict(meta or {}),
+        )
+    return CapabilityResult.failure(
+        request,
+        CapabilityFailure(
+            code=CapabilityFailureCode.PERMANENT_RUNTIME,
+            detail=error or "operation failed",
+            stage="invoke",
+        ),
         output=output,
-        error=None if ok else error,
         metadata=dict(meta or {}),
     )
 

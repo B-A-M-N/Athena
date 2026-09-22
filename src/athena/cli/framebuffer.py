@@ -9,13 +9,15 @@ from __future__ import annotations
 
 import io
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, TypeAlias
 
-from athena.cli.activity import VisualActionKind
 from athena.cli.animation import OIVisualState
-from athena.cli.scene import OIScene, tree_rows
-from athena.cli.render.scene import _diagnostic_lines, format_progress
+from athena.cli.framebuffer_cache import FramebufferCache
+from athena.cli.framebuffer_layout import BuddyPlacement
+from athena.cli.framebuffer_world import BuddyWorld
+from athena.presentation.ansi_scene import diagnostic_lines, format_progress
+from athena.presentation.scene import OIScene, tree_rows
+from athena.presentation.semantics import VisualActionKind
 
 Image: Any = None
 ImageDraw: Any = None
@@ -104,119 +106,23 @@ class FrameBuffer:
 class OIFrameBuffer:
     """Render a restrained blue-black computational world as PNG."""
 
-    # Buddy is a fixed scene sprite.  The logical grid is intentionally
-    # stable across terminal sizes; Kitty receives exactly 64x80 source
-    # pixels (32x40 logical cells at 2px per cell).
-    BUDDY_LOGICAL_WIDTH = 32
-    BUDDY_LOGICAL_HEIGHT = 40
-    BUDDY_SCALE = 2
-    BUDDY_WIDTH = BUDDY_LOGICAL_WIDTH * BUDDY_SCALE
-    BUDDY_HEIGHT = BUDDY_LOGICAL_HEIGHT * BUDDY_SCALE
-    _BUDDY_SPRITE = (
-        "................................",
-        "..........#..........#..........",
-        ".........###........###.........",
-        ".........###........###.........",
-        "........#...............#.......",
-        ".......#.................#......",
-        "......#...................#.....",
-        ".....#....#..........#.....#....",
-        "....#....#.#........#.#.....#...",
-        "....#.....#..........#......#...",
-        "....#....#.#........#.#.....#...",
-        "....#.....#....#.#...#......#...",
-        "....#..#........#.......#...#...",
-        ".....#..#.......#......#...#....",
-        "......#....#.........#....#.....",
-        ".......#....#.......#....#......",
-        "....#...#...............#...#...",
-        "...#......#...........#......#..",
-        "...#.........................#..",
-        "...#........#.......#........#..",
-        "..#.#........#.....#.......#.#..",
-        ".....#........#...#........#....",
-        ".....#.........#.#........##....",
-        ".....#..........#..........#....",
-        ".....##..................#.#....",
-        ".....#......#.......#......#....",
-        ".....#.#......#...#.....#..#....",
-        ".....#..........#..........#....",
-        ".....#..#..............#...#....",
-        "......#....#.........#....#.....",
-        "......#..#...#.....#..#...#.....",
-        "......#........#.#........#.....",
-        "......#...................#.....",
-        "................................",
-        "..........###......###..........",
-        "..........###......###..........",
-        "..........###......###..........",
-        "........#####......#####........",
-        "................................",
-        "................................",
-    )
-
-    _FONT_PATHS = (
-        "/usr/share/fonts/opentype/fira/FiraMono-Regular.otf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf",
-    )
+    # Collision uses the complete bounded terrain and owl rectangle.
+    BUDDY_WORLD_WIDTH = BuddyWorld.WIDTH
+    BUDDY_WORLD_HEIGHT = BuddyWorld.HEIGHT
+    OWL_RENDER_WIDTH = BuddyWorld.OWL_WIDTH
+    OWL_RENDER_HEIGHT = BuddyWorld.OWL_HEIGHT
 
     def __init__(self, *, font_path: str | None = None) -> None:
         self.font_path = font_path
-        self._fonts: dict[int, Any] = {}
-        self._max_font_entries = 32
-        self._base_frames: dict[tuple[int, int, tuple[Any, ...]], Any] = {}
-        self._base_frame_sizes: dict[tuple[int, int, tuple[Any, ...]], int] = {}
-        self._base_frame_bytes = 0
-        self._base_png: dict[tuple[int, int, tuple[Any, ...]], bytes] = {}
-        self._base_png_bytes = 0
-        self._max_cache_bytes = 16 * 1024 * 1024
+        self._cache = FramebufferCache(font_path=font_path, image_font=ImageFont)
+        self._world = BuddyWorld(Image, ImageDraw, ImageFilter)
 
     def _trim_base_caches(self, protected_key: tuple[Any, ...] | None = None) -> None:
         """Keep framebuffer caches bounded by entries and combined memory."""
-        while (
-            len(self._base_frames) > 8
-            or len(self._base_png) > 8
-            or self._base_frame_bytes + self._base_png_bytes > self._max_cache_bytes
-        ):
-            frame_candidate = next((key for key in self._base_frames if key != protected_key), None)
-            png_candidate = next((key for key in self._base_png if key != protected_key), None)
-            if frame_candidate is None and png_candidate is None:
-                break
-            if len(self._base_frames) > 8 or (
-                self._base_frame_bytes >= self._base_png_bytes and frame_candidate is not None
-            ):
-                assert frame_candidate is not None
-                self._base_frames.pop(frame_candidate, None)
-                self._base_frame_bytes -= self._base_frame_sizes.pop(frame_candidate, 0)
-            else:
-                assert png_candidate is not None
-                png = self._base_png.pop(png_candidate, None)
-                if png is not None:
-                    self._base_png_bytes -= len(png)
+        self._cache.trim(protected_key)
 
     def _font(self, size: int):
-        if ImageFont is None:
-            return None
-        size = max(int(size), 8)
-        font = self._fonts.pop(size, None)
-        if font is not None:
-            self._fonts[size] = font
-            return font
-        paths = ([self.font_path] if self.font_path else []) + list(self._FONT_PATHS)
-        for candidate in paths:
-            if candidate and Path(candidate).is_file():
-                try:
-                    font = ImageFont.truetype(candidate, size)
-                    self._fonts[size] = font
-                    return font
-                except OSError:
-                    pass
-        font = ImageFont.load_default()
-        self._fonts[size] = font
-        if len(self._fonts) > self._max_font_entries:
-            self._fonts.pop(next(iter(self._fonts)))
-        return font
+        return self._cache.font(size)
 
     @staticmethod
     def _scene_key(scene: OIScene) -> tuple[Any, ...]:
@@ -256,127 +162,16 @@ class OIFrameBuffer:
     def _base_image(self, scene: OIScene, width: int, height: int) -> tuple[Any, tuple[Any, ...]]:
         """Return a cached opaque scene layer and its stable content key."""
         key = (width, height, self._scene_key(scene))
-        base = self._base_frames.pop(key, None)
-        if base is not None:
-            self._base_frames[key] = base
-        if base is None:
-            base = self._render_base(scene, width, height)
-            self._base_frames[key] = base
-            size = width * height * 4
-            self._base_frame_sizes[key] = size
-            self._base_frame_bytes += size
-            self._trim_base_caches(protected_key=key)
+        base = self._cache.base_image(key, lambda: self._render_base(scene, width, height))
         return base, key
 
     @classmethod
-    def _buddy_position(
-        cls, scene: OIScene, visual: OIVisualState, width: int, height: int
-    ) -> tuple[int, int, int] | None:
-        start_fx, start_fy = scene.anchors.get(visual.previous_anchor, scene.anchors["center"])
-        end_fx, end_fy = scene.anchors.get(scene.buddy_anchor, scene.anchors["center"])
-        progress = min(max(visual.transition, 0.0), 1.0)
-        eased = progress * progress * (3.0 - 2.0 * progress)
-        fx = start_fx + (end_fx - start_fx) * eased
-        fy = start_fy + (end_fy - start_fy) * eased
-        desired = (
-            int(width * fx),
-            int(height * fy) + (0 if progress >= 1 else int((1 - progress) * 10)),
-        )
-        for center_x, center_y in cls._buddy_candidates(desired, width, height):
-            left = center_x - cls.BUDDY_WIDTH // 2
-            top = center_y - cls.BUDDY_HEIGHT // 2
-            if (
-                left < 0
-                or top < 0
-                or left + cls.BUDDY_WIDTH > width
-                or top + cls.BUDDY_HEIGHT > height
-            ):
-                continue
-            if not cls._buddy_overlaps_content(scene, left, top, width, height):
-                return center_x, center_y, cls.BUDDY_SCALE
-        return None
+    def _buddy_position(cls, scene, visual, width, height):
+        return BuddyPlacement.position(scene, visual, width, height)
 
     @classmethod
-    def _buddy_candidates(
-        cls, desired: tuple[int, int], width: int, height: int
-    ) -> tuple[tuple[int, int], ...]:
-        """Return deterministic, cell-aligned positions around an anchor."""
-        desired_left = round((desired[0] - cls.BUDDY_WIDTH // 2) / 10) * 10
-        desired_top = round((desired[1] - cls.BUDDY_HEIGHT // 2) / 20) * 20
-        candidates: list[tuple[int, int, int, int]] = []
-        for radius in range(5):
-            for dy, dx in (
-                (0, 0),
-                (-radius * 20, 0),
-                (radius * 20, 0),
-                (0, -radius * 10),
-                (0, radius * 10),
-                (-radius * 20, -radius * 10),
-                (-radius * 20, radius * 10),
-                (radius * 20, -radius * 10),
-                (radius * 20, radius * 10),
-            ):
-                left, top = desired_left + dx, desired_top + dy
-                distance = abs(left - desired_left) + abs(top - desired_top)
-                candidate = (distance, top, left, 0)
-                candidates.append(candidate)
-        ordered: list[tuple[int, int]] = []
-        seen: set[tuple[int, int]] = set()
-        for _distance, top, left, _ in sorted(candidates):
-            center = (left + cls.BUDDY_WIDTH // 2, top + cls.BUDDY_HEIGHT // 2)
-            if center not in seen:
-                seen.add(center)
-                ordered.append(center)
-        return tuple(ordered)
-
-    @classmethod
-    def _buddy_overlaps_content(
-        cls, scene: OIScene, left: int, top: int, width: int, height: int
-    ) -> bool:
-        right, bottom = left + cls.BUDDY_WIDTH, top + cls.BUDDY_HEIGHT
-        for region_left, region_top, region_right, region_bottom in cls._content_regions(
-            scene, width, height
-        ):
-            if (
-                left < region_right
-                and right > region_left
-                and top < region_bottom
-                and bottom > region_top
-            ):
-                return True
-        return False
-
-    @staticmethod
-    def _content_regions(
-        scene: OIScene, width: int, height: int
-    ) -> tuple[tuple[int, int, int, int], ...]:
-        """Approximate occupied text/priority regions for collision-safe Buddy placement."""
-        margin = max(18, width // 24)
-        top = max(14, height // 22)
-        regions: list[tuple[int, int, int, int]] = [
-            (margin, top - 2, width - margin, top + 63),
-            (margin, height - 103, width - margin, height - 34),
-        ]
-        if scene.mode is VisualActionKind.IDLE:
-            body_top = top + 78
-            middle = width // 2
-            regions.append((middle - 2, body_top - 4, middle + 3, height - 52))
-            regions.extend(
-                (margin, body_top - 2 + index * 20, middle - 8, body_top + 16 + index * 20)
-                for index, _ in enumerate(tree_rows(scene.workspace_tree)[:8])
-            )
-            regions.extend(
-                (middle + 8, body_top - 2 + index * 20, width - margin, body_top + 16 + index * 20)
-                for index, _ in enumerate(tree_rows(scene.runtime_tree)[:8])
-            )
-            if not scene.workspace_tree:
-                regions.append((margin, body_top + 34, middle - 8, body_top + 58))
-            if not scene.runtime_tree:
-                regions.append((middle + 8, body_top + 34, width - margin, body_top + 58))
-        else:
-            body_top = top + 78
-            regions.append((margin, body_top - 2, width - margin, height - 106))
-        return tuple(regions)
+    def _buddy_overlaps_content(cls, scene, left, top, width, height):
+        return BuddyPlacement.overlaps_content(scene, left, top, width, height)
 
     @staticmethod
     def _entity_color(entity: Any, ink: Color, accent: Color, warn: Color, bad: Color) -> Color:
@@ -400,18 +195,14 @@ class OIFrameBuffer:
         image = Image.new("RGBA", (width, height), (9, 15, 31, 255))
         draw = ImageDraw.Draw(image, "RGBA")
 
-        # Glass depth: vignette-like bands, a faint perspective grid, and
-        # scanlines. These are static atmosphere, not semantic state.
+        # Glass depth: a blue-black gradient plus restrained scanlines. The
+        # animated perspective terrain belongs to the bounded mascot world.
         for y in range(height):
             mix = y / max(height - 1, 1)
             draw.line(
                 (0, y, width, y),
                 fill=(10 + int(4 * mix), 17 + int(9 * mix), 35 + int(15 * mix), 255),
             )
-        for x in range(-height, width + height, max(42, width // 14)):
-            draw.line((width // 2, height // 2, x, height), fill=(37, 56, 94, 34), width=1)
-        for y in range(height // 2, height, max(28, height // 9)):
-            draw.line((0, y, width, y), fill=(47, 72, 111, 28), width=1)
         for y in range(2, height, 4):
             draw.line((0, y, width, y), fill=(139, 177, 219, 8), width=1)
 
@@ -583,7 +374,6 @@ class OIFrameBuffer:
         row = body_top + 38
         row_height = max(16, int(getattr(font, "size", 12)) + 4)
 
-        # Trace annotations: truthful, derived from canonical events.
         if scene.trace:
             for line in scene.trace[:3]:
                 self._text(
@@ -618,7 +408,7 @@ class OIFrameBuffer:
                 )
         elif scene.mode is VisualActionKind.FAILURE:
             for diagnostic in scene.diagnostics[: max((height - row - 20) // row_height, 1)]:
-                for line in _diagnostic_lines(diagnostic):
+                for line in diagnostic_lines(diagnostic):
                     self._text(
                         draw,
                         (margin, row),
@@ -742,34 +532,19 @@ class OIFrameBuffer:
         width, height = max(int(width), 80), max(int(height), 60)
         base, key = self._base_image(scene, width, height)
         image = base.copy()
-        draw = ImageDraw.Draw(image, "RGBA")
-        ink = (177, 196, 225, 228)
-        accent = (101, 183, 206, 220)
-        warn = (222, 176, 108, 235)
-        bad = (224, 119, 126, 235)
         # One buddy, one bounded anchor.  It is a scene entity, never a pane.
         if visual.semantic_state != "hidden":
             position = self._buddy_position(scene, visual, width, height)
             if position is not None:
-                bx, by, scale = position
-                self._draw_buddy(
-                    draw,
-                    bx,
-                    by,
-                    scale,
-                    scene.status,
-                    visual.phase,
-                    ink,
-                    accent,
-                    warn,
-                    bad,
-                    character=scene.character,
-                    mode=scene.mode,
+                left, top = position
+                image.alpha_composite(
+                    self._world.render(visual, status=scene.status),
+                    dest=(left, top),
                 )
 
         encoded = io.BytesIO()
         # Animation ticks reuse the cached scene layer and use a low-latency
-        # PNG encode. Compression is still lossless; ``optimize=True`` is a
+        # PNG encode. Compression is lossless; ``optimize=True`` is a
         # costly palette/scan optimisation that should happen only for a
         # deliberate asset export, not for a live frame transport.
         image.convert("RGB").save(encoded, format="PNG", optimize=False, compress_level=1)
@@ -781,16 +556,12 @@ class OIFrameBuffer:
             return None
         width, height = max(int(width), 80), max(int(height), 60)
         base, key = self._base_image(scene, width, height)
-        png = self._base_png.pop(key, None)
-        if png is not None:
-            self._base_png[key] = png
+        png = self._cache.cached_png(key)
         if png is None:
             encoded = io.BytesIO()
             base.convert("RGB").save(encoded, format="PNG", optimize=False, compress_level=1)
             png = encoded.getvalue()
-            self._base_png[key] = png
-            self._base_png_bytes += len(png)
-            self._trim_base_caches(protected_key=key)
+            self._cache.save_png(key, png)
         return FrameBuffer(png, width, height, layer="base", base_key=key)
 
     def render_motion_overlay(
@@ -998,114 +769,23 @@ class OIFrameBuffer:
                 layer="overlay",
                 base_key=(width, height, self._scene_key(scene)),
             )
-        bx, by, scale = position
-        left = bx - self.BUDDY_WIDTH // 2
-        top = by - self.BUDDY_HEIGHT // 2
-        right, bottom = left + self.BUDDY_WIDTH, top + self.BUDDY_HEIGHT
-        image = Image.new("RGBA", (self.BUDDY_WIDTH, self.BUDDY_HEIGHT), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(image, "RGBA")
-        ink = (177, 196, 225, 228)
-        accent = (101, 183, 206, 220)
-        warn = (222, 176, 108, 235)
-        bad = (224, 119, 126, 235)
-        self._draw_buddy(
-            draw,
-            self.BUDDY_WIDTH // 2,
-            self.BUDDY_HEIGHT // 2,
-            scale,
-            scene.status,
-            visual.phase,
-            ink,
-            accent,
-            warn,
-            bad,
-            character=scene.character,
-            mode=scene.mode,
-        )
+        left, top = position
+        world = self._world.render(visual, status=scene.status)
         encoded = io.BytesIO()
-        image.save(encoded, format="PNG", optimize=False, compress_level=1)
+        world.save(encoded, format="PNG", optimize=False, compress_level=1)
         return FrameBuffer(
             encoded.getvalue(),
             width,
             height,
-            dirty_region=(left, top, right - left, bottom - top),
+            dirty_region=(
+                left,
+                top,
+                self.BUDDY_WORLD_WIDTH,
+                self.BUDDY_WORLD_HEIGHT,
+            ),
             layer="overlay",
             base_key=(width, height, self._scene_key(scene)),
         )
-
-    def _draw_buddy(
-        self,
-        draw: Any,
-        x: int,
-        y: int,
-        scale: int,
-        status: str,
-        phase: float,
-        ink: Color,
-        accent: Color,
-        warn: Color,
-        bad: Color,
-        *,
-        character: str = "owl",
-        mode: VisualActionKind = VisualActionKind.IDLE,
-    ) -> None:
-        """Draw the fixed 32x40 logical Buddy sprite inside its own box."""
-        del scale, character, mode
-        status = str(status).upper()
-        signal = (
-            bad if status in {"FAILURE", "BLOCKED"} else warn if status == "APPROVAL" else accent
-        )
-        body = (16, 28, 51, 242)
-        outline = signal
-        eye = bad if status in {"FAILURE", "BLOCKED"} else ink
-        left = x - self.BUDDY_WIDTH // 2
-        top = y - self.BUDDY_HEIGHT // 2
-        phase = float(phase) % 1.0
-        blink = status not in {"FAILURE", "BLOCKED"} and phase > 0.86
-        scan_row = 10 + int(phase * 16)
-        for row, line in enumerate(self._BUDDY_SPRITE):
-            for column, marker in enumerate(line):
-                if marker != "#":
-                    continue
-                edge = (
-                    row == 0
-                    or row == self.BUDDY_LOGICAL_HEIGHT - 1
-                    or column == 0
-                    or column == self.BUDDY_LOGICAL_WIDTH - 1
-                    or row == 2
-                    or row == 35
-                )
-                fill = outline if edge else body
-                draw.rectangle(
-                    (
-                        left + column * self.BUDDY_SCALE,
-                        top + row * self.BUDDY_SCALE,
-                        left + column * self.BUDDY_SCALE + self.BUDDY_SCALE - 1,
-                        top + row * self.BUDDY_SCALE + self.BUDDY_SCALE - 1,
-                    ),
-                    fill=fill,
-                )
-
-        def cell(column: int, row: int, fill: Color) -> None:
-            draw.rectangle(
-                (
-                    left + column * self.BUDDY_SCALE,
-                    top + row * self.BUDDY_SCALE,
-                    left + column * self.BUDDY_SCALE + self.BUDDY_SCALE - 1,
-                    top + row * self.BUDDY_SCALE + self.BUDDY_SCALE - 1,
-                ),
-                fill=fill,
-            )
-
-        # All semantic animation remains inside the fixed sprite bounds.
-        if not blink:
-            cell(9, 9, eye)
-            cell(22, 9, eye)
-        cell(16, 13, warn if status == "APPROVAL" else outline)
-        if status in {"THINKING", "EXECUTING", "DELEGATED", "RECOVERING"}:
-            for column in range(8, 24):
-                if self._BUDDY_SPRITE[scan_row][column] == "#":
-                    cell(column, scan_row, signal)
 
 
 __all__ = ["FrameBuffer", "OIFrameBuffer", "pillow_available"]

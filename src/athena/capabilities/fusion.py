@@ -1,13 +1,13 @@
 """Model-visible bounded access to Athena's fusion machinery."""
 
 from __future__ import annotations
+from athena.capabilities.operations import native_descriptor
 
 import dataclasses
 import json
 from typing import Any
 
 from athena.protocol.capabilities import (
-    CapabilityDescriptor,
     CapabilityOrigin,
     CapabilityRequest,
     CapabilityResult,
@@ -21,15 +21,16 @@ class FusionCapability:
 
     Fusion remains one-agent orchestration: this capability delegates to the
     service-owned :class:`FusionOrchestrator`, which uses the normal dispatcher
-    for shadow execution, verification, and real-workspace commit.
+    for shadow execution and verification. It never promotes a candidate into
+    reality; the kernel's RealityCoordinator owns candidate→reality promotion.
     """
 
-    descriptor = CapabilityDescriptor(
+    descriptor = native_descriptor(
         id="fusion",
         description=(
             "Run bounded speculative experiments in a shadow workspace, inspect "
-            "or discard branches, commit verified changes, create causal forks, "
-            "and capture workspace checkpoints."
+            "or discard candidates, create causal forks, and capture workspace "
+            "checkpoints. Verified candidates remain awaiting reality promotion."
         ),
         input_schema={
             "type": "object",
@@ -41,7 +42,6 @@ class FusionCapability:
                         "run",
                         "compare",
                         "status",
-                        "commit",
                         "discard",
                         "fork",
                         "checkpoint",
@@ -87,11 +87,6 @@ class FusionCapability:
                         },
                     },
                 },
-                "criteria_probes": {
-                    "type": "array",
-                    "maxItems": 100,
-                    "items": {"type": "object", "additionalProperties": True},
-                },
                 "invariants": {
                     "type": "array",
                     "maxItems": 100,
@@ -109,7 +104,7 @@ class FusionCapability:
                 {"properties": {"operation": {"const": "run"}}, "required": ["proposal"]},
                 {"properties": {"operation": {"const": "compare"}}, "required": ["proposals"]},
                 {
-                    "properties": {"operation": {"enum": ["status", "commit", "discard"]}},
+                    "properties": {"operation": {"enum": ["status", "discard"]}},
                     "required": ["branch_id"],
                 },
                 {
@@ -158,7 +153,6 @@ class FusionCapability:
                 outcome = await orchestrator.run_experiment(
                     task_id=task_id,
                     proposal=proposal,
-                    criteria_probes=[dict(item) for item in args.get("criteria_probes") or ()],
                     invariants=[dict(item) for item in args.get("invariants") or ()],
                     profile=args.get("profile"),
                     auto_fork_on_failure=bool(args.get("auto_fork_on_failure", True)),
@@ -177,7 +171,6 @@ class FusionCapability:
                 outcome = await orchestrator.compare(
                     task_id=task_id,
                     proposals=proposals,
-                    criteria_probes=[dict(item) for item in args.get("criteria_probes") or ()],
                     invariants=[dict(item) for item in args.get("invariants") or ()],
                     profile=args.get("profile"),
                 )
@@ -196,12 +189,6 @@ class FusionCapability:
                 outcome = await orchestrator.shadow.discard(
                     branch, reason=str(args.get("reason") or "discarded by operator")
                 )
-                return _result(request, output=json.dumps(outcome))
-            if operation == "commit":
-                branch = _owned_branch(orchestrator, branch_id, task_id)
-                if branch is None:
-                    return _result(request, ok=False, error="branch not found")
-                outcome = await orchestrator.shadow.commit(branch)
                 return _result(request, output=json.dumps(outcome))
             if operation == "fork":
                 if "after_event_sequence" not in args:

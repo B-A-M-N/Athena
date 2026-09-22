@@ -119,7 +119,7 @@ class KnowledgePipeline:
                 for step in steps
             ):
                 return
-            from athena.affordances.models import AffordanceScope
+            from athena.protocol.affordances import AffordanceScope
             from athena.workflows.models import Workflow
 
             signature = _trace_signature(steps)
@@ -432,7 +432,7 @@ class KnowledgePipeline:
         if self._workflows is None or not getattr(task, "id", None):
             return
         try:
-            from athena.affordances.models import AffordanceScope
+            from athena.protocol.affordances import AffordanceScope
             from athena.protocol.messages import CapabilityCallBlock, CapabilityResultBlock
             from athena.workflows.models import Workflow, WorkflowStep
 

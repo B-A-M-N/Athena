@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -103,7 +104,10 @@ async def test_strategy_composes_nested_workflow_and_replays_durably() -> None:
         approval = await dispatch(run_arguments, "workflow-run-parent")
         assert isinstance(approval, SuspendedCall)
         await service.approve(approval.approval_id, granted=True, scope="task")
-        first = await dispatch(run_arguments, "workflow-run-parent")
+        first = await asyncio.wait_for(
+            dispatch(run_arguments, "workflow-run-parent"),
+            timeout=5,
+        )
         assert first.status is CapabilityResultStatus.OK, first.error
         first_payload = json.loads(first.output)
         assert first_payload["status"] == "completed"

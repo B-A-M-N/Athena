@@ -16,6 +16,7 @@ from athena.protocol.memory import MemoryKind, MemoryRecord, MemoryScope
 from athena.protocol.messages import TrustClass
 from athena.service.config import AthenaConfig
 from athena.service.service import AthenaService
+from athena.service.operator_query import OperatorQueryService
 from athena.models.registry import ProviderRegistry
 from athena.affordances.models import AffordanceScope
 from athena.skills.models import Skill, SkillCandidate
@@ -215,6 +216,7 @@ async def test_generated_capability_operator_methods_use_synthesis_dispatcher():
 
     dispatcher = Dispatcher()
     service = AthenaService.__new__(AthenaService)
+    service._operator_query = OperatorQueryService(service)
     service.config = AthenaConfig()
     service._dispatcher = dispatcher
     service._default_workspace = WorkspaceSpec(id="root", root="/tmp/athena")
@@ -253,6 +255,7 @@ async def test_generated_capability_operator_method_surfaces_failure():
             )
 
     service = AthenaService.__new__(AthenaService)
+    service._operator_query = OperatorQueryService(service)
     service.config = AthenaConfig()
     service._dispatcher = Dispatcher()
     service._default_workspace = WorkspaceSpec(id="root", root="/tmp/athena")

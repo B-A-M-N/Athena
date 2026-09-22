@@ -8,7 +8,11 @@ from pathlib import Path
 import pytest
 
 import athena.state.database as database_module
-from athena.state.database import Database, DatabaseRecoveryRequired
+from athena.state.database import (
+    Database,
+    DatabaseRecoveryRequired,
+    DatabaseRollbackPoisonedError,
+)
 
 
 @pytest.fixture
@@ -395,3 +399,261 @@ async def test_truncated_sqlite_fails_closed_and_is_operator_diagnosable(tmp_pat
     assert diagnostics["status"] == "recovery_required"
     assert "error" in diagnostics
     await database.close()
+
+
+# --------------------------------------------------------------------- #
+# Transaction atomicity: db.execute()/executemany() must join the
+# surrounding transaction instead of silently committing inside it.
+# --------------------------------------------------------------------- #
+
+
+async def test_execute_inside_transaction_does_not_commit(db):
+    """A plain execute() while a transaction owns the connection must be
+    rolled back when the surrounding transaction rolls back (P0)."""
+    await db._ensure_ready()
+    with pytest.raises(RuntimeError):
+        async with db.transaction():
+            await db.execute(
+                "INSERT INTO sessions(id, parent_id, created_at, updated_at, metadata) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("txn_exec", None, "2020-01-01T00:00:00+00:00", "2020-01-01T00:00:00+00:00", "{}"),
+            )
+            raise RuntimeError("rollback after db.execute()")
+    row = await db.fetch_one("SELECT id FROM sessions WHERE id = 'txn_exec'")
+    assert row is None
+
+
+async def test_execute_inside_transaction_commits_on_success(db):
+    """The same statement is durable when the surrounding transaction commits."""
+    await db._ensure_ready()
+    async with db.transaction():
+        await db.execute(
+            "INSERT INTO sessions(id, parent_id, created_at, updated_at, metadata) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("txn_exec_ok", None, "2020-01-01T00:00:00+00:00", "2020-01-01T00:00:00+00:00", "{}"),
+        )
+    row = await db.fetch_one("SELECT id FROM sessions WHERE id = 'txn_exec_ok'")
+    assert row is not None
+
+
+async def test_executemany_inside_transaction_does_not_commit(db):
+    await db._ensure_ready()
+    with pytest.raises(RuntimeError):
+        async with db.transaction():
+            await db.executemany(
+                "INSERT INTO sessions(id, parent_id, created_at, updated_at, metadata) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [
+                    (
+                        "txn_many_a",
+                        None,
+                        "2020-01-01T00:00:00+00:00",
+                        "2020-01-01T00:00:00+00:00",
+                        "{}",
+                    ),
+                    (
+                        "txn_many_b",
+                        None,
+                        "2020-01-01T00:00:00+00:00",
+                        "2020-01-01T00:00:00+00:00",
+                        "{}",
+                    ),
+                ],
+            )
+            raise RuntimeError("rollback after db.executemany()")
+    row_a = await db.fetch_one("SELECT id FROM sessions WHERE id = 'txn_many_a'")
+    row_b = await db.fetch_one("SELECT id FROM sessions WHERE id = 'txn_many_b'")
+    assert row_a is None
+    assert row_b is None
+
+
+async def test_executemany_inside_transaction_commits_on_success(db):
+    await db._ensure_ready()
+    async with db.transaction():
+        await db.executemany(
+            "INSERT INTO sessions(id, parent_id, created_at, updated_at, metadata) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [
+                (
+                    "txn_many_ok_a",
+                    None,
+                    "2020-01-01T00:00:00+00:00",
+                    "2020-01-01T00:00:00+00:00",
+                    "{}",
+                ),
+                (
+                    "txn_many_ok_b",
+                    None,
+                    "2020-01-01T00:00:00+00:00",
+                    "2020-01-01T00:00:00+00:00",
+                    "{}",
+                ),
+            ],
+        )
+    row = await db.fetch_one("SELECT id FROM sessions WHERE id = 'txn_many_ok_a'")
+    assert row is not None
+
+
+async def test_standalone_execute_still_autocommits(db):
+    """Outside a transaction, execute() keeps autocommit semantics."""
+    await db._ensure_ready()
+    await db.execute(
+        "INSERT INTO sessions(id, parent_id, created_at, updated_at, metadata) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("auto_exec", None, "2020-01-01T00:00:00+00:00", "2020-01-01T00:00:00+00:00", "{}"),
+    )
+    row = await db.fetch_one("SELECT id FROM sessions WHERE id = 'auto_exec'")
+    assert row is not None
+
+
+async def test_nested_transaction_is_rejected(db):
+    """A nested transaction on the same task must fail fast, not deadlock."""
+    await db._ensure_ready()
+    async with db.transaction():
+        with pytest.raises(RuntimeError, match="nested Database.transaction"):
+            async with db.transaction():
+                pass
+
+
+async def test_cancellation_inside_transaction_still_rolls_back(db):
+    """A cancelled body must not leave the transaction committed."""
+    await db._ensure_ready()
+
+    async def doomed():
+        async with db.transaction():
+            await db.execute_raw(
+                "INSERT INTO sessions(id, parent_id, created_at, updated_at, metadata) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    "txn_cancel",
+                    None,
+                    "2020-01-01T00:00:00+00:00",
+                    "2020-01-01T00:00:00+00:00",
+                    "{}",
+                ),
+            )
+            await asyncio.sleep(10)
+
+    task = asyncio.create_task(doomed())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    row = await db.fetch_one("SELECT id FROM sessions WHERE id = 'txn_cancel'")
+    assert row is None
+
+
+async def test_execute_raw_rejects_transaction_control_sql(db):
+    with pytest.raises(ValueError, match="transaction-control SQL"):
+        await db.execute_raw("BEGIN IMMEDIATE")
+    with pytest.raises(ValueError, match="transaction-control SQL"):
+        await db.execute_raw("COMMIT")
+    with pytest.raises(ValueError, match="transaction-control SQL"):
+        await db.execute_raw("ROLLBACK")
+
+
+async def test_transaction_mode_rejects_invalid(db):
+    with pytest.raises(ValueError, match="unsupported transaction mode"):
+        async with db.transaction(mode="SNAPSHOT"):
+            pass
+
+
+async def test_transaction_mode_immediate_holds_serialization_lock(db):
+    async with db.transaction(mode="IMMEDIATE"):
+        assert db._lock.locked()
+    assert not db._lock.locked()
+
+
+async def test_transaction_releases_lock_on_body_exception(db):
+    with pytest.raises(RuntimeError, match="boom"):
+        async with db.transaction():
+            raise RuntimeError("boom")
+    assert not db._lock.locked()
+    assert db._txn_owner is None
+
+
+async def test_transaction_releases_lock_on_cancellation(db):
+    inside = asyncio.Event()
+
+    async def holder():
+        async with db.transaction():
+            inside.set()
+            await asyncio.sleep(60)
+
+    task = asyncio.create_task(holder())
+    await asyncio.wait_for(inside.wait(), timeout=2)
+    assert db._lock.locked()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not db._lock.locked()
+    assert db._txn_owner is None
+
+
+async def test_rollback_failure_poisons_connection(db, monkeypatch):
+    """A rollback failure poisons the connection so no half-rolled-back state
+    is treated as trustworthy. Both original and rollback errors survive."""
+    calls: list[str] = []
+    await db._ensure_ready()
+    assert db._conn is not None
+
+    async def failing_rollback():
+        calls.append("rollback")
+        raise sqlite3.OperationalError("rollback poisoned by fault injection")
+
+    # Patch the bound rollback method so our fault fires instead of the
+    # real connection rollback.
+    monkeypatch.setattr(db._conn, "rollback", failing_rollback)
+    with pytest.raises(DatabaseRollbackPoisonedError) as exc_info:
+        async with db.transaction():
+            calls.append("body")
+            await db.execute("CREATE TABLE IF NOT EXISTS poison_test (id TEXT)")
+            await db.execute("INSERT INTO poison_test VALUES ('x')")
+            raise RuntimeError("body error that triggers rollback")
+
+    assert exc_info.value.original is not None
+    assert "body error" in str(exc_info.value.original)
+    assert "rollback poisoned" in str(exc_info.value.rollback)
+    assert calls == ["body", "rollback"]
+    # Connection is poisoned: `_conn` is None, so _ensure_ready would
+    # attempt to recreate one. The Database has been durably closed by the
+    # poison path so subsequent use cannot succeed silently.
+    assert db._conn is None
+
+
+async def test_rollback_poison_persists_and_recovery_clears_it(db, monkeypatch):
+    """After rollback poisoning, _ensure_ready raises DatabaseRecoveryRequired,
+    not a silently new connection. Only explicit recover() clears the flag."""
+    from athena.state.database import DatabaseRecoveryRequired
+
+    await db._ensure_ready()
+    assert db._conn is not None
+
+    async def failing_rollback():
+        raise sqlite3.OperationalError("rollback poisoned by fault injection")
+
+    monkeypatch.setattr(db._conn, "rollback", failing_rollback)
+    with pytest.raises(DatabaseRollbackPoisonedError):
+        async with db.transaction():
+            await db.execute("CREATE TABLE IF NOT EXISTS poison_persist (id TEXT)")
+            await db.execute("INSERT INTO poison_persist VALUES ('x')")
+            raise RuntimeError("body error")
+
+    assert db._poisoned is True
+    assert db._conn is None
+
+    # Normal runtime must fail loudly, never silently reopen.
+    with pytest.raises(DatabaseRecoveryRequired, match="poisoned"):
+        await db._ensure_ready()
+    with pytest.raises(DatabaseRecoveryRequired, match="poisoned"):
+        await db.execute("SELECT 1")
+
+    # Only explicit recovery may reopen.
+    result = await db.recover()
+    assert result["status"] == "ok"
+    assert result["reopened"] is True
+    assert db._poisoned is False
+
+    # Post-recovery, normal operations work again.
+    row = await db.fetch_one("SELECT 1 AS one")
+    assert row is not None

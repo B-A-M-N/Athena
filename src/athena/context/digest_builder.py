@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from athena.context.digest import ContextDigest
-from athena.kernel.termination import result_qualifies_as_work_evidence
+from athena.evidence import result_qualifies_as_work_evidence
 from athena.protocol.messages import (
     ArtifactRefBlock,
     CapabilityCallBlock,

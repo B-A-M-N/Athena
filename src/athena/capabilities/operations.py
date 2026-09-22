@@ -18,7 +18,7 @@ from typing import Any
 
 from athena.protocol.capabilities import CapabilityDescriptor, EffectClass
 
-__all__ = ["OPERATION_EFFECTS", "CapabilityEffectError", "resolve_operation_effects"]
+__all__ = ["OPERATION_EFFECTS", "CapabilityEffectError", "native_descriptor", "resolve_operation_effects"]
 
 
 class CapabilityEffectError(ValueError):
@@ -330,6 +330,9 @@ OPERATION_EFFECTS: dict[str, dict[str, frozenset[EffectClass]]] = {
         "create": frozenset({EffectClass.WRITE_LOCAL}),
         "promote": frozenset({EffectClass.WRITE_LOCAL}),
         "recover": frozenset({EffectClass.WRITE_LOCAL}),
+        # The dispatcher replaces this conservative fallback with the
+        # owner-scoped graph envelope before policy evaluation. Keeping the
+        # static map broad protects descriptor-only and legacy callers.
         "run": frozenset(
             {
                 EffectClass.EXECUTE,
@@ -385,7 +388,6 @@ OPERATION_EFFECTS: dict[str, dict[str, frozenset[EffectClass]]] = {
             }
         ),
         "status": frozenset({EffectClass.READ_LOCAL}),
-        "commit": frozenset({EffectClass.WRITE_LOCAL, EffectClass.DELETE}),
         "discard": frozenset({EffectClass.WRITE_LOCAL, EffectClass.DELETE}),
         "fork": frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
         "checkpoint": frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
@@ -417,6 +419,8 @@ OPERATION_EFFECTS: dict[str, dict[str, frozenset[EffectClass]]] = {
                 EffectClass.SPAWN_PROCESS,
             }
         ),
+        # The dispatcher replaces this conservative fallback with the
+        # validated capsule graph before policy evaluation.
         "run": frozenset(
             {
                 EffectClass.READ_LOCAL,
@@ -453,3 +457,10 @@ def resolve_operation_effects(
     except Exception as exc:  # noqa: BLE001 - effect resolution is a fail-closed boundary
         raise CapabilityEffectError(f"capability {descriptor.id}: {exc}") from None
     return tuple(sorted(effects or (), key=lambda e: e.value))
+
+
+def native_descriptor(**kwargs: Any) -> CapabilityDescriptor:
+    """Construct a native descriptor with its operation contract attached."""
+    if "operation_effects" not in kwargs and "effect_resolver" not in kwargs:
+        kwargs["operation_effects"] = OPERATION_EFFECTS.get(str(kwargs["id"]))
+    return CapabilityDescriptor(**kwargs)

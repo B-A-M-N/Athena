@@ -28,6 +28,26 @@ def test_clean_install_release_script_executes_n1_preflight() -> None:
     assert "PREFLIGHT PASS" in result.stdout
 
 
+def test_release_check_requires_every_required_scenario_to_pass() -> None:
+    release_check = runpy.run_path(str(_ROOT / "scripts" / "release-check"))
+
+    failures = release_check["_required_scenario_failures"](
+        {
+            "scenarios": [
+                {"scenario": "GOOD-001", "required": True, "status": "passed"},
+                {
+                    "scenario": "HOST-001",
+                    "required": True,
+                    "status": "environment_unavailable",
+                },
+                {"scenario": "OPTIONAL-001", "required": False, "status": "missing"},
+            ]
+        }
+    )
+
+    assert failures == ["HOST-001"]
+
+
 def test_support_matrix_generation_executes_against_bound_fixture(tmp_path: Path) -> None:
     source_sha = "a" * 40
     run_id = "fixture-run"
@@ -248,6 +268,9 @@ def test_architecture_lint_rejects_unwaived_baseline_widening(tmp_path: Path) ->
     (tmp_path / "src" / "athena").mkdir(parents=True)
     (tmp_path / "src" / "athena" / "__init__.py").write_text("\n")
     (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "architecture-dependency-baseline.json").write_text(
+        json.dumps({"schema": 1, "cycles": []})
+    )
     baseline_path = tmp_path / "docs" / "architecture-size-baseline.json"
     baseline_path.write_text(json.dumps({"schema": 1, "python": {"legacy.py": 2000}, "rust": {}}))
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)

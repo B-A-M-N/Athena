@@ -13,7 +13,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from athena.capabilities.dispatcher import SuspendedCall
+from athena.protocol.continuations import SuspendedCall
 from athena.protocol.capabilities import (
     CapabilityRequest,
     CapabilityRequestOrigin,
@@ -59,7 +59,7 @@ class PersistentGeneratedSession:
     async def start(self) -> None:
         if self._process is not None:
             return
-        self._process = await asyncio.create_subprocess_exec(  # architecture-lint: allow subprocess-outside-approved-backends reason=generated runtime worker
+        self._process = await asyncio.create_subprocess_exec(  # architecture-lint: allow subprocess-outside-approved-backends reason=generated runtime worker; architecture-exception: synthesis-runtime-worker
             *self._argv,
             env=self._env,
             stdin=asyncio.subprocess.PIPE,
@@ -245,7 +245,7 @@ class GeneratedToolHost:
                 task_budget=self.task_budget,
                 _generated_call_depth=self.call_depth + 1,
                 _generated_call_chain=(*self.call_chain, capability_id),
-                _directives=DispatchDirectives(
+                directives=DispatchDirectives(
                     inherited_effects=self.inherited_effects,
                     inherited_capability_id=self.inherited_capability_id,
                 ),

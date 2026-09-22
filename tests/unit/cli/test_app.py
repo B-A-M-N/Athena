@@ -13,10 +13,12 @@ from athena.cli.app import (
     build_config,
 )
 from athena.protocol.errors import ModelProviderUnconfigured
-from athena.protocol.tasks import TaskStatus
+from athena.protocol.tasks import AutonomyLevel, TaskStatus
 
 
 def test_build_config_auto_wires_openrouter_free_router(monkeypatch):
+    monkeypatch.delenv("FREEINFERENCE_API_KEY", raising=False)
+    monkeypatch.delenv("FREEINFERENCE_MODEL", raising=False)
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-only-secret")
     monkeypatch.delenv("OPENROUTER_MODEL", raising=False)
 
@@ -52,6 +54,8 @@ def test_build_config_auto_wires_freeinference_glm_flash(monkeypatch):
 
 
 def test_build_config_honors_openrouter_model_override(monkeypatch):
+    monkeypatch.delenv("FREEINFERENCE_API_KEY", raising=False)
+    monkeypatch.delenv("FREEINFERENCE_MODEL", raising=False)
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-only-secret")
     monkeypatch.setenv("OPENROUTER_MODEL", "google/gemma-4-31b-it:free")
 
@@ -61,6 +65,8 @@ def test_build_config_honors_openrouter_model_override(monkeypatch):
 
 
 def test_build_config_rejects_paid_openrouter_override(monkeypatch):
+    monkeypatch.delenv("FREEINFERENCE_API_KEY", raising=False)
+    monkeypatch.delenv("FREEINFERENCE_MODEL", raising=False)
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-only-secret")
     monkeypatch.setenv("OPENROUTER_MODEL", "openai/gpt-5")
 
@@ -246,6 +252,7 @@ class _RunService:
         self.status = status
         self.ready = ready
         self.submit_calls = 0
+        self.config = SimpleNamespace(autonomy_level=AutonomyLevel.AUTONOMOUS)
 
     def require_agent_ready(self, request=None) -> None:
         del request

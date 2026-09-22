@@ -12,7 +12,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, TextIO
 
-from athena.execution.async_call import run_blocking
+from athena.concurrency import run_blocking
 
 
 @dataclass(frozen=True)

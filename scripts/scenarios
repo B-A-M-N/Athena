@@ -25,20 +25,22 @@ What it does
          "scenarios": [
            {"scenario": "SYNTH-001", "family": "SYNTH",
             "title": "...", "required": true,
-            "status": "passed|failed|missing|skipped",
+            "status": "passed|failed|missing|skipped|environment_unavailable",
             "evidence": [{"kind": "pytest"|"probe", "ref": "...",
                           "exit_code": 0, "duration_s": 1.2, ...}],
             "duration_s": 3.4, "notes": "..."}
          ],
          "families": {"SYNTH": {"passed": 4, "failed": 0, "missing": 1, ...}},
          "summary": {"total": 50, "passed": 47, "failed": 0,
-                     "missing": 2, "skipped": 1, "required_missing": 0}
+                     "missing": 2, "skipped": 1, "required_not_passed": []}
        }
 
 4. Exit code: 0 iff every REQUIRED scenario is ``passed``.  A required
-   scenario that is ``missing`` (declared gap in the registry) or ``failed``
-   (its evidence ran and did not pass) makes the run fail.  Optional
-   scenarios may be ``missing``/``skipped`` without failing the run.
+   scenario that is ``missing`` (declared gap in the registry), ``failed``
+   (its evidence ran and did not pass), or ``environment_unavailable``
+   (required host evidence could not run) makes the run fail. Optional
+   scenarios may be ``missing``/``skipped``/``environment_unavailable``
+   without failing the run.
 
 Honesty rules
 -------------
@@ -96,6 +98,49 @@ RENDER_DEMO_EXIT_NAMES = {
 }
 
 
+def _capability_available(capability: str) -> bool:
+    """Probe one host capability without side effects."""
+    if capability == "PURE" or capability == "FS" or capability == "PROCESS":
+        return True
+    if capability == "LOCAL_SOCKET":
+        try:
+            import socket
+
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            probe.close()
+            return True
+        except (OSError, PermissionError):
+            return False
+    if capability == "TCP_LOOPBACK":
+        try:
+            import socket
+
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                probe.bind(("127.0.0.1", 0))
+                return True
+            finally:
+                probe.close()
+        except (OSError, PermissionError):
+            return False
+    if capability == "NETWORK_EGRESS":
+        # DNS is the same host resolver path PyPI installation needs and does
+        # not itself require egress to a named service.
+        try:
+            import socket
+
+            return socket.getaddrinfo("pypi.org", 443, type=socket.SOCK_STREAM) != []
+        except OSError:
+            return False
+    if capability == "DISPLAY":
+        return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    raise ValueError(f"unknown runner capability: {capability}")
+
+
+def _unavailable_capabilities(capabilities: tuple[str, ...]) -> list[str]:
+    return [capability for capability in capabilities if not _capability_available(capability)]
+
+
 def _artifact_identity() -> dict[str, object]:
     """Return hashes for the installed-artifact bundle when one is present.
 
@@ -140,6 +185,7 @@ def _artifact_identity() -> dict[str, object]:
             "artifacts": [],
             "reason": f"release manifest could not be read: {type(exc).__name__}: {exc}",
         }
+
 
 # Keep the scenario-process allowance aligned with scripts/render-demo's
 # default timeout (600s) plus a small parent-process margin.  This used to
@@ -314,7 +360,7 @@ def execute_scenario(
         if (
             isinstance(prior, dict)
             and prior.get("source_identity") == identity
-            and prior.get("status") in {"passed", "skipped", "missing"}
+            and prior.get("status") in {"passed", "skipped", "missing", "environment_unavailable"}
         ):
             prior["resumed"] = True
             return prior
@@ -324,6 +370,7 @@ def execute_scenario(
         "family": sc.family,
         "title": sc.title,
         "required": sc.required,
+        "capabilities": list(sc.capabilities),
         "commit_sha": identity["head_sha"],
         "release_run_id": identity["release_run_id"],
         "status": None,
@@ -343,6 +390,19 @@ def execute_scenario(
         return entry
 
     started = time.monotonic()
+    # A missing runner capability is an environment boundary, not product
+    # evidence. Record it honestly for host-capable qualification routing;
+    # required host evidence still blocks the release gate.
+    unavailable = _unavailable_capabilities(sc.capabilities)
+    if unavailable:
+        entry["status"] = "environment_unavailable"
+        entry["unavailable_capabilities"] = unavailable
+        entry["duration_s"] = round(time.monotonic() - started, 3)
+        if receipt_path is not None:
+            receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            _write_json_atomic(receipt_path, entry)
+        return entry
+
     if sc.nodeids:
         record = _run_pytest(list(sc.nodeids))
         record["commit_sha"] = str(identity["head_sha"])
@@ -505,11 +565,17 @@ def main(argv: list[str] | None = None) -> int:
         families[fam] = {
             "description": FAMILY_DESCRIPTIONS[fam],
             "total": len(fam_entries),
-            **{k: counts.get(k, 0) for k in ("passed", "failed", "missing", "skipped")},
+            **{
+                k: counts.get(k, 0)
+                for k in ("passed", "failed", "missing", "skipped", "environment_unavailable")
+            },
         }
 
     summary = Counter(e["status"] for e in entries)
     required_missing = [e["scenario"] for e in entries if e["required"] and e["status"] != "passed"]
+    required_environment_unavailable = [
+        e["scenario"] for e in entries if e["required"] and e["status"] == "environment_unavailable"
+    ]
     manifest = {
         "generated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
         "repo_root": str(REPO_ROOT),
@@ -525,7 +591,9 @@ def main(argv: list[str] | None = None) -> int:
             "failed": summary.get("failed", 0),
             "missing": summary.get("missing", 0),
             "skipped": summary.get("skipped", 0),
+            "environment_unavailable": summary.get("environment_unavailable", 0),
             "required_not_passed": required_missing,
+            "required_environment_unavailable": required_environment_unavailable,
         },
     }
 
@@ -536,9 +604,15 @@ def main(argv: list[str] | None = None) -> int:
     s = manifest["summary"]
     print(
         f"\nscenarios: {s['total']} total, {s['passed']} passed, "
-        f"{s['failed']} failed, {s['missing']} missing, {s['skipped']} skipped"
+        f"{s['failed']} failed, {s['missing']} missing, {s['skipped']} skipped, "
+        f"{s['environment_unavailable']} environment-unavailable"
     )
     print(f"manifest: {out_path}")
+    if s["required_environment_unavailable"]:
+        print(
+            "REQUIRED scenarios unavailable; host-capable evidence required: "
+            + ", ".join(s["required_environment_unavailable"])
+        )
     if s["required_not_passed"]:
         print("REQUIRED scenarios not passed: " + ", ".join(s["required_not_passed"]))
         return 1

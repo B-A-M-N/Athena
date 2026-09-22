@@ -22,6 +22,7 @@ Governance is pre-built and has been waiting for a provider:
 """
 
 from __future__ import annotations
+from athena.capabilities.operations import native_descriptor
 
 import asyncio
 from collections.abc import Mapping
@@ -34,10 +35,9 @@ import time
 from typing import Any, Protocol
 
 from athena.artifacts.store import ArtifactStore
-from athena.execution.async_call import run_blocking
+from athena.concurrency import run_blocking
 from athena.protocol.capabilities import (
     Availability,
-    CapabilityDescriptor,
     CapabilityOrigin,
     CapabilityRequest,
     CapabilityResult,
@@ -120,7 +120,7 @@ def _operation_effects(operation: str) -> frozenset[EffectClass]:
     return frozenset({EffectClass.COMPUTER_INPUT})
 
 
-_COMPUTER_DESCRIPTOR = CapabilityDescriptor(
+_COMPUTER_DESCRIPTOR = native_descriptor(
     id="computer",
     description=(
         "Visual computer control (fallback/general-purpose infrastructure per "

@@ -64,9 +64,9 @@ def main() -> int:
                 Path(args.workspace_root), Path(args.root), args.checkpoint_id or ""
             )
         elif args.operation == "manifest":
-            from athena.shadow.engine import ShadowEngine
+            from athena.workspace_manifest import content_manifest
 
-            result = {"manifest": ShadowEngine._manifest(args.workspace_root)}
+            result = {"manifest": content_manifest(args.workspace_root)}
         elif args.operation == "inspect":
             result = manager._inspect_sync(args.checkpoint_id or "")
         elif args.operation == "read":
@@ -136,8 +136,7 @@ def _clone_shadow(source: Path, root: Path, branch_id: str) -> dict:
         raise ValueError("shadow destination cannot be inside its source workspace")
     if target.exists() or target.is_symlink():
         raise FileExistsError(f"shadow destination already exists: {target}")
-    from athena.shadow.engine import ShadowEngine
-    from athena.workspace_manifest import copy_workspace_tree
+    from athena.workspace_manifest import content_manifest, copy_workspace_tree
 
     target.parent.mkdir(parents=True, exist_ok=True)
     copy_workspace_tree(
@@ -149,7 +148,7 @@ def _clone_shadow(source: Path, root: Path, branch_id: str) -> dict:
     # The clone is the immutable branch base. Capturing its manifest after the
     # copy means an edit racing with copytree is treated as base drift at
     # commit rather than silently folded into the proof.
-    base_manifest = ShadowEngine._manifest(str(target))
+    base_manifest = content_manifest(target)
     return {
         "base_manifest": base_manifest,
         "base_preimages": _preimage_manifest(target),

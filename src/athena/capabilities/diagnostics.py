@@ -1,6 +1,7 @@
 """First-class diagnostic normalization and repair-memory access."""
 
 from __future__ import annotations
+from athena.capabilities.operations import native_descriptor
 
 import json
 from collections.abc import Mapping
@@ -8,7 +9,6 @@ from typing import Any
 
 from athena.execution.diagnostics import normalize_diagnostics, normalize_diagnostics_payload
 from athena.protocol.capabilities import (
-    CapabilityDescriptor,
     CapabilityOrigin,
     CapabilityRequest,
     CapabilityResult,
@@ -18,7 +18,7 @@ from athena.protocol.capabilities import (
 
 
 class DiagnosticsCapability:
-    descriptor = CapabilityDescriptor(
+    descriptor = native_descriptor(
         id="diagnostics",
         description=(
             "Normalize native or textual diagnostics and retrieve advisory, "

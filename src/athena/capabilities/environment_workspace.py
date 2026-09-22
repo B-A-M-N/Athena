@@ -2,7 +2,7 @@
 over the task's workspace root (P1-10, checkpoint-manager backed)."""
 
 from athena.capabilities import environment as _facade
-from athena.protocol.capabilities import CapabilityDescriptor
+from athena.capabilities.operations import native_descriptor
 from athena.protocol.capabilities import CapabilityOrigin
 from athena.protocol.capabilities import CapabilityRequest
 from athena.protocol.capabilities import CapabilityResult
@@ -12,7 +12,7 @@ import json
 import os
 
 from athena.capabilities.environment_common import _result
-from athena.execution.async_call import run_blocking
+from athena.concurrency import run_blocking
 
 
 class WorkspaceCapability:
@@ -40,7 +40,7 @@ class WorkspaceCapability:
         self._project_index_store = project_index_store
         self._project_index_coordinator = project_index_coordinator
 
-    descriptor = CapabilityDescriptor(
+    descriptor = native_descriptor(
         id="workspace",
         description=(
             "Workspace lifecycle: status summary, snapshot (via checkpoint "

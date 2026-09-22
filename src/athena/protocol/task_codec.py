@@ -22,6 +22,7 @@ from athena.protocol.tasks import (
     NetworkPolicy,
     PathRule,
     ResourceBudget,
+    TaskExecutionPlan,
     TaskSpec,
     VerificationSpec,
     VerificationType,
@@ -425,7 +426,7 @@ def encode_task_spec(task: TaskSpec) -> dict[str, Any]:
     """Return the canonical transport/database record for a ``TaskSpec``."""
     workspace = encode_workspace(task.workspace)
     delivery = encode_delivery(task.delivery)
-    return {
+    canonical: dict[str, Any] = {
         "id": task.id,
         "objective": task.objective,
         "session_id": task.session_id,
@@ -440,6 +441,12 @@ def encode_task_spec(task: TaskSpec) -> dict[str, Any]:
         "delivery": json.loads(delivery) if delivery is not None else None,
         "metadata": dict(task.metadata),
     }
+    # Keep the typed execution plan in the canonical record so restart, ACP,
+    # delegation, and persistence cannot lose the service admission decision.
+    execution_plan = task.execution_plan
+    if execution_plan is not None:
+        canonical["execution_plan"] = execution_plan.to_record()
+    return canonical
 
 
 def decode_task_spec(raw: Mapping[str, Any], *, status: str | None = None) -> TaskSpec:
@@ -453,6 +460,22 @@ def decode_task_spec(raw: Mapping[str, Any], *, status: str | None = None) -> Ta
             deadline = datetime.fromisoformat(deadline)
         except ValueError:
             deadline = None
+    execution_plan_record = raw.get("execution_plan")
+    metadata = dict(metadata)
+    execution_plan = None
+    if isinstance(execution_plan_record, Mapping):
+        execution_plan = TaskExecutionPlan.from_record(execution_plan_record)
+    else:
+        # Compatibility decode: older records stored only these private keys.
+        legacy_work_class = metadata.get("_athena_work_class")
+        legacy_depth = metadata.get("_athena_speculation_depth")
+        if legacy_work_class and legacy_depth:
+            execution_plan = TaskExecutionPlan.from_record(
+                {
+                    "work_class": legacy_work_class,
+                    "speculation_depth": legacy_depth,
+                }
+            )
     return TaskSpec(
         id=str(raw["id"]),
         objective=str(raw.get("objective") or ""),
@@ -467,4 +490,5 @@ def decode_task_spec(raw: Mapping[str, Any], *, status: str | None = None) -> Ta
         deadline=deadline,
         delivery=decode_delivery(raw.get("delivery")),
         metadata=metadata,
+        execution_plan=execution_plan,
     )

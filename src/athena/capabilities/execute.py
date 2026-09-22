@@ -7,6 +7,7 @@ and its persistent runtimes (shell, python). Execution remains behind
 """
 
 from __future__ import annotations
+from athena.capabilities.operations import native_descriptor
 
 import os
 import hashlib
@@ -16,7 +17,6 @@ from datetime import datetime, timedelta, timezone
 
 from athena.execution.diagnostics import normalize_diagnostics
 from athena.protocol.capabilities import (
-    CapabilityDescriptor,
     CapabilityOrigin,
     CapabilityRequest,
     CapabilityResult,
@@ -48,7 +48,7 @@ _INPUT_SCHEMA = {
 
 
 class ExecuteCapability:
-    descriptor = CapabilityDescriptor(
+    descriptor = native_descriptor(
         id="execute",
         description=(
             "Universal computation: run code in a language on the local system. "

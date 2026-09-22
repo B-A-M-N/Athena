@@ -47,7 +47,7 @@ def _payload_int(payload: dict, key: str) -> int:
 # loop's tool-correction path) turn the failure into an observation worth
 # interpreting. The first failure is ordinary — the model sees the error
 # and repairs. By the third, the repair loop is circling.
-_REPEATED_FAILURE_THRESHOLD = 3
+REPEATED_FAILURE_THRESHOLD = 3
 
 # A screen smaller than this is compact enough for the primary transcript;
 # a larger one (busy TUI, long scrollback render) is interpreter material.
@@ -93,7 +93,7 @@ def observation_warrants_subturn(observation: InterpreterObservation) -> bool:
         return True
 
     if observation.kind == BodyObservationKind.REPEATED_FAILURE:
-        return _payload_int(payload, "attempts") >= _REPEATED_FAILURE_THRESHOLD
+        return _payload_int(payload, "attempts") >= REPEATED_FAILURE_THRESHOLD
 
     if observation.kind == BodyObservationKind.CAPABILITY_FAILED:
         error_len = len(str(payload.get("error") or ""))

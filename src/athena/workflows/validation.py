@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from athena.capabilities.registry import _compile_validator
+from athena.schema import compile_validator
 from athena.workflows.models import Workflow
 
 
@@ -31,9 +31,9 @@ class WorkflowValidator:
         # step can run. Generated workflows may infer this schema from their
         # construction fixtures, while no-input workflows can leave it empty.
         try:
-            _compile_validator(dict(workflow.input_schema))
+            compile_validator(dict(workflow.input_schema))
             if workflow.output_schema is not None:
-                _compile_validator(dict(workflow.output_schema))
+                compile_validator(dict(workflow.output_schema))
         except (TypeError, ValueError) as exc:
             errors.append(f"workflow input_schema: {exc}")
 

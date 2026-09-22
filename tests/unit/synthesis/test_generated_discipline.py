@@ -14,7 +14,7 @@ import json
 import pytest
 from hypothesis import given, strategies as st
 
-from athena.capabilities.registry import _compile_validator, validate_schema as _validate_schema
+from athena.schema import compile_validator, validate_schema
 from athena.synthesis.engine import (
     _GENERATED_EFFECTIVE_AUTHORITY,
     _service_negative_cases,
@@ -39,10 +39,10 @@ class TestAdversarialSchemas:
             node = {"anyOf": [node, {"type": "null"}]}
         schema["properties"] = {"x": node}
         with pytest.raises(ValueError, match="nesting depth"):
-            _compile_validator(schema)
+            compile_validator(schema)
         # A sane depth still compiles.
         ok = {"type": "object", "properties": {"x": {"anyOf": [{"type": "string"}]}}}
-        assert _compile_validator(ok).is_valid({"x": "s"}) is True
+        assert compile_validator(ok).is_valid({"x": "s"}) is True
 
     def test_numeric_bounds_survive_alias_translation(self):
         """allow_extra alias translation must not drop constraint keys."""
@@ -51,20 +51,20 @@ class TestAdversarialSchemas:
             "allow_extra": False,
             "properties": {"n": {"type": "integer", "minimum": 0, "maximum": 10}},
         }
-        assert _validate_schema(schema, {"n": 11}) != []
-        assert _validate_schema(schema, {"n": -1}) != []
-        assert _validate_schema(schema, {"n": 5}) == []
-        assert _validate_schema(schema, {"n": 5, "extra": 1}) != []
+        assert validate_schema(schema, {"n": 11}) != []
+        assert validate_schema(schema, {"n": -1}) != []
+        assert validate_schema(schema, {"n": 5}) == []
+        assert validate_schema(schema, {"n": 5, "extra": 1}) != []
 
     def test_invalid_schema_is_rejected_not_accepted(self):
         """A schema that cannot compile must raise, never validate-all."""
         with pytest.raises(Exception):
-            _compile_validator({"type": "not-a-real-type"})
+            compile_validator({"type": "not-a-real-type"})
 
     def test_non_object_schema_payloads_rejected(self):
         schema = {"type": "object", "properties": {"a": {"type": "string"}}}
         for hostile in ([], "str", 3, None):
-            assert _validate_schema(schema, hostile) != [], hostile
+            assert validate_schema(schema, hostile) != [], hostile
 
     @given(
         properties=st.dictionaries(
@@ -91,7 +91,7 @@ class TestAdversarialSchemas:
         cases = _service_negative_cases(schema)
         assert cases
         for case in cases:
-            assert _validate_schema(schema, case["input"]), case
+            assert validate_schema(schema, case["input"]), case
 
 
 # ---------------------------------------------------------------- #

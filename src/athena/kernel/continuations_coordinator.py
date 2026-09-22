@@ -20,7 +20,8 @@ import logging
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
-from athena.kernel.dispatch import DispatchResult, SuspendedCall
+from athena.kernel.dispatch import DispatchResult
+from athena.protocol.continuations import SuspendedCall
 from athena.protocol.capabilities import (
     CapabilityRequest,
     CapabilityRequestOrigin,
@@ -37,6 +38,7 @@ from athena.protocol.messages import (
     utcnow,
 )
 
+from athena.concurrency import ReferenceCountedKeyedLocks
 from athena.kernel.termination import TerminationDecision
 
 if TYPE_CHECKING:
@@ -46,17 +48,11 @@ if TYPE_CHECKING:
 from athena.protocol.tasks import TaskStatus
 
 
-def _mod():
-    # Kernel-module helpers resolve through the kernel module at call time.
-    from athena.kernel import kernel
-
-    return kernel
-
-
-def _replay_policy_context(task) -> dict:
-    # Pure static on AgentKernel; resolved through the kernel module to
-    # avoid the import cycle while keeping one definition.
-    return _mod().AgentKernel._replay_policy_context(task)
+from athena.kernel.policy_context import (
+    deny_result as _deny_result,
+    replay_policy_context as _replay_policy_context,
+    remaining_runtime_seconds as _remaining_runtime_seconds,
+)
 
 
 _logger = logging.getLogger("athena.kernel")
@@ -76,9 +72,7 @@ class ContinuationCoordinator:
         suspended: SuspendedCall | None = None,
         *,
         record: dict | None = None,
-        dispatcher=None,
-        workspace=None,
-        profile=None,
+        shim=None,
     ):
         """Finish the outer workflow call after one child approval resolves.
 
@@ -114,19 +108,8 @@ class ContinuationCoordinator:
         )
         if not run_id or not workflow_id or not parent_call_id:
             return None
-        if dispatcher is None:
-            dispatcher = (
-                getattr(self._k._dispatch_factory(task), "_dispatcher", None)
-                if self._k._dispatch_factory is not None
-                else None
-            )
-        if workspace is None:
-            shim = (
-                self._k._dispatch_factory(task) if self._k._dispatch_factory is not None else None
-            )
-            workspace = getattr(shim, "_workspace", None)
-            profile = getattr(shim, "_profile", profile)
-        if dispatcher is None or workspace is None:
+        shim = self._k._dispatch_factory(task) if self._k._dispatch_factory is not None else None
+        if shim is None:
             return CapabilityResultBlock(
                 call_id=str(parent_call_id),
                 capability_id=str(parent_capability_id),
@@ -156,13 +139,12 @@ class ContinuationCoordinator:
                 origin=CapabilityRequestOrigin.TRUSTED_ORCHESTRATION,
             )
         try:
-            return await dispatcher.dispatch(
+            return await shim.resume_request(
+                task,
                 parent_request,
-                workspace=workspace,
-                profile=profile,
                 **_replay_policy_context(task),
             )
-        except Exception as exc:  # the outer result must remain truthful
+        except Exception as exc:  # broad-exception: the outer result must remain truthful
             return CapabilityResultBlock(
                 call_id=parent_request.call_id,
                 capability_id=parent_request.capability_id,
@@ -206,7 +188,7 @@ class ContinuationCoordinator:
                 continue
             try:
                 await self._k._continuation_store.mark_consumed_for_call(call_id)
-            except Exception as exc:
+            except Exception as exc:  # broad-exception: continuation boundary converts durable-store/binding failures into truthful task outcomes
                 _logger.warning("continuation consume failed for %s: %s", call_id, exc)
 
     async def _resume_durable_continuation(self, task: TaskSpec) -> SuspendedCall | None:
@@ -214,7 +196,7 @@ class ContinuationCoordinator:
             return None
         try:
             record = await self._k._continuation_store.claim_resolved(task.id)
-        except Exception as exc:
+        except Exception as exc:  # broad-exception: continuation boundary converts durable-store/binding failures into truthful task outcomes
             _logger.warning("durable continuation lookup failed for %s: %s", task.id, exc)
             return None
         if record is None:
@@ -240,9 +222,7 @@ class ContinuationCoordinator:
             parent = await self._k._resume_workflow_parent(
                 task,
                 record=record,
-                dispatcher=shim._dispatcher,
-                workspace=shim._workspace,
-                profile=shim._profile,
+                shim=shim,
             )
             blocks = [denied]
             if isinstance(parent, SuspendedCall):
@@ -292,14 +272,10 @@ class ContinuationCoordinator:
                         else None
                     ),
                 )
-            replay_context = _replay_policy_context(task)
-            result = await shim._dispatcher.dispatch(
+            result = await shim.resume_request(
+                task,
                 request,
-                workspace=shim._workspace,
-                profile=shim._profile,
-                task_policy=replay_context["task_policy"],
-                model_policy=replay_context["model_policy"],
-                _directives=directives,
+                directives=directives,
             )
             if isinstance(result, SuspendedCall):
                 await self._k._append_results(
@@ -318,15 +294,13 @@ class ContinuationCoordinator:
                 await self._k._reconcile_workflow_continuation(
                     record,
                     result,
-                    workspace_root=shim._workspace.root,
-                    workspace=shim._workspace,
+                    workspace_root=shim.scope.workspace.root,
+                    workspace=shim.scope.workspace,
                 )
                 parent = await self._k._resume_workflow_parent(
                     task,
                     record=record,
-                    dispatcher=shim._dispatcher,
-                    workspace=shim._workspace,
-                    profile=shim._profile,
+                    shim=shim,
                 )
                 blocks = [_to_result_block(result)]
                 if isinstance(parent, SuspendedCall):
@@ -337,7 +311,7 @@ class ContinuationCoordinator:
                     blocks.append(_to_result_block(parent))
                 await self._k._append_results(task, blocks)
                 await self._k._consume_durable_call(call_id)
-        except Exception as exc:
+        except Exception as exc:  # broad-exception: continuation boundary converts durable-store/binding failures into truthful task outcomes
             await self._k._release_durable_call(call_id)
             await self._k._append_results(
                 task,
@@ -390,7 +364,7 @@ class ContinuationCoordinator:
             return
         try:
             await self._k._continuation_store.mark_consumed_for_call(call_id)
-        except Exception as exc:
+        except Exception as exc:  # broad-exception: continuation boundary converts durable-store/binding failures into truthful task outcomes
             _logger.warning("continuation consume failed for %s: %s", call_id, exc)
 
     async def _release_durable_call(self, call_id: str) -> None:
@@ -401,7 +375,7 @@ class ContinuationCoordinator:
             return
         try:
             await release(call_id)
-        except Exception as exc:
+        except Exception as exc:  # broad-exception: continuation boundary converts durable-store/binding failures into truthful task outcomes
             _logger.warning("continuation claim release failed for %s: %s", call_id, exc)
 
     async def _scrub_input_answer(self, request_id: str, answer_ref: str) -> None:
@@ -414,7 +388,7 @@ class ContinuationCoordinator:
             return
         try:
             await self._k._scrub_input_answer_impl(request_id, answer_ref)
-        except Exception as exc:
+        except Exception as exc:  # broad-exception: continuation boundary converts durable-store/binding failures into truthful task outcomes
             _logger.warning("input answer scrub failed for %s: %s", request_id, exc)
 
     async def _scrub_input_answer_impl(self, request_id: str, answer_ref: str) -> None:
@@ -453,14 +427,14 @@ class ContinuationCoordinator:
         decision = decision or "denied"
         try:
             await self._k._transition(task, TaskStatus.RUNNING)
-        except Exception:
+        except Exception:  # broad-exception: continuation boundary converts durable-store/binding failures into truthful task outcomes
             return await self._k._finalize_decision(
                 task,
                 state,
                 TerminationDecision(True, "approval wait could not resume", TaskStatus.BLOCKED),
             )
         if decision in ("denied", "cancelled"):
-            denied = [_mod()._deny_result(s) for s in outcome.suspended]
+            denied = [_deny_result(s) for s in outcome.suspended]
             parent_results: list[CapabilityResultBlock] = []
             parent_suspended: list[SuspendedCall] = []
             for suspended_call, result in zip(outcome.suspended, denied):
@@ -483,23 +457,17 @@ class ContinuationCoordinator:
         if self._k._dispatch_factory is None:
             return None
         shim = self._k._dispatch_factory(task)
-        dispatcher = getattr(shim, "_dispatcher", None)
-        if dispatcher is None:
-            blocks = [_mod()._block_of(s) for s in outcome.suspended]
-            retried = await shim.dispatch(task, blocks)
-            await self._k._append_results(task, retried.results)
-            return None
         suspended = list(outcome.suspended)
         while suspended:
             requests = [s.request for s in suspended]
             for request in requests:
                 object.__setattr__(request, "origin", CapabilityRequestOrigin.TRUSTED_ORCHESTRATION)
-            items = await dispatcher.dispatch_many(
+            items = await shim.resume_requests(
+                task,
                 requests,
-                workspace=shim._workspace,
-                profile=shim._profile,
-                **_mod().AgentKernel._replay_policy_context(task),
-                runtime_remaining_s=_mod().AgentKernel._remaining_runtime_seconds(task, state),
+                **_replay_policy_context(task),
+                runtime_remaining_s=_remaining_runtime_seconds(task, state),
+                verification_environment=getattr(task, "verification_environment", None),
                 _directives_by_call_id={
                     suspended_call.call_id: suspended_call.directives
                     for suspended_call in suspended
@@ -509,7 +477,7 @@ class ContinuationCoordinator:
             results = []
             raw_results = []
             re_ask: list = []
-            for it in items:
+            for it in [*items.results, *items.suspended]:
                 if isinstance(it, SuspendedCall):
                     re_ask.append(it)
                 else:
@@ -519,12 +487,12 @@ class ContinuationCoordinator:
             for item in raw_results:
                 matched_suspended = by_call_id.get(getattr(item, "call_id", ""))
                 if matched_suspended is not None:
-                    reconcile_kwargs = {"workspace_root": shim._workspace.root}
+                    reconcile_kwargs = {"workspace_root": shim.scope.workspace.root}
                     if (
                         "workspace"
                         in inspect.signature(self._k._reconcile_workflow_suspended).parameters
                     ):
-                        reconcile_kwargs["workspace"] = shim._workspace
+                        reconcile_kwargs["workspace"] = shim.scope.workspace
                     await self._k._reconcile_workflow_suspended(
                         matched_suspended, item, **reconcile_kwargs
                     )
@@ -533,9 +501,7 @@ class ContinuationCoordinator:
                         await resume_parent(
                             task,
                             matched_suspended,
-                            dispatcher=dispatcher,
-                            workspace=shim._workspace,
-                            profile=shim._profile,
+                            shim=shim,
                         )
                         if resume_parent is not None
                         else None
@@ -691,7 +657,7 @@ class ContinuationCoordinator:
             for pending in (resume_task, cancel_task, timeout_task):
                 if not pending.done():
                     pending.cancel()
-        async with lock:
+        async with self._resume_lock(task.id):
             if state.cancel.is_set():
                 self._disarm_resume_wait(task.id)
                 return "cancelled"
@@ -724,12 +690,12 @@ class ContinuationCoordinator:
         if armed is not None:
             armed.discard(task_id)
 
-    def _resume_lock(self, task_id: str) -> asyncio.Lock:
+    def _resume_lock(self, task_id: str):
         locks = getattr(self._k, "_resume_locks", None)
-        if locks is None:
-            locks = {}
+        if not isinstance(locks, ReferenceCountedKeyedLocks):
+            locks = ReferenceCountedKeyedLocks()
             setattr(self._k, "_resume_locks", locks)
-        return locks.setdefault(task_id, asyncio.Lock())
+        return locks.lock(task_id)
 
     async def _durable_resume_ready(self, task) -> bool:
         input_store = getattr(self._k, "_input_request_store", None)
@@ -737,7 +703,7 @@ class ContinuationCoordinator:
             try:
                 if await input_store.pending_resumable(task.id) is not None:
                     return True
-            except Exception as exc:
+            except Exception as exc:  # broad-exception: continuation boundary converts durable-store/binding failures into truthful task outcomes
                 _logger.warning("input resume readiness lookup failed for %s: %s", task.id, exc)
 
         continuations = getattr(self._k, "_continuation_store", None)
@@ -747,7 +713,7 @@ class ContinuationCoordinator:
                 try:
                     if await ready(task.id):
                         return True
-                except Exception as exc:
+                except Exception as exc:  # broad-exception: continuation boundary converts durable-store/binding failures into truthful task outcomes
                     _logger.warning(
                         "approval resume readiness lookup failed for %s: %s", task.id, exc
                     )
@@ -806,7 +772,7 @@ class ContinuationCoordinator:
         self._arm_resume_wait(task.id)
         try:
             answered = await input_store.pending_resumable(task.id)
-        except Exception:
+        except Exception:  # broad-exception: continuation boundary converts durable-store/binding failures into truthful task outcomes
             answered = None
         if answered is not None:
             request_id = str(answered.get("id") or "")
@@ -815,7 +781,7 @@ class ContinuationCoordinator:
             return None
         try:
             open_request = await input_store.pending_for_task(task.id)
-        except Exception:
+        except Exception:  # broad-exception: continuation boundary converts durable-store/binding failures into truthful task outcomes
             open_request = None
         if open_request is None:
             return None
@@ -892,7 +858,7 @@ class ContinuationCoordinator:
                         },
                     ),
                 )
-            except Exception:
+            except Exception:  # broad-exception: continuation boundary converts durable-store/binding failures into truthful task outcomes
                 _logger.warning("input answer persistence failed for %s", request_id, exc_info=True)
         consumed = await self._k._input_request_store.consume(request_id)
         if consumed is False:
@@ -901,7 +867,7 @@ class ContinuationCoordinator:
             row = await self._k._task_store.get(task.id)
             if row and (row.get("status") or "").upper() == TaskStatus.WAITING_INPUT.value:
                 await self._k._transition(task, TaskStatus.RUNNING)
-        except Exception:
+        except Exception:  # broad-exception: continuation boundary converts durable-store/binding failures into truthful task outcomes
             return await self._k._finalize_decision(
                 task,
                 state,

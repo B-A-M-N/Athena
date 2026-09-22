@@ -13,6 +13,8 @@ import subprocess
 from typing import Any
 
 from athena.protocol.capabilities import (
+    CapabilityFailure,
+    CapabilityFailureCode,
     CapabilityDescriptor,
     CapabilityOrigin,
     CapabilityRequest,
@@ -33,12 +35,23 @@ def _result(
     error: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> CapabilityResult:
-    return CapabilityResult(
-        request.call_id,
-        request.capability_id,
-        CapabilityResultStatus.OK if ok else CapabilityResultStatus.FAILED,
+    if ok:
+        return CapabilityResult(
+            request.call_id,
+            request.capability_id,
+            CapabilityResultStatus.OK,
+            output=output[:_MAX_OUTPUT],
+            error=error,
+            metadata=dict(metadata or {}),
+        )
+    return CapabilityResult.failure(
+        request,
+        CapabilityFailure(
+            code=CapabilityFailureCode.PERMANENT_RUNTIME,
+            detail=error or "operation failed",
+            stage="invoke",
+        ),
         output=output[:_MAX_OUTPUT],
-        error=error,
         metadata=dict(metadata or {}),
     )
 

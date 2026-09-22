@@ -32,6 +32,7 @@ import queue as thread_queue
 import threading
 from typing import Any, AsyncIterator, Mapping, cast
 
+from athena.concurrency import ReferenceCountedKeyedLocks
 from athena.protocol.execution import (
     ExecutionEvent,
     ExecutionRequest,
@@ -51,9 +52,8 @@ class BaseRuntime(metaclass=abc.ABCMeta):
         self._sessions: dict[str, Any] = {}
         # execution_id -> session id (interrupt registry, BHV-061 ownership).
         self._exec_owner: dict[str, str] = {}
-        # Serializes overlapping executions on the same runtime session
-        # (BHV-058/059/060): concurrent run() on one session must not interleave.
-        self._session_locks: dict[str, asyncio.Lock] = {}
+        # Serialize one session at a time; the keyed lock is released after each execution.
+        self._session_locks = ReferenceCountedKeyedLocks()
 
     # ------------------------------------------------------------------ #
     # Concrete session bookkeeping (shared scaffolding)
@@ -192,10 +192,9 @@ class BaseRuntime(metaclass=abc.ABCMeta):
         """Default async-gen bridge over the blocking ``_run`` generator."""
         sid, session = self._adopt_or_create(request)
         self._exec_owner[execution_id] = sid
-        lock = self._session_locks.setdefault(sid, asyncio.Lock())
         reported = False
         try:
-            async with lock:
+            async with self._session_locks.lock(sid):
                 gen = self._run(session, request, execution_id)
                 async for event in self._bridge_sync_generator(gen):
                     if not reported:
@@ -298,7 +297,7 @@ class BaseRuntime(metaclass=abc.ABCMeta):
             try:
                 for item in gen:
                     queue.put(("item", item))
-            except BaseException as exc:  # surface to async side
+            except BaseException as exc:  # broad-exception: bridge worker failures to async side
                 queue.put(("error", exc))
             finally:
                 done.set()

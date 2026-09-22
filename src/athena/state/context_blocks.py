@@ -6,8 +6,7 @@ import json
 from datetime import datetime
 from typing import Any, List, Mapping, Sequence
 
-from athena.context.blocks import ContextBlock
-from athena.context.provenance import provenance_from_mapping
+from athena.protocol.context import ContextBlock, provenance_from_mapping
 from athena.protocol.ids import new_id
 from athena.protocol.messages import Provenance, TrustClass, utcnow
 from athena.state.database import Database

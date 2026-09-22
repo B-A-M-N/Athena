@@ -8,12 +8,14 @@ distinct from semantic memory: transcript recall is provenance-anchored
 """
 
 from __future__ import annotations
+from athena.capabilities.operations import native_descriptor
 
 import json
 from typing import Any
 
 from athena.protocol.capabilities import (
-    CapabilityDescriptor,
+    CapabilityFailure,
+    CapabilityFailureCode,
     CapabilityOrigin,
     CapabilityRequest,
     CapabilityRequestOrigin,
@@ -58,8 +60,16 @@ _INPUT_SCHEMA = {
 _MAX_OUTPUT_CHARS = 48_000
 
 
+def _typed_failed(
+    request: CapabilityRequest, msg: str, code: CapabilityFailureCode
+) -> CapabilityResult:
+    return CapabilityResult.failure(
+        request, CapabilityFailure(code=code, detail=msg, stage="invoke")
+    )
+
+
 class SessionSearchCapability:
-    descriptor = CapabilityDescriptor(
+    descriptor = native_descriptor(
         id="session_search",
         description=(
             "Full-text search over past conversation history. Returns matching "
@@ -77,6 +87,14 @@ class SessionSearchCapability:
 
     def __init__(self, message_store=None) -> None:
         self._messages = message_store
+
+    def _conformance_failure_probe(self) -> dict:
+        failure = CapabilityFailure(
+            code=CapabilityFailureCode.INVALID_INPUT,
+            detail="conformance probe",
+            stage="invoke",
+        )
+        return failure.to_metadata()
 
     async def invoke(
         self, request: CapabilityRequest, *, context=None, **kwargs
@@ -106,11 +124,10 @@ class SessionSearchCapability:
         if operation == "read":
             anchor = str(args.get("anchor") or "").strip()
             if not anchor:
-                return CapabilityResult(
-                    call_id,
-                    self.descriptor.id,
-                    CapabilityResultStatus.FAILED,
-                    error="anchor is required for read",
+                return _typed_failed(
+                    request,
+                    "anchor is required for read",
+                    CapabilityFailureCode.INVALID_INPUT,
                 )
             requested_session = str(args.get("session_id") or request.session_id or "") or None
             if context is not None and not principal_id:
@@ -153,12 +170,7 @@ class SessionSearchCapability:
 
         query = str(args.get("query") or "").strip()
         if not query:
-            return CapabilityResult(
-                call_id,
-                self.descriptor.id,
-                CapabilityResultStatus.FAILED,
-                error="query is required",
-            )
+            return _typed_failed(request, "query is required", CapabilityFailureCode.INVALID_INPUT)
         scope = str(args.get("scope") or "current_session")
         if scope not in {"current_session", "principal"}:
             return CapabilityResult(

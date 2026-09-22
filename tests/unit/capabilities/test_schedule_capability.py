@@ -7,12 +7,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from athena.capabilities.schedule import (
-    ScheduleAPI,
-    ScheduleControl,
-    _grant_allows,
-    _workspace_rules_cover,
-)
+from athena.capabilities.schedule import ScheduleAPI, ScheduleControl
+from athena.scheduler.control import _grant_allows, _workspace_rules_cover
 from athena.scheduler.scheduler import TriggerType
 from athena.state.database import Database
 from athena.state.schedules import ScheduleStore

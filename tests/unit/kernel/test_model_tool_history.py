@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +11,7 @@ from athena.kernel.kernel import AgentKernel, _assistant_message
 from athena.kernel.inference_broker import _request_fingerprint
 from athena.models.providers.anthropic import AnthropicProvider
 from athena.models.providers.openai_compat import OpenAICompatProvider
+from athena.protocol.capabilities import CapabilityDescriptor, EffectClass
 from athena.protocol.messages import (
     CapabilityCallBlock,
     CapabilityResultBlock,
@@ -103,6 +107,74 @@ def test_provider_receipt_fingerprint_excludes_transport_request_id():
     assert _request_fingerprint(
         task, first, inference_kind=None, attempt=0
     ) != _request_fingerprint(task, changed, inference_kind=None, attempt=0)
+
+
+def test_provider_receipt_fingerprint_is_stable_across_hash_seeds():
+    script = """
+from athena.kernel.inference_broker import _request_fingerprint
+from athena.protocol.capabilities import CapabilityDescriptor, EffectClass
+from athena.protocol.messages import Message, Role, TextBlock
+from athena.protocol.models import ModelRequest
+from athena.protocol.tasks import TaskSpec
+
+descriptor = CapabilityDescriptor(
+    id="execute",
+    description="run a bounded command",
+    input_schema={"type": "object", "required": ["code"]},
+    effects=frozenset({EffectClass.SPAWN_PROCESS, EffectClass.EXECUTE}),
+    tags=frozenset({"shell", "execution"}),
+    operation_effects={"run": frozenset({EffectClass.EXECUTE})},
+    source_schema={"properties": {"code": {"type": "string"}}},
+)
+request = ModelRequest(
+    messages=(Message(
+        id="message-1",
+        role=Role.USER,
+        blocks=(TextBlock(text="run the command"),),
+        created_at=None,
+        provenance=None,
+        metadata={"unordered": frozenset({"z", "a"})},
+    ),),
+    model="model",
+    provider="provider",
+    request_id="transport-id",
+    capabilities=(descriptor,),
+    metadata={"unordered": frozenset({"second", "first"})},
+)
+print(_request_fingerprint(TaskSpec(id="task", objective="run"), request,
+                           inference_kind="primary", attempt=0))
+"""
+    fingerprints = []
+    source_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..", "src"))
+    for seed in ("1", "2", "3", "4"):
+        environment = os.environ.copy()
+        environment["PYTHONHASHSEED"] = seed
+        current_path = environment.get("PYTHONPATH")
+        environment["PYTHONPATH"] = (
+            source_root + os.pathsep + current_path if current_path else source_root
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        fingerprints.append(completed.stdout.strip())
+    assert len(set(fingerprints)) == 1
+
+
+def test_provider_receipt_fingerprint_rejects_unsupported_values():
+    task = TaskSpec(id="task-unsupported", objective="inspect")
+    request = ModelRequest(
+        messages=(),
+        model="m",
+        provider="p",
+        request_id="call",
+        metadata={"unsupported": object()},
+    )
+    with pytest.raises(TypeError, match="unsupported fingerprint value"):
+        _request_fingerprint(task, request, inference_kind=None, attempt=0)
 
 
 @pytest.mark.athena_scenario("COMPAT-002")

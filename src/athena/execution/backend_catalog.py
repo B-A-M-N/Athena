@@ -1,0 +1,101 @@
+"""Backend catalog and health inventory for the execution manager.
+
+Subordinate to :class:`athena.execution.manager.ExecutionManager`. This module
+owns the read-only inventory surface: listing backends, health/probe status,
+and capability descriptors. It does not select the backend for an execution
+(that stays on the manager), and it does not authorize or run anything.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Mapping
+
+from athena.execution.backend import ExecutionBackend
+
+__all__ = ["BackendCatalog"]
+
+
+class BackendCatalog:
+    """Track registered backends and expose health/capability inventory."""
+
+    def __init__(self) -> None:
+        self._backends: dict[str, ExecutionBackend] = {}
+        self._passports: dict[str, dict[str, Any]] = {}
+
+    def register(self, backend: ExecutionBackend) -> None:
+        name = getattr(backend, "name", type(backend).__name__)
+        self._backends[name] = backend
+
+    @property
+    def backends(self) -> dict[str, ExecutionBackend]:
+        return self._backends
+
+    def set_passport(self, backend: str, passport: Mapping[str, Any]) -> None:
+        self._passports[backend] = dict(passport)
+
+    def get_passport(self, name: str) -> dict[str, Any] | None:
+        return self._passports.get(name)
+
+    def get(self, name: str) -> ExecutionBackend | None:
+        return self._backends.get(name)
+
+    def names(self) -> list[str]:
+        return sorted(self._backends)
+
+    def status(
+        self,
+        *,
+        local_backend: ExecutionBackend | None = None,
+        available_runtimes: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return availability for the full backend inventory."""
+        result = [{"id": "local", "available": True, "healthy": True}]
+        if local_backend is not None:
+            result[0]["implementation"] = type(local_backend).__name__
+            passport = self._passports.get(getattr(local_backend, "name", "local"))
+            if passport is not None:
+                result[0]["passport"] = dict(passport)
+            try:
+                value = local_backend.capabilities()
+                result[0]["capabilities"] = {
+                    key: list(item) if isinstance(item, tuple) else item
+                    for key, item in vars(value).items()
+                }
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                result[0]["capabilities_error"] = str(exc)
+        for name, backend in sorted(self._backends.items()):
+            available = True
+            probe = getattr(backend, "available", None)
+            if callable(probe):
+                try:
+                    available = bool(probe())
+                except Exception:
+                    available = False
+            result.append(
+                {
+                    "id": name,
+                    "available": available,
+                    "healthy": available,
+                    "implementation": type(backend).__name__,
+                }
+            )
+            passport = self._passports.get(name)
+            if passport is not None:
+                result[-1]["passport"] = dict(passport)
+            capabilities = getattr(backend, "capabilities", None)
+            if callable(capabilities):
+                try:
+                    value = capabilities()
+                    result[-1]["capabilities"] = {
+                        key: list(item) if isinstance(item, tuple) else item
+                        for key, item in vars(value).items()
+                    }
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    result[-1]["capabilities_error"] = str(exc)
+            identity = getattr(backend, "environment_identity", None)
+            if available and callable(identity):
+                try:
+                    result[-1].update(dict(identity()))
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    result[-1]["environment_identity_error"] = str(exc)
+        return result

@@ -10,6 +10,9 @@ set -euo pipefail
 if [[ -n "${ATHENA_PYTHON:-}" ]]; then
     PYTHON_CMD=("${ATHENA_PYTHON}")
 else
+    # A read-only or isolated HOME otherwise turns into a false product-proof
+    # failure at uv's cache acquisition boundary before any Athena test runs.
+    export UV_CACHE_DIR="${UV_CACHE_DIR:-${TMPDIR:-/tmp}/athena-uv-cache}"
     PYTHON_CMD=("${ATHENA_RELEASE_UV:-uv}" run --frozen --extra dev python)
 fi
 

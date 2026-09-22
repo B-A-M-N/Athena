@@ -7,6 +7,7 @@ Arguments MUST be schema-validated before policy evaluation.
 
 from __future__ import annotations
 
+import asyncio
 import enum
 import hashlib
 import json
@@ -148,6 +149,40 @@ class CachePolicy(str, enum.Enum):
     CONTENT_ADDRESS = "content_address"
 
 
+class RetryPolicy(str, enum.Enum):
+    """Effect-aware retry contract (review item 22).
+
+    READ_ONLY — safe to retry on transient failure (no persistent effect).
+    IDEMPOTENT — safe to retry because the same operation on the same
+                 resource is a no-op if already applied.
+    COMPENSATED — retry requires a durable mutation receipt and a
+                  compensation path; never blind-retry.
+    NEVER — external writes, publications, messages, financial operations,
+            dependency installs, and unknown-outcome operations.
+    """
+
+    READ_ONLY = "read_only"
+    IDEMPOTENT = "idempotent"
+    COMPENSATED = "compensated"
+    NEVER = "never"
+
+
+def _default_retry_policy(effects: frozenset[EffectClass]) -> RetryPolicy:
+    """Derive the conservative default retry policy from declared effects.
+
+    Pure reads and computes are retryable.  Local writes with a mutation
+    receipt are IDEMPOTENT.  Everything else is NEVER.  The dispatcher never
+    auto-retries COMPENSATED or NEVER operations; the caller must supply a
+    durable receipt or an explicit idempotency key.
+    """
+    if effects <= {EffectClass.READ_LOCAL}:
+        return RetryPolicy.READ_ONLY
+    # Local write/execute/spawn are not generally idempotent. A descriptor
+    # must explicitly declare IDEMPOTENT and own an operation-specific
+    # key/receipt contract before the dispatcher will retry it.
+    return RetryPolicy.NEVER
+
+
 class ExternalEffectPhase(str, enum.Enum):
     """Lifecycle phases for effects that cannot be shadowed locally."""
 
@@ -238,6 +273,15 @@ class ExternalEffectReceipt:
 
 
 @dataclass(frozen=True)
+class DispatchProvenance:
+    """Invocation-scoped inference provenance for one dispatch round."""
+
+    provider_profile_id: str | None = None
+    model_id: str | None = None
+    repair_mode: str | None = None
+
+
+@dataclass(frozen=True)
 class CapabilityDescriptor:
     id: str
     description: str
@@ -254,8 +298,12 @@ class CapabilityDescriptor:
     cache_ttl_seconds: float | None = None
     operation_cache_policies: Mapping[str, CachePolicy] | None = None
     cache_key_resolver: Callable[[Mapping[str, Any], WorkspaceSpec], str | None] | None = None
+    resource_key_resolver: (
+        Callable[[Mapping[str, Any], WorkspaceSpec], tuple[str, ...]] | None
+    ) | None = None
     external_effects: Mapping[str, ExternalEffectContract] | None = None
     resources: frozenset[ResourceClass] | None = None
+    retry_policy: RetryPolicy | None = None  # None = derive from effects
     # Original provider schema, when a remote integration exposes a richer
     # contract than Athena's execution validator currently understands.
     source_schema: Mapping[str, Any] | None = None
@@ -294,16 +342,9 @@ class CapabilityDescriptor:
                     for operation, contract in self.external_effects.items()
                 },
             )
-        if self.operation_effects is not None or self.effect_resolver is not None:
-            return
-        try:
-            from athena.capabilities.operations import OPERATION_EFFECTS
-
-            mapping = OPERATION_EFFECTS.get(self.id)
-        except ImportError:
-            mapping = None
-        if mapping is not None:
-            object.__setattr__(self, "operation_effects", dict(mapping))
+        # Operation effects are supplied by the descriptor constructor. The
+        # protocol layer must not discover implementation-owned mappings by
+        # importing the capability package.
 
     def resolve_effects(self, arguments: Mapping[str, Any]) -> frozenset[EffectClass] | None:
         """Resolve exact operation effects, or ``None`` for simple contracts."""
@@ -333,6 +374,12 @@ class CapabilityDescriptor:
                 + ", ".join(sorted(effect.value for effect in outside))
             )
         return frozenset(effects)
+
+    def resolve_retry_policy(self) -> RetryPolicy:
+        """Return the effective retry policy, deriving from effects if unset."""
+        if self.retry_policy is not None:
+            return self.retry_policy
+        return _default_retry_policy(self.effects)
 
     def resolve_cache_policy(self, arguments: Mapping[str, Any]) -> CachePolicy:
         """Resolve cache semantics for an operation without guessing from effects."""
@@ -520,6 +567,207 @@ class CapabilityResult:
     ref_uri: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
+    @classmethod
+    def failure(
+        cls,
+        request: "CapabilityRequest",
+        failure: "CapabilityFailure",
+        *,
+        output: str = "",
+        ref_uri: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> "CapabilityResult":
+        """Construct the canonical FAILED result carrying typed failure metadata."""
+        merged = dict(metadata or {})
+        merged.update(failure.to_metadata())
+        return cls(
+            request.call_id,
+            request.capability_id,
+            CapabilityResultStatus.FAILED,
+            output=output,
+            error=failure.detail or failure.code.value,
+            ref_uri=ref_uri,
+            metadata=merged,
+        )
+
+
+class CapabilityFailureCode(str, enum.Enum):
+    """Structured, model-unreachable failure taxonomy (review item 21)."""
+
+    INVALID_INPUT = "invalid_input"
+    NOT_FOUND = "not_found"
+    PRECONDITION_FAILED = "precondition_failed"
+    DOMAIN_REJECTED = "domain_rejected"
+    ALREADY_EXISTS = "already_exists"
+    UNSUPPORTED_OPERATION = "unsupported_operation"
+    UNAVAILABLE = "unavailable"
+    DEPENDENCY_UNAVAILABLE = "dependency_unavailable"
+    POLICY_DENIED = "policy_denied"
+    CONFLICT = "conflict"
+    TIMEOUT = "timeout"
+    CANCELLED = "cancelled"
+    TRANSIENT_RUNTIME = "transient_runtime"
+    PERMANENT_RUNTIME = "permanent_runtime"
+    PERSISTENCE_FAILURE = "persistence_failure"
+    EXTERNAL_OUTCOME_UNKNOWN = "external_outcome_unknown"
+    VERIFICATION_FAILED = "verification_failed"
+
+
+@dataclass(frozen=True)
+class CapabilityFailure:
+    """Structured capability failure record, not a string to parse."""
+
+    code: CapabilityFailureCode
+    detail: str = ""
+    stage: str = ""
+    retryable: bool = False
+    outcome_known: bool = True
+    operation: str = ""
+    resource: str = ""
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "failure_code": self.code.value,
+            "failure_detail": self.detail[:4096],
+            "failure_stage": self.stage,
+            "failure_retryable": self.retryable,
+            "failure_outcome_known": self.outcome_known,
+            "failure_operation": self.operation,
+            "failure_resource": self.resource,
+        }
+
+    @classmethod
+    def from_metadata(cls, metadata: Mapping[str, Any]) -> "CapabilityFailure | None":
+        raw = metadata.get("failure_code")
+        if not raw:
+            return None
+        try:
+            code = CapabilityFailureCode(str(raw))
+        except ValueError:
+            return None
+        return cls(
+            code=code,
+            detail=str(metadata.get("failure_detail") or ""),
+            stage=str(metadata.get("failure_stage") or ""),
+            retryable=bool(metadata.get("failure_retryable", False)),
+            outcome_known=bool(metadata.get("failure_outcome_known", True)),
+            operation=str(metadata.get("failure_operation") or ""),
+            resource=str(metadata.get("failure_resource") or ""),
+        )
+
+
+# Codes that represent infrastructure/implementation health, not ordinary
+# task failures. Only these should drive circuit-breaker state.
+HEALTH_FAILURE_CODES = frozenset(
+    {
+        CapabilityFailureCode.UNAVAILABLE,
+        CapabilityFailureCode.DEPENDENCY_UNAVAILABLE,
+        CapabilityFailureCode.TIMEOUT,
+        CapabilityFailureCode.TRANSIENT_RUNTIME,
+        CapabilityFailureCode.PERSISTENCE_FAILURE,
+        CapabilityFailureCode.EXTERNAL_OUTCOME_UNKNOWN,
+    }
+)
+
+
+_RETRYABLE_FAILURE_CODES = frozenset(
+    {
+        CapabilityFailureCode.UNAVAILABLE,
+        CapabilityFailureCode.DEPENDENCY_UNAVAILABLE,
+        CapabilityFailureCode.TIMEOUT,
+        CapabilityFailureCode.TRANSIENT_RUNTIME,
+    }
+)
+
+
+def classify_exception_failure(
+    exc: BaseException,
+    *,
+    descriptor: "CapabilityDescriptor | None" = None,
+    operation: str = "",
+    resource: str = "",
+) -> CapabilityFailure:
+    """Classify a capability exception into the protocol failure taxonomy."""
+    detail = str(exc) or type(exc).__name__
+    operation = operation or str((getattr(descriptor, "id", "") or ""))
+    if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+        return CapabilityFailure(
+            code=CapabilityFailureCode.CANCELLED,
+            detail=detail,
+            stage="invoke",
+            operation=operation,
+            resource=resource,
+            outcome_known=True,
+            retryable=False,
+        )
+    if isinstance(exc, asyncio.TimeoutError):
+        return CapabilityFailure(
+            code=CapabilityFailureCode.TIMEOUT,
+            detail=detail,
+            stage="invoke",
+            operation=operation,
+            resource=resource,
+            outcome_known=False,
+            retryable=True,
+        )
+    if isinstance(exc, PermissionError):
+        return CapabilityFailure(
+            code=CapabilityFailureCode.DOMAIN_REJECTED,
+            detail=detail,
+            stage="invoke",
+            operation=operation,
+            resource=resource,
+        )
+    if isinstance(exc, FileNotFoundError):
+        return CapabilityFailure(
+            code=CapabilityFailureCode.NOT_FOUND,
+            detail=detail,
+            stage="invoke",
+            operation=operation,
+            resource=resource,
+        )
+    if isinstance(exc, (NotADirectoryError, IsADirectoryError)):
+        return CapabilityFailure(
+            code=CapabilityFailureCode.PRECONDITION_FAILED,
+            detail=detail,
+            stage="invoke",
+            operation=operation,
+            resource=resource,
+        )
+    if isinstance(exc, FileExistsError):
+        return CapabilityFailure(
+            code=CapabilityFailureCode.ALREADY_EXISTS,
+            detail=detail,
+            stage="invoke",
+            operation=operation,
+            resource=resource,
+        )
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return CapabilityFailure(
+            code=CapabilityFailureCode.DEPENDENCY_UNAVAILABLE,
+            detail=detail,
+            stage="invoke",
+            operation=operation,
+            resource=resource,
+            retryable=True,
+        )
+    if isinstance(exc, (AttributeError, TypeError, ValueError, KeyError, AssertionError)):
+        return CapabilityFailure(
+            code=CapabilityFailureCode.INVALID_INPUT,
+            detail=detail,
+            stage="invoke",
+            operation=operation,
+            resource=resource,
+        )
+    return CapabilityFailure(
+        code=CapabilityFailureCode.TRANSIENT_RUNTIME,
+        detail=detail,
+        stage="invoke",
+        operation=operation,
+        resource=resource,
+        retryable=True,
+    )
+
 
 class CapabilityExecutor(Protocol):
     descriptor: CapabilityDescriptor
@@ -531,6 +779,19 @@ class CapabilityExecutor(Protocol):
         output_accumulator: CapabilityOutputSink | None = None,
         context: InvocationContext | None = None,
     ) -> CapabilityResult: ...
+
+
+class CapabilityInventory(Protocol):
+    """Minimal global inventory surface needed by overlay consumers."""
+
+    @property
+    def generation(self) -> int: ...
+
+    def executor_for(self, capability_id: str) -> CapabilityExecutor: ...
+
+    def iter_executors(self) -> tuple[CapabilityExecutor, ...]: ...
+
+    def list_descriptors(self) -> list[CapabilityDescriptor]: ...
 
 
 class CapabilityOutputSink(Protocol):
@@ -588,9 +849,11 @@ def _canonical_identity_value(field: str, value: Any) -> Any:
 __all__ = [
     "Availability",
     "CachePolicy",
+    "RetryPolicy",
     "Capability",
     "CapabilityDescriptor",
     "CapabilityExecutor",
+    "CapabilityInventory",
     "ExternalEffectContract",
     "ExternalEffectPhase",
     "ExternalEffectReceipt",
@@ -603,4 +866,7 @@ __all__ = [
     "EffectClass",
     "InvocationContext",
     "DispatchDirectives",
+    "CapabilityFailure",
+    "CapabilityFailureCode",
+    "HEALTH_FAILURE_CODES",
 ]

@@ -434,7 +434,7 @@ async def test_transactional_candidate_is_compensated_when_verification_fails(tm
         request,
         workspace=ws,
         profile="autonomous",
-        _directives=DispatchDirectives(reality_tier="transactional"),
+        directives=DispatchDirectives(reality_tier="transactional"),
     )
     assert result.status.value == "ok"
 
@@ -514,3 +514,190 @@ def test_self_host_forces_candidate_boundary_even_for_direct_request():
             ),
             "session-self",
         )
+
+
+async def test_complex_coding_without_derivable_proof_fails_closed(tmp_path):
+    """Complex coding cannot synthesize proof from an empty criteria plan."""
+    project = _project(tmp_path)
+    ws = _workspace(project)
+    gate, engine, dispatcher = _gate_engine(tmp_path)
+    coordinator = _coordinator(gate, engine, dispatcher)
+
+    await gate.route(
+        __import__(
+            "athena.protocol.capabilities", fromlist=["CapabilityRequest"]
+        ).CapabilityRequest(
+            capability_id="fs",
+            arguments={"operation": "write", "path": "candidate.py", "content": "x = 1\n"},
+            task_id="task-complex-proof",
+            call_id="complex-write",
+        ),
+        ws,
+        {EffectClass.WRITE_LOCAL},
+        FilesystemCapability().descriptor,
+    )
+    branch = gate.active_branch("task-complex-proof")
+    assert branch is not None
+    (Path(branch.shadow_workspace.root) / "candidate.py").write_text("x = 1\n", encoding="utf-8")
+    task = replace(
+        _spec(ws),
+        id="task-complex-proof",
+        metadata={"autonomy": "autonomous", "_athena_work_class": "complex_coding"},
+    )
+    decision = TerminationDecision(
+        terminal=True,
+        status=TaskStatus.COMPLETE,
+        reason="model says the refactor is done",
+    )
+    result = await coordinator.prepare_completion(task, decision)
+
+    assert result.committed is False
+    assert result.decision.status is TaskStatus.PARTIAL
+    assert "verification_unavailable" in result.decision.reason
+    assert (project / "candidate.py").exists() is False
+
+
+async def test_strong_plan_requires_all_selected_evidence_classes(tmp_path):
+    """A strong plan does not certify when only one category passes."""
+    project = _project(tmp_path)
+    ws = _workspace(project)
+    gate, engine, dispatcher = _gate_engine(tmp_path)
+
+    class _OnePassingVerifier:
+        async def verify_against(self, task, criteria, workspace):
+            # The planner selected a test and a lint command; only the first
+            # test probe actually passes.
+            return [True, False]
+
+    coordinator = RealityCoordinator(
+        shadow_engine=engine,
+        reality_gate=gate,
+        candidate_verifier=_OnePassingVerifier(),
+        default_criteria_source=lambda _task: {
+            "commands": {"test": ["pytest"], "lint": ["ruff check"]}
+        },
+    )
+
+    await gate.route(
+        __import__(
+            "athena.protocol.capabilities", fromlist=["CapabilityRequest"]
+        ).CapabilityRequest(
+            capability_id="fs",
+            arguments={"operation": "write", "path": "app.py", "content": "x = 1\n"},
+            task_id="task-strong-proof",
+            call_id="strong-write",
+        ),
+        ws,
+        {EffectClass.WRITE_LOCAL},
+        FilesystemCapability().descriptor,
+    )
+    branch = gate.active_branch("task-strong-proof")
+    assert branch is not None
+    (Path(branch.shadow_workspace.root) / "app.py").write_text("x = 1\n", encoding="utf-8")
+
+    task = replace(
+        _spec(ws),
+        id="task-strong-proof",
+        metadata={"autonomy": "autonomous"},
+    )
+    # Force changed resources so the planner marks the plan strong.
+    from dataclasses import replace as dc_replace
+
+    task = dc_replace(task, metadata={**task.metadata, "changed_resources": ("app.py",)})
+    results = await coordinator._verify_or_fail(  # noqa: SLF001
+        task,
+        await coordinator._criteria_for(  # noqa: SLF001
+            task,
+            workspace=branch.shadow_workspace,
+            changed_resources=("app.py", "pyproject.toml"),
+            impact={"build": True, "index_revision": "idx-1"},
+        ),
+        branch.shadow_workspace,
+    )
+
+    strength_failures = {
+        "required_strength_unsatisfied",
+        "verification_strength_unavailable",
+    }
+    assert any(item.get("id") in strength_failures for item in results)
+    assert not all(item.get("passed") for item in results)
+
+
+async def test_complex_explicit_criteria_without_baseline_fail_closed(tmp_path):
+    """Complex coding with explicit criteria but no project baseline must
+    refuse to certify. Explicit criteria strengthen proof, never substitute."""
+    project = _project(tmp_path)
+    ws = _workspace(project)
+    gate, engine, dispatcher = _gate_engine(tmp_path)
+    coordinator = _coordinator(gate, engine, dispatcher)
+    verifier_calls = []
+
+    class TrackingVerifier:
+        async def verify(self, task, criteria):
+            verifier_calls.append([c.id for c in criteria])
+            return [True] * len(criteria)
+
+    from athena.reality import ShadowCandidateVerifier
+
+    coordinator._candidate_verification._candidate_verifier = ShadowCandidateVerifier(
+        TrackingVerifier()
+    )
+    task = replace(
+        _spec(ws),
+        id="task-explicit-only",
+        metadata={"autonomy": "autonomous", "_athena_work_class": "complex_coding"},
+        acceptance_criteria=(
+            Criterion(
+                id="file-exists",
+                description="output file exists",
+                verification=VerificationSpec(
+                    type=VerificationType.FILE,
+                    path="output.txt",
+                ),
+            ),
+        ),
+    )
+    plan = await coordinator._candidate_verification.proof_plan(task, workspace=task.workspace)
+    assert plan.criteria == ()
+    assert plan.planning_errors
+    # Verifier was never called because proof was refused at planning.
+    assert verifier_calls == []
+
+
+async def test_verification_strength_result_is_recorded(tmp_path):
+    """Requested vs achieved strength is a structured result on the service."""
+    from athena.reality.candidate_verification import CandidateVerificationService
+
+    class Verifier:
+        async def verify_against(self, task, criteria, workspace):
+            return [{"id": c.id, "passed": True} for c in criteria]
+
+    svc = CandidateVerificationService(candidate_verifier=Verifier())
+    task_id = "t-strength"
+    svc._plans[task_id] = {
+        "required_strength": "strong",
+        "criterion_categories": {
+            "project_default:1": "test",
+            "project_default:2": "lint",
+        },
+    }
+    criteria = (
+        Criterion(
+            id="project_default:1",
+            description="test probe",
+            verification=VerificationSpec(type=VerificationType.COMMAND, command="true"),
+        ),
+        Criterion(
+            id="project_default:2",
+            description="lint probe",
+            verification=VerificationSpec(type=VerificationType.COMMAND, command="true"),
+        ),
+    )
+    task = replace(_spec(_workspace(tmp_path)), id=task_id)
+    results = await svc.verify_or_fail(task, criteria, task.workspace)
+    assert all(r["passed"] for r in results)
+    strength = svc.strength_for(task_id)
+    assert strength["requested_strength"] == "strong"
+    assert strength["achieved_strength"] == "strong"
+    assert set(strength["passed_categories"]) == {"test", "lint"}
+    assert strength["unavailable_categories"] == []

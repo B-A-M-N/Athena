@@ -311,7 +311,7 @@ def test_generated_host_call_inherits_parent_effect_ceiling():
         dispatcher.dispatch(
             request,
             workspace=_WS,
-            _directives=DispatchDirectives(inherited_effects=frozenset({EffectClass.READ_LOCAL})),
+            directives=DispatchDirectives(inherited_effects=frozenset({EffectClass.READ_LOCAL})),
         )
     )
     # The operation resolves to READ_LOCAL only, inside the inherited
@@ -481,8 +481,11 @@ def test_legacy_single_effect_grant_is_a_one_element_envelope():
 def _spec_for(prompt: str, **kwargs):
     from athena.protocol.tasks import AgentRequest
     from athena.service import service as svc
+    from athena.service.task_intake import TaskIntake
 
     service = svc.AthenaService.__new__(svc.AthenaService)
+    service._task_intake = TaskIntake(service)
+    service.config = svc.AthenaConfig()
     service._default_workspace = WorkspaceSpec(id="w", root="/tmp/ws")
     request = AgentRequest(prompt=prompt, **kwargs)
     return service._build_task_spec(request, "session-invariant")

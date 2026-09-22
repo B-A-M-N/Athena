@@ -1,40 +1,71 @@
-"""Operator projection mechanism for the service façade (P1-10).
-
-Stable read/projection views over canonical durable state, moved verbatim
-from ``athena.service.service``. This is a subordinate mechanism, not a
-second authority: policy, stores, the compiler, artifacts, and capability
-dispatch all resolve through the owning :class:`AthenaService` instance
-(``self._svc``). These views never mutate state and never become a second
-execution path; the CLI renders them verbatim.
-"""
+"""Read-only operator projections over canonical durable state."""
 
 from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from athena.protocol.events import make_event
 from athena.protocol.ids import new_id
 from athena.protocol.memory import MemoryScope
+
+if TYPE_CHECKING:
+    from athena.service.service import AthenaService
 
 __all__ = ["OperatorQueryService"]
 
 _logger = logging.getLogger("athena.service")
 
 
+class OperatorQueryPorts:
+    """Allowlisted read-model resources and event-factory operations."""
+
+    _RESOURCE_NAMES = {
+        "memory": "_memory",
+        "store_mutations": "_store_mutations",
+        "store_messages": "_store_messages",
+        "store_approvals": "_store_approvals",
+        "dispatcher": "_dispatcher",
+        "default_workspace": "_default_workspace",
+        "compiler": "_compiler",
+        "artifacts": "_artifacts",
+        "workflow_store": "_workflow_store",
+        "policy": "_policy",
+        "skill_lifecycle": "_skill_lifecycle",
+        "config": "config",
+    }
+    _APPLICATION_OPERATIONS = {
+        "forward_events": "_forward_events",
+        "require_events": "_require_events",
+        "_forward_events": "_forward_events",
+        "_require_events": "_require_events",
+    }
+
+    def __init__(self, owner: "AthenaService") -> None:
+        self._owner = owner
+
+    def __getattr__(self, name: str) -> Any:
+        resource_name = self._RESOURCE_NAMES.get(name)
+        if resource_name is None:
+            resource_name = self._APPLICATION_OPERATIONS.get(name)
+        if resource_name is None:
+            raise AttributeError(f"operator query port is not allowed: {name}")
+        return getattr(self._owner, resource_name, None)
+
+
 class OperatorQueryService:
     """Operator projections (permissions, diff, artifacts, generated caps)."""
 
-    def __init__(self, service: Any) -> None:
-        self._svc = service
+    def __init__(self, service: Any, *, ports: OperatorQueryPorts | None = None) -> None:
+        self._ports = ports or OperatorQueryPorts(service)
 
     async def operator_permissions(self) -> dict:
         """Active policy grants plus pending approval requests."""
         grants: list[dict] = []
-        if self._svc._policy is not None:
+        if self._ports.policy is not None:
             try:
-                for g in self._svc._policy.approvals.list_active():
+                for g in self._ports.policy.approvals.list_active():
                     grants.append(
                         {
                             "approval_id": g.id,
@@ -49,9 +80,9 @@ class OperatorQueryService:
             except Exception as exc:
                 _logger.warning("list_active grants failed: %s", exc)
         pending: list[dict] = []
-        if self._svc._store_approvals is not None:
+        if self._ports.store_approvals is not None:
             try:
-                for rec in await self._svc._store_approvals.list_pending():
+                for rec in await self._ports.store_approvals.list_pending():
                     pending.append(
                         {
                             "approval_id": rec.get("id"),
@@ -66,10 +97,10 @@ class OperatorQueryService:
 
     async def operator_diff(self, *, limit: int = 25) -> list[dict]:
         """Recent file mutations from the write-ahead mutation ledger."""
-        if self._svc._store_mutations is None:
+        if self._ports.store_mutations is None:
             return []
         try:
-            rows = await self._svc._store_mutations.list_recent(limit=limit)
+            rows = await self._ports.store_mutations.list_recent(limit=limit)
         except Exception as exc:
             _logger.warning("mutation listing failed: %s", exc)
             return []
@@ -91,18 +122,18 @@ class OperatorQueryService:
 
     async def undo_mutation(self, mutation_id: str) -> dict:
         """Roll back one completed mutation through the RollbackExecutor."""
-        if self._svc._store_mutations is None:
+        if self._ports.store_mutations is None:
             return {"status": "error", "error": "mutation store unavailable"}
         from athena.state.rollback import RollbackExecutor
 
-        executor = RollbackExecutor(self._svc._store_mutations, self._svc._artifacts)
+        executor = RollbackExecutor(self._ports.store_mutations, self._ports.artifacts)
         try:
             outcome = await executor.execute_inverse(mutation_id)
         except Exception as exc:
             return {"status": "error", "error": str(exc)}
         # Emit an event so the surface and audit trail see the rollback.
         try:
-            sink = self._svc._forward_events(self._svc._require_events())
+            sink = self._ports.forward_events(self._ports.require_events())
             await sink(
                 make_event(
                     "MutationRolledBack",
@@ -120,18 +151,18 @@ class OperatorQueryService:
     async def operator_context_summary(self, session_id: str | None = None) -> dict:
         """What the model would actually see next turn (bounded-context view)."""
         info: dict = {"session_id": session_id}
-        if session_id and self._svc._store_messages is not None:
+        if session_id and self._ports.store_messages is not None:
             try:
-                info["message_count"] = await self._svc._store_messages.count_session_messages(
+                info["message_count"] = await self._ports.store_messages.count_session_messages(
                     session_id
                 )
             except Exception as exc:
                 _logger.warning("session message count failed: %s", exc)
-        if self._svc._compiler is not None:
+        if self._ports.compiler is not None:
             try:
-                window = getattr(self._svc._compiler, "context_window", None)
-                reserve = getattr(self._svc._compiler, "reserve_output", None)
-                recent = getattr(self._svc._compiler, "recent_verbatim_turns", None)
+                window = getattr(self._ports.compiler, "context_window", None)
+                reserve = getattr(self._ports.compiler, "reserve_output", None)
+                recent = getattr(self._ports.compiler, "recent_verbatim_turns", None)
                 info["window"] = int(window) if window else None
                 info["reserve_output"] = int(reserve) if reserve else None
                 info["recent_verbatim_turns"] = int(recent) if recent else None
@@ -141,10 +172,10 @@ class OperatorQueryService:
 
     async def operator_artifacts(self, *, limit: int = 50) -> list[dict]:
         """Artifact index across all tasks (evidence view)."""
-        if self._svc._artifacts is None:
+        if self._ports.artifacts is None:
             return []
         try:
-            refs = await self._svc._artifacts.list(limit=limit)
+            refs = await self._ports.artifacts.list(limit=limit)
         except Exception as exc:
             _logger.warning("artifact listing failed: %s", exc)
             return []
@@ -164,14 +195,14 @@ class OperatorQueryService:
 
     async def operator_generated_capabilities(self, task_id: str | None = None) -> list[dict]:
         """Review candidates for one task through the canonical synthesis API."""
-        result = await self._invoke_synthesis({"operation": "candidates"}, task_id=task_id)
+        result = await self.invoke_synthesis({"operation": "candidates"}, task_id=task_id)
         return result["value"]
 
     async def operator_memory_candidates(self, *, limit: int = 100) -> list[dict]:
         """Project pending memory lessons into the shared review surface."""
-        if self._svc._memory is None:
+        if self._ports.memory is None:
             return []
-        records = await self._svc._memory.list_pending_candidates(limit=limit)
+        records = await self._ports.memory.list_pending_candidates(limit=limit)
         return [_memory_candidate_view(record) for record in records]
 
     async def operator_candidates(self, task_id: str | None = None) -> list[dict[str, Any]]:
@@ -185,19 +216,19 @@ class OperatorQueryService:
         rows: list[dict[str, Any]] = []
         rows.extend(await self.operator_memory_candidates())
 
-        skills = getattr(self._svc, "_skill_lifecycle", None)
+        skills = self._ports.skill_lifecycle
         if skills is not None:
             list_candidates = getattr(skills, "list_candidates", None)
             if callable(list_candidates):
                 rows.extend(await list_candidates())
 
-        workflows = getattr(self._svc, "_workflow_store", None)
+        workflows = self._ports.workflow_store
         if workflows is not None and task_id:
             try:
                 for workflow in await workflows.list(
                     task_id=task_id,
-                    project_id=getattr(self._svc._default_workspace, "id", None),
-                    user_id=self._svc.config.cache_namespace,
+                    project_id=getattr(self._ports.default_workspace, "id", None),
+                    user_id=self._ports.config.cache_namespace,
                 ):
                     if getattr(getattr(workflow, "scope", None), "value", None) != "candidate":
                         continue
@@ -270,7 +301,7 @@ class OperatorQueryService:
                 candidate_id, target_scope, item.get("scope_id")
             )
         if kind == "skill":
-            lifecycle = getattr(self._svc, "_skill_lifecycle", None)
+            lifecycle = self._ports.skill_lifecycle
             promote = getattr(lifecycle, "promote_candidate", None)
             if not callable(promote):
                 return {"status": "error", "error": "skill candidate lifecycle unavailable"}
@@ -291,7 +322,7 @@ class OperatorQueryService:
     async def _promote_workflow_candidate(
         self, workflow_id: str, scope: str, *, task_id: str | None
     ) -> dict[str, Any]:
-        if not task_id or self._svc._dispatcher is None:
+        if not task_id or self._ports.dispatcher is None:
             return {"status": "error", "error": "workflow promotion requires a current task"}
         from athena.protocol.capabilities import (
             CapabilityRequest,
@@ -300,7 +331,7 @@ class OperatorQueryService:
             CapabilityResultStatus,
         )
 
-        result = await self._svc._dispatcher.dispatch(
+        result = await self._ports.dispatcher.dispatch(
             CapabilityRequest(
                 capability_id="workflow",
                 arguments={"operation": "promote", "workflow_id": workflow_id, "scope": scope},
@@ -308,8 +339,8 @@ class OperatorQueryService:
                 call_id=new_id("operator-workflow"),
                 origin=CapabilityRequestOrigin.USER_DIRECT,
             ),
-            workspace=self._svc._default_workspace,
-            profile=self._svc.config.autonomy_level,
+            workspace=self._ports.default_workspace,
+            profile=self._ports.config.autonomy_level,
         )
         if not isinstance(result, CapabilityResult):
             return {"status": "error", "error": "workflow promotion requires approval"}
@@ -333,24 +364,24 @@ class OperatorQueryService:
             return {"status": "error", "error": "candidate not found or not visible"}
         kind = str(item.get("type") or "")
         if kind == "memory":
-            ok = await self._svc._memory.discard_pending_candidate(candidate_id)
+            ok = await self._ports.memory.discard_pending_candidate(candidate_id)
         elif kind == "skill":
-            lifecycle = getattr(self._svc, "_skill_lifecycle", None)
+            lifecycle = self._ports.skill_lifecycle
             discard = getattr(lifecycle, "discard_candidate", None)
             ok = bool(await discard(candidate_id)) if callable(discard) else False
         elif kind == "workflow":
-            workflow = await self._svc._workflow_store.get(
+            workflow = await self._ports.workflow_store.get(
                 candidate_id,
                 task_id=task_id,
-                project_id=getattr(self._svc._default_workspace, "id", None),
-                user_id=self._svc.config.cache_namespace,
+                project_id=getattr(self._ports.default_workspace, "id", None),
+                user_id=self._ports.config.cache_namespace,
             )
             if workflow is None:
                 ok = False
             else:
                 from dataclasses import replace
 
-                await self._svc._workflow_store.save(
+                await self._ports.workflow_store.save(
                     replace(workflow, enabled=False, lifecycle_state="DEPRECATED")
                 )
                 ok = True
@@ -367,9 +398,9 @@ class OperatorQueryService:
 
     async def operator_memory_candidate(self, memory_id: str) -> dict | None:
         """Inspect one memory candidate without changing its lifecycle."""
-        if self._svc._memory is None:
+        if self._ports.memory is None:
             return None
-        record = await self._svc._memory.get(memory_id)
+        record = await self._ports.memory.get(memory_id)
         if record is None or (record.metadata or {}).get("pending_promotion") is not True:
             return None
         return _memory_candidate_view(record)
@@ -378,7 +409,7 @@ class OperatorQueryService:
         self, memory_id: str, scope: str, scope_id: str | None = None
     ) -> dict:
         """Promote only through the durable memory candidate gate."""
-        if self._svc._memory is None:
+        if self._ports.memory is None:
             return {"status": "error", "error": "memory store unavailable"}
         try:
             target_scope = MemoryScope(scope.strip().lower())
@@ -386,7 +417,7 @@ class OperatorQueryService:
             return {"status": "error", "error": f"unknown memory scope: {scope}"}
         if target_scope is MemoryScope.TASK:
             return {"status": "error", "error": "task scope requires a task-local operator flow"}
-        record = await self._svc._memory.promote_pending_candidate(
+        record = await self._ports.memory.promote_pending_candidate(
             memory_id,
             scope=target_scope,
             scope_id=scope_id,
@@ -397,9 +428,9 @@ class OperatorQueryService:
 
     async def operator_discard_memory_candidate(self, memory_id: str) -> dict:
         """Discard one pending memory lesson through the durable store."""
-        if self._svc._memory is None:
+        if self._ports.memory is None:
             return {"status": "error", "error": "memory store unavailable"}
-        discarded = await self._svc._memory.discard_pending_candidate(memory_id)
+        discarded = await self._ports.memory.discard_pending_candidate(memory_id)
         return {
             "status": "discarded" if discarded else "error",
             **({} if discarded else {"error": "memory candidate not found or already reviewed"}),
@@ -409,7 +440,7 @@ class OperatorQueryService:
         self, capability_id: str, task_id: str | None = None
     ) -> dict:
         """Inspect one generated capability through the canonical synthesis API."""
-        result = await self._invoke_synthesis(
+        result = await self.invoke_synthesis(
             {"operation": "inspect", "capability_id": capability_id}, task_id=task_id
         )
         return result["value"]
@@ -418,7 +449,7 @@ class OperatorQueryService:
         self, capability_id: str, scope: str, task_id: str | None = None
     ) -> dict:
         """Promote a generated capability through policy and synthesis."""
-        return await self._invoke_synthesis(
+        return await self.invoke_synthesis(
             {"operation": "promote", "capability_id": capability_id, "scope": scope},
             task_id=task_id,
         )
@@ -427,11 +458,11 @@ class OperatorQueryService:
         self, capability_id: str, task_id: str | None = None
     ) -> dict:
         """Retire a generated capability through policy and synthesis."""
-        return await self._invoke_synthesis(
+        return await self.invoke_synthesis(
             {"operation": "deprecate", "capability_id": capability_id}, task_id=task_id
         )
 
-    async def _invoke_synthesis(self, arguments: dict, *, task_id: str | None) -> dict:
+    async def invoke_synthesis(self, arguments: dict, *, task_id: str | None) -> dict:
         from athena.protocol.capabilities import (
             CapabilityRequest,
             CapabilityRequestOrigin,
@@ -439,9 +470,9 @@ class OperatorQueryService:
             CapabilityResultStatus,
         )
 
-        if self._svc._dispatcher is None:
+        if self._ports.dispatcher is None:
             raise RuntimeError("AthenaService not started")
-        result = await self._svc._dispatcher.dispatch(
+        result = await self._ports.dispatcher.dispatch(
             CapabilityRequest(
                 capability_id="synthesis",
                 arguments=arguments,
@@ -449,8 +480,8 @@ class OperatorQueryService:
                 call_id=new_id("operator-synthesis"),
                 origin=CapabilityRequestOrigin.USER_DIRECT,
             ),
-            workspace=self._svc._default_workspace,
-            profile=self._svc.config.autonomy_level,
+            workspace=self._ports.default_workspace,
+            profile=self._ports.config.autonomy_level,
         )
         if not isinstance(result, CapabilityResult):
             raise RuntimeError("generated capability operation requires approval")

@@ -17,17 +17,19 @@ from typing import TYPE_CHECKING
 from athena.affordances.models import AffordanceScope, GeneratedCapability
 from athena.affordances.validation import ValidationTier
 from athena.protocol.ids import new_id
+from athena.schema import compile_validator
 
 if TYPE_CHECKING:
-    from athena.synthesis.engine import SyntheticCapability
+    from athena.synthesis.models import SyntheticCapability
     from athena.synthesis.engine import SynthesisEngine
 
 
-def _mod():
-    # Patch seams / engine-module helpers resolve through the engine module.
-    from athena.synthesis import engine
-
-    return engine
+from athena.synthesis.helpers import (
+    _GENERATED_EFFECTIVE_AUTHORITY,
+    _candidate_ready,
+    _input_signature,
+    _promotion_proof_error,
+)
 
 
 _logger = logging.getLogger(__name__)
@@ -86,8 +88,6 @@ class Promotion:
             raise ValueError(f"unsupported generated runtime: {generated.runtime}")
         if generated.validation_state not in {"VALIDATED", "PROMOTED"}:
             raise ValueError("generated capability is not validated")
-        from athena.capabilities.registry import _compile_validator
-
         tier = (
             ValidationTier.PROJECT
             if generated.scope is AffordanceScope.PROJECT
@@ -113,14 +113,14 @@ class Promotion:
         if source_validation.code != generated.implementation:
             raise ValueError("persisted generated capability is not in canonical source format")
         persisted_authority = frozenset(generated.effective_authority)
-        if not persisted_authority.issubset(_mod()._GENERATED_EFFECTIVE_AUTHORITY):
+        if not persisted_authority.issubset(_GENERATED_EFFECTIVE_AUTHORITY):
             raise ValueError(
                 "persisted generated capability requests authority outside "
                 "the generated sandbox profile"
             )
-        _compile_validator(generated.input_schema)
+        compile_validator(generated.input_schema)
         if generated.output_schema is not None:
-            _compile_validator(generated.output_schema)
+            compile_validator(generated.output_schema)
         if generated.required_dependencies and workspace_root:
             self._e._dependency_paths(
                 generated.required_dependencies,
@@ -133,7 +133,9 @@ class Promotion:
             )
         proof = dict(generated.proof_record)
         usage = dict(proof.pop("usage", {}))
-        cap = _mod().SyntheticCapability(
+        from athena.synthesis.models import SyntheticCapability
+
+        cap = SyntheticCapability(
             id=generated.id,
             name=generated.name,
             description=generated.description,
@@ -166,7 +168,7 @@ class Promotion:
             # Stored metadata is checked above but is never the source of
             # runtime authority. Rehydration derives the envelope from the
             # current Athena profile so old records cannot widen execution.
-            effective_effects=_mod()._GENERATED_EFFECTIVE_AUTHORITY,
+            effective_effects=_GENERATED_EFFECTIVE_AUTHORITY,
             lifecycle_state=generated.lifecycle_state,
             family_id=generated.family_id,
             revision=generated.revision,
@@ -210,7 +212,7 @@ class Promotion:
                 cap_id,
             )
             return False
-        proof_error = _mod()._promotion_proof_error(cap, promotion_tier)
+        proof_error = _promotion_proof_error(cap, promotion_tier)
         if proof_error is not None:
             _logger.warning("refusing promotion of %s: %s", cap_id, proof_error)
             return False
@@ -318,7 +320,7 @@ class Promotion:
         # Repetition with the same arguments is not evidence that a helper is
         # reusable. Require successful behavioral diversity before turning
         # executable proof into a durable knowledge candidate.
-        if cap is None or not _mod()._candidate_ready(cap):
+        if cap is None or not _candidate_ready(cap):
             return None
         cap.lifecycle_state = "CANDIDATE"
         from athena.skills.candidates import SkillCandidate
@@ -417,7 +419,7 @@ class Promotion:
                 # probe is unavailable; the fallback is deliberately limited
                 # to execution policy identity, never caller metadata.
                 pass
-        return _mod()._input_signature(
+        return _input_signature(
             {
                 "workspace": getattr(workspace, "id", None),
                 "backend": getattr(workspace, "execution_backend", None),

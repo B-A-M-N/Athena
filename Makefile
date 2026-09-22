@@ -1,4 +1,4 @@
-.PHONY: format format-check lint typecheck compile test check scenarios arch-lint native-check native-test native-smoke native-package release-check
+.PHONY: format format-check static-critical lint typecheck compile test full-test check critical-contracts perf performance scenarios arch-lint native-build native-check native-test native-fmt native-clippy native-smoke native-package release-check
 
 UV ?= uv
 UV_RUN_DEV := $(UV) run --extra dev
@@ -12,6 +12,9 @@ format:
 
 format-check:
 	$(RUFF) format --check src tests
+
+static-critical:
+	scripts/static-critical
 
 lint:
 	$(RUFF) check src tests
@@ -40,11 +43,20 @@ scenarios:
 arch-lint:
 	$(PYTHON) scripts/architecture-lint
 
+native-build:
+	cargo build --manifest-path native/Cargo.toml --locked --offline
+
 native-check:
-	cargo check --manifest-path native/Cargo.toml --offline
+	cargo check --manifest-path native/Cargo.toml --locked --offline
+
+native-fmt:
+	cargo fmt --manifest-path native/Cargo.toml -- --check
+
+native-clippy:
+	cargo clippy --manifest-path native/Cargo.toml --all-targets --locked --offline -- -D warnings
 
 native-test:
-	cargo test --manifest-path native/Cargo.toml --offline
+	cargo test --manifest-path native/Cargo.toml --locked --offline
 
 native-package:
 	scripts/build-native-package
@@ -67,6 +79,30 @@ release-check:
 # Appended (P1.29/P1.30/P1.32): the scenario manifest and the architecture
 # lint are part of the gate.  The kernel router-fallback defect that once
 # made arch-lint run red is fixed; the lint is part of the GREEN gate.
+# Critical correctness contracts (P1.29): invariants protecting state
+# transactions, event idempotency, dispatcher controls/provenance, task
+# failure/finalization, and projection conformance.  Run on every PR.
+critical-contracts:
+	$(PYTEST) -q \
+		tests/unit/state/test_database.py \
+		tests/unit/state/test_task_metadata.py \
+		tests/unit/state/test_task_lease.py \
+		tests/unit/state/test_event_sequencing.py \
+		tests/unit/capabilities/test_dispatch_provenance_scoped.py \
+		tests/unit/capabilities/test_dispatcher_operation_contracts.py \
+		tests/unit/capabilities/test_dispatch_many_preflight.py \
+		tests/unit/tasks/test_failure_propagation.py \
+		tests/unit/cli/test_projection_conformance.py \
+		tests/unit/synthesis/test_generated_discipline.py
+
+# Performance lane: deterministic SLO counters (model-call counts, query
+# counts, data-structure cardinality).  No wall-clock assertions.
+performance:
+	$(PYTEST) -q tests/performance/
+
+full-test: format-check static-critical lint typecheck compile native-fmt native-clippy
+	$(PYTEST) -q
+
 check: lint typecheck compile
 	$(PYTEST) -q \
 		tests/unit/affordances/test_validation.py \
@@ -76,5 +112,5 @@ check: lint typecheck compile
 		tests/unit/models/test_openai_compat.py \
 		tests/unit/models/test_anthropic.py \
 		tests/unit/capabilities/test_dispatch_many_preflight.py
-	$(PYTHON) scripts/scenarios --output scenarios-manifest.json
+	$(PYTHON) scripts/scenarios --output /tmp/athena-check-scenarios.json
 	$(PYTHON) scripts/architecture-lint

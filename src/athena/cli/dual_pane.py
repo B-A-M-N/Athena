@@ -19,25 +19,27 @@ from __future__ import annotations
 import os
 import shutil
 import time
-import textwrap
 from collections import deque
 from typing import Any, Mapping
 
 from athena.cli.animation import AnimationClock, OIAnimator
-from athena.cli.activity import VisualActionKind, classify_event
+from athena.cli.event_projection import DualPaneEventProjection
+from athena.cli.chassis_composition import DualPaneChassisComposer
+from athena.cli.glass_presentation import GlassPresentation
+from athena.presentation.ansi import CellGridDiffRenderer
+from athena.presentation.layout import compute_layout
+from athena.presentation.projection import OperationNode, ProjectionState
+from athena.presentation.scene import build_oi_scene
+from athena.presentation.semantics import VisualActionKind, classify_event
+from athena.cli.frame_composition import DualPaneFrameComposer
 from athena.cli.framebuffer import OIFrameBuffer, pillow_available
+from athena.cli.dual_pane_lifecycle import DualPaneLifecycle
 from athena.cli.input import PromptController
-from athena.cli.layout import compute_layout
-from athena.cli.projection import OperationNode, ProjectionState
-from athena.cli.render.ansi import CellGridDiffRenderer, fit_cells
-from athena.cli.render.scene import render_scene_lines
 from athena.cli.render.kitty import (
-    KittyAsset,
     KittyCapabilityProbe,
     KittyGraphicsProtocol,
     select_renderer,
 )
-from athena.cli.scene import build_oi_scene
 from athena.cli.surface import OperatorSurface
 from athena.cli.terminal import TerminalSession, sanitize_terminal_text
 
@@ -780,23 +782,43 @@ class DualPaneSurface(OperatorSurface):
         self.dual = self.layout.mode.value != "plain"
         self._full_screen = self._supports_full_screen()
         self.projection = ProjectionState()
+        self._frame_composer = DualPaneFrameComposer(self.projection, self.window.snapshot)
+        self._chassis_composer = DualPaneChassisComposer()
+        self._event_projection = DualPaneEventProjection(
+            self.projection,
+            self.mascot,
+            self.window,
+        )
         self.scene = build_oi_scene(
             self.projection, self.layout.oi, character=self.mascot.character
         )
         self.animator = OIAnimator(reduced_motion=reduced_motion)
-        self.animation_clock = AnimationClock(
-            self._animation_tick,
-            enabled=animations,
-            reduced_motion=reduced_motion,
-        )
         self.frame_renderer = CellGridDiffRenderer(self.output)
         self.terminal_session = TerminalSession(self.output, enabled=self._full_screen)
         self.oi_framebuffer = OIFrameBuffer()
         self.kitty = KittyGraphicsProtocol()
-        self._glass_frame_id = 40
-        self._glass_overlay_id = 41
-        self._glass_motion_id = 42
-        self._glass_base_key: tuple[Any, ...] | None = None
+        self.glass_presentation = GlassPresentation(
+            self.output,
+            self.oi_framebuffer,
+            self.kitty,
+        )
+        self._lifecycle = DualPaneLifecycle(
+            output=self.output,
+            terminal_session=self.terminal_session,
+            glass_presentation=self.glass_presentation,
+            animator=self.animator,
+            mascot=self.mascot,
+            full_screen=lambda: self._full_screen,
+            display=lambda: self.display,
+            prepare_display=self._prepare_display,
+            repaint=self.repaint_oi,
+        )
+        self.animation_clock = AnimationClock(
+            self._lifecycle.tick,
+            enabled=animations,
+            reduced_motion=reduced_motion,
+        )
+        self._lifecycle.bind_animation_clock(self.animation_clock)
         self._prompt_text = ""
         self.prompt = PromptController(
             input_fn=self._input_fn if self._input_supplied else None,
@@ -860,46 +882,26 @@ class DualPaneSurface(OperatorSurface):
 
     def open(self) -> None:
         """Enter the composed terminal surface once for the REPL lifetime."""
-        if self._full_screen:
-            self.terminal_session.open()
-            if self.display_requested in {"auto", "glass"} and not self._kitty_confirmed:
-                self._kitty_confirmed = KittyCapabilityProbe.probe(self.output, self.prompt.stdin)
-                self.display = select_renderer(
-                    self.display_requested,
-                    capability_confirmed=self._kitty_confirmed and pillow_available(),
-                )
-            self.animation_clock.start()
-            self.repaint_oi(force=True)
+        self._lifecycle.open()
 
     def close(self) -> None:
         """Stop animation and restore the terminal, even after partial setup."""
-        self.animation_clock.stop()
-        self._close_terminal()
+        self._lifecycle.close()
 
     async def aclose(self) -> None:
         """Async teardown that waits for the animation task to exit."""
-        await self.animation_clock.stop_async()
-        self._close_terminal()
+        await self._lifecycle.aclose()
 
-    def _close_terminal(self) -> None:
-        cleanup = self.kitty.cleanup()
-        if cleanup and self.terminal_session.active:
-            self.output.write(cleanup)
-            self.output.flush()
-        self.terminal_session.close()
+    def _prepare_display(self) -> None:
+        if self.display_requested in {"auto", "glass"} and not self._kitty_confirmed:
+            self._kitty_confirmed = KittyCapabilityProbe.probe(self.output, self.prompt.stdin)
+            self.display = select_renderer(
+                self.display_requested,
+                capability_confirmed=self._kitty_confirmed and pillow_available(),
+            )
 
     def _animation_tick(self, dt: float) -> bool:
-        # ANSI/plain surfaces are event-driven cell projections; repainting
-        # them ten times per second only burns terminal bandwidth because the
-        # cell scene has no animated layer.  The retained pixel scene owns the
-        # animation clock when Glass is actually active.
-        if not self._full_screen or self.display != "glass":
-            return False
-        if not self.animator.tick(dt):
-            return False
-        self.mascot.advance(dt)
-        self.repaint_oi(force=False)
-        return True
+        return self._lifecycle.tick(dt)
 
     def read_prompt(self, prompt: str = "athena> ") -> str:
         value = self.prompt.read(prompt)
@@ -1065,275 +1067,42 @@ class DualPaneSurface(OperatorSurface):
     def _ingest_event(
         self, etype: str, payload: dict[str, Any], *, task_id: str | None = None
     ) -> None:
-        """Reduce canonical events once, then update presentation-only tails."""
-        self.projection.reduce(etype, payload, task_id=task_id)
-        self.mascot.observe(etype, payload)
-        if etype == "ExecutionStarted":
-            self.window.feed(f"$ {_terminal_text(payload.get('runtime') or 'runtime')}\n")
-        elif etype in {"StdoutChunk", "StderrChunk"}:
-            data = _terminal_text(payload.get("data"))
-            if data:
-                self.window.feed(("[err] " if etype == "StderrChunk" else "") + data)
+        self._event_projection.ingest(etype, payload, task_id=task_id)
 
     async def render_event(self, event: Any) -> None:
-        etype = str(getattr(event, "type", ""))
-        payload = dict(getattr(event, "payload", {}) or {})
-        self._ingest_event(etype, payload, task_id=getattr(event, "task_id", None))
+        async def parent_render(item: Any) -> None:
+            await super(DualPaneSurface, self).render_event(item)
 
-        # In a composed TTY, details mode means expandable thinking content,
-        # not raw token output.  Preserve the inherited buffer semantics.
-        old_details = self.details
-        if self._full_screen and etype == "ModelDelta" and old_details:
-            self.details = False
-        try:
-            await super().render_event(event)
-        finally:
-            self.details = old_details
-
-        if self._full_screen:
-            important = etype not in {"ModelDelta", "StdoutChunk", "StderrChunk"}
-            self.repaint_oi(force=important)
+        await self._event_projection.render_event(
+            event,
+            full_screen=self._full_screen,
+            details=self.details,
+            parent_render=parent_render,
+            set_details=lambda value: setattr(self, "details", value),
+            repaint=self.repaint_oi,
+        )
 
     async def choose_approval(self, event: Any) -> Any:
-        choice = await super().choose_approval(event)
-        if self._full_screen:
-            self.projection.acknowledge_approval(
-                granted=choice.granted,
-                scope=choice.scope,
-            )
-            self.repaint_oi(force=True)
-        return choice
+        async def parent_choose(item: Any) -> Any:
+            return await super(DualPaneSurface, self).choose_approval(item)
+
+        return await self._event_projection.choose_approval(
+            event,
+            full_screen=self._full_screen,
+            parent_choose=parent_choose,
+            repaint=self.repaint_oi,
+        )
 
     # -- frame composition ----------------------------------------------
     @staticmethod
     def _fit(text: Any, width: int) -> str:
-        width = max(int(width), 0)
-        text = _terminal_text(text).replace("\n", " ")
-        return fit_cells(text, width)
-
-    @classmethod
-    def _wrap(cls, text: str, width: int) -> list[str]:
-        width = max(width, 1)
-        text = _terminal_text(text)
-        result: list[str] = []
-        for raw in text.splitlines() or [""]:
-            if not raw:
-                result.append("")
-                continue
-            result.extend(
-                textwrap.wrap(
-                    raw,
-                    width=width,
-                    replace_whitespace=False,
-                    drop_whitespace=True,
-                    break_long_words=True,
-                    break_on_hyphens=False,
-                )
-                or [""]
-            )
-        return result or [""]
-
-    def _left_lines(self, height: int, width: int) -> list[str]:
-        lines = ["CHAT LOG", "─" * min(width, 18)]
-        for entry in self._chat:
-            label = "YOU" if entry["role"] == "user" else "ATHENA"
-            wrapped = self._wrap(entry["text"], max(width - 9, 1))
-            for index, text in enumerate(wrapped):
-                lines.append(f"{label:<7} {text}" if index == 0 else f"{'':7} {text}")
-            lines.append("")
-        if self._model_text:
-            lines.append("ATHENA  responding…")
-            for text in self._wrap(self._model_text, max(width - 9, 1)):
-                lines.append(f"{'':7} {text}")
-        elif self._thinking:
-            lines.append("ATHENA  thinking…")
-            if self.details:
-                lines.extend(
-                    [
-                        "         ┌ reasoning ─────────────────",
-                        "         │ provider reasoning is active",
-                        "         └───────────────────────────",
-                    ]
-                )
-            else:
-                lines.append("         (details hidden · /details to expand)")
-        stop = len(lines) - self._left_scroll if self._left_scroll else len(lines)
-        visible = lines[max(0, stop - height) : stop]
-        return [self._fit(line, width) for line in visible] + [
-            "" for _ in range(max(0, height - len(visible)))
-        ]
-
-    @staticmethod
-    def _glyph(state: str) -> str:
-        return {
-            "complete": "✓",
-            "success": "✓",
-            "failed": "!",
-            "failure": "!",
-            "approval": "?",
-            "running": "●",
-            "interrupted": "!",
-        }.get(state, "·")
-
-    def _operation_history_lines(self) -> list[str]:
-        """Return compact completed/parked operation rows.
-
-        The active operation is deliberately excluded.  This keeps the right
-        pane honest about what is running now while retaining a short answer
-        to "what just happened?" without replaying the event firehose.
-        """
-        rows = ["OPERATION HISTORY"]
-        history = [
-            operation
-            for operation in reversed(list(self._operations.values()))
-            if operation.id != self._active_operation_id
-        ][:4]
-        if not history:
-            rows.append("· no completed operations")
-            return rows
-        for operation in history:
-            line = f"{self._glyph(operation.state)} {operation.label}  {operation.state.upper()}"
-            if operation.target:
-                line += f" · {operation.target}"
-            if operation.artifact:
-                line += f" · artifact {operation.artifact}"
-            rows.append(line)
-        return rows
-
-    def _active_lines(self, height: int, width: int) -> list[str]:
-        active_lines: list[str] = []
-        active = self._operations.get(self._active_operation_id or "")
-        if active:
-            active_lines.extend(
-                [
-                    "ACTIVE OPERATION",
-                    f"{self._glyph(active.state)} {active.label}  {active.state.upper()}",
-                ]
-            )
-            if active.target:
-                active_lines.append(f"target  {active.target}")
-            if active.command:
-                active_lines.append(f"> {active.command}")
-            if active.progress:
-                active_lines.append(f"progress  {active.progress}")
-            active_lines.extend(f"stderr  {item}" for item in list(active.error)[-2:])
-            active_lines.extend(f"stdout  {item}" for item in list(active.output)[-2:])
-            if active.artifact:
-                active_lines.append(f"artifact  {active.artifact}")
-        else:
-            active_lines.extend(["ACTIVE OPERATION", "· no capability is running"])
-
-        approval_lines: list[str] = []
-        pending_approvals = self._pending_approvals
-        if pending_approvals:
-            approval_lines.extend(["", f"APPROVAL REQUIRED ({len(pending_approvals)})"])
-            for index, approval in enumerate(pending_approvals):
-                approval_id = approval.get("approval_id") or approval.get("id") or "?"
-                label = (
-                    active.label
-                    if index == 0 and active
-                    else approval.get("capability_id") or "capability"
-                )
-                approval_lines.append(f"? {approval_id}  {label}  PAUSED")
-                target = (
-                    active.target
-                    if index == 0 and active
-                    else approval.get("target")
-                    or approval.get("resource")
-                    or approval.get("path")
-                    or ""
-                )
-                if target:
-                    approval_lines.append(f"target  {target}")
-                reason = (
-                    approval.get("reason")
-                    or approval.get("policy_reason")
-                    or (active.detail if index == 0 and active else "")
-                )
-                if reason:
-                    approval_lines.append(f"reason  {reason}")
-                scopes = [str(scope) for scope in approval.get("scopes") or ()]
-                choices = " ".join(
-                    f"{scope_index}:{scope}" for scope_index, scope in enumerate(scopes, 1)
-                )
-                approval_lines.append(f"keys  {choices or '1:allow'} d:deny")
-                approval_lines.append("paused · choose a scope")
-
-        secondary: list[str] = [""]
-        secondary.extend(self._operation_history_lines())
-        secondary.extend(["", "RECENT ACTIVITY"])
-        secondary.extend(f"{glyph} {text}" for glyph, text in list(self._recent)[-6:])
-        if self.details and self._maintenance:
-            secondary.extend(["", "LEARNING / MAINTENANCE"])
-            secondary.extend(f"{glyph} {text}" for glyph, text in list(self._maintenance)[-6:])
-        secondary.extend(["", "LIVE STREAM"])
-        for item in self.window.snapshot(min(5, max(height, 1)), max(width - 2, 1))[-5:]:
-            if item.strip():
-                secondary.append(f"│ {item}")
-
-        def expanded(lines: list[str]) -> list[str]:
-            output: list[str] = []
-            for line in lines:
-                output.extend(self._wrap(line, width))
-            return output
-
-        critical = expanded(active_lines + approval_lines)
-        tail = expanded(secondary)
-        if self._right_scroll:
-            # Explicit history navigation is allowed to inspect the complete
-            # projection, including older active/history sections.
-            all_lines = critical + tail
-            stop = len(all_lines) - self._right_scroll
-            visible = all_lines[max(0, stop - height) : stop]
-        else:
-            # At the live edge, keep the current operation and approval in
-            # view.  Only lower-priority history/stream detail is trimmed.
-            if len(critical) >= height:
-                visible = critical[:height]
-            else:
-                visible = critical + tail[-(height - len(critical)) :]
-        return [self._fit(line, width) for line in visible] + [
-            "" for _ in range(max(0, height - len(visible)))
-        ]
-
-    def _scene_lines(self, height: int, width: int) -> list[str]:
-        """Render the live OI as a bounded scene, not a second dashboard.
-
-        The scene deliberately uses the same fixed OI rectangle as the Glass
-        framebuffer.  The ANSI renderer only changes how that rectangle is
-        expressed; Buddy is placed over the scene and never gets a reserved
-        column.  Detailed operation/history text remains available through
-        the independent right-pane scroll view.
-        """
-        return render_scene_lines(
-            self.projection,
-            self.scene,
-            width=width,
-            height=height,
-            buddy_lines=(
-                [f"BUDDY · {self.mascot.state.upper()}"]
-                + self.mascot.render(max_width=min(20, width))
-                if self.mascot_enabled
-                else ()
-            ),
-            buddy_enabled=self.mascot_enabled,
-            recent=self._recent,
-        )
-
-    def _right_lines(self, height: int, width: int) -> list[str]:
-        if self.display == "glass":
-            # Kitty paints the framebuffer into this fixed cell rectangle.
-            # Keep the ANSI layer empty so it cannot overwrite the image.
-            return [""] * height
-        if self._right_scroll:
-            return self._active_lines(height, width)
-        return self._scene_lines(height, width)
+        return DualPaneFrameComposer.fit(text, width)
 
     def _frame_lines(self, *, refresh: bool = True) -> list[str]:
         if refresh:
             self._refresh_terminal_size()
         layout = self.layout
-        cols, rows = layout.columns, layout.rows
+        cols = layout.columns
         if layout.mode.value == "plain":
             return [self._fit(f"ATHENA  {self.projection.status_message}", cols)]
 
@@ -1344,164 +1113,39 @@ class DualPaneSurface(OperatorSurface):
             action_kind=self.scene.mode.value,
             code_lines=(len(self.scene.code_view.lines) if self.scene.code_view else 0),
         )
-        lines = [" " * cols for _ in range(rows)]
         left_w, right_w = layout.operator.width, layout.oi.width
-        lines[0] = self._fit("ATHENA  //  OPERATOR INSTRUMENT", cols)
-        lines[1] = self._fit(
-            f"STATUS {self.projection.status:<13}  ·  local-first / event projection  ·  {self.display.upper()}",
-            cols,
-        )
-        lines[2] = self._fit("─" * max(cols - 4, 1), cols)
-
-        # Outer aperture geometry drives the shared chassis box.
-        # outer_operator / outer_oi include the one-cell aperture rim on
-        # every side; inner content area = outer minus rim (2 cells total).
-        outer_op = layout.outer_operator
-        outer_oi = layout.outer_oi
-        chassis_top = outer_op.y
-        chassis_height = outer_op.height
-        chassis_bot = chassis_top + chassis_height - 1  # inclusive bottom row
-        inner_h = max(chassis_height - 2, 1)  # body rows between rim top/bottom
-        inner_w_left = max(left_w - 2, 1)  # rim removes │ on each side
+        inner_h = max(layout.outer_operator.height - 2, 1)
+        inner_w_left = max(left_w - 2, 1)
         inner_w_right = max(right_w - 2, 1)
-        left = self._left_lines(inner_h, inner_w_left)
-        right = self._right_lines(inner_h, inner_w_right)
-        right_title = "OI // HISTORY" if self._right_scroll else "ATHENA OI // GLASS COMPUTE"
-        cabinet_x = max(layout.operator.x - 1, 0)
-        seam = max(self.PANE_GAP - 2, 0)
-        prefix = " " * cabinet_x
-        seam_fill = "░" * max(seam, 1)
-        chassis_total_width = outer_op.width + len(seam_fill) + outer_oi.width + 2
-
-        # Asymmetric apertures — one recessed, one flush.
-        # Left (operator) is recessed/inset: ╓─╖ top, │ walls, ╙─╜ bottom.
-        #    The corner characters create visual depth — the panel appears
-        #    sunk into the chassis bezel.
-        # Right (OI) is flush/non-recessed: ── top, │ walls, ── bottom.
-        #    Straight borders with no corner curves; the panel sits flush
-        #    on the chassis surface.
-        # Both apertures share equal logical width/height; only visual framing
-        # differs.  Outer chassis box (╭─╮ / ╰─╯) still spans both.
-        #
-        # Row layout inside outer chassis (derived from outer_operator /
-        # outer_oi):
-        #   chassis_top      : ╭────────╮ outer chassis top (spans both)
-        #   chassis_top + 1  : ╓─╖ left recessed top  |  ──── right flush top
-        #   chassis_top + 2… : │ content │  |  │ content │ (body rows)
-        #   chassis_top+inner_h-1: ╙─╜ left recessed bottom |  ── right flush bottom
-        #   chassis_bot      : ╰────────╯ outer chassis bottom (spans both)
-
-        def left_body_row(left_value: str) -> str:
-            """Recessed body row — │ walls, no corner characters."""
-            return prefix + "│" + self._fit(left_value, inner_w_left) + "│"
-
-        def right_body_row(right_value: str) -> str:
-            """Flush body row — │ walls, no bevels or inset corners."""
-            return prefix + "│" + self._fit(right_value, inner_w_right) + "│"
-
-        # Outer chassis top — spans both apertures
-        top_line = prefix + "╭" + "─" * chassis_total_width + "╮"
-        lines[chassis_top] = self._fit(top_line, cols)
-
-        # Title row: left recessed inset corners, right flush edge
-        lines[chassis_top + 1] = self._fit(
-            (prefix + "╓" + "─" * inner_w_left + "╖")
-            + " "
-            + seam_fill
-            + " "
-            + right_body_row(right_title),
-            cols,
+        left = self._frame_composer.left_lines(
+            inner_h,
+            inner_w_left,
+            model_text=self._model_text,
+            details=self.details,
+            left_scroll=self._left_scroll,
         )
-
-        # Content body rows: left recessed │, right flush │
-        for index in range(inner_h):
-            row = chassis_top + 2 + index
-            if row >= chassis_bot:
-                # Outer chassis bottom; skip
-                break
-            left_content = left[index] if index < len(left) else ""
-            right_content = right[index] if index < len(right) else ""
-            lines[row] = self._fit(
-                left_body_row(left_content) + " " + right_body_row(right_content),
-                cols,
-            )
-
-        # Recessed bottom corner for left on the last inner content row
-        # (the row just before the outer chassis bottom)
-        last_inner_row = chassis_top + inner_h - 1
-        if last_inner_row > chassis_top + 1 and last_inner_row < chassis_bot:
-            left_bottom = prefix + "╙" + "─" * inner_w_left + "╜"
-            right_bottom = prefix + "│" + "─" * inner_w_right + "│"
-            lines[last_inner_row] = self._fit(left_bottom + " " + right_bottom, cols)
-
-        # Outer chassis bottom — spans both apertures
-        bottom_line = prefix + "╰" + "─" * chassis_total_width + "╯"
-        lines[chassis_bot] = self._fit(bottom_line, cols)
-
-        controls_y = layout.controls.y
-        compact = cols < 120
-
-        # ── Hardware rail: 4 rows (2 when compact) ──────────────────────
-        # Row 0: top separator
-        lines[controls_y] = self._fit("─" * max(cols - 4, 1), cols)
-
-        # Row 1: measured application state.  This is a terminal surface, not
-        # a hardware telemetry bus: never present display availability as a
-        # network/system sensor or imply that a configured model is active.
-        surface = "GLASS" if self._full_screen and self.display == "glass" else self.display.upper()
-        oi_state = "ON" if self.oi_enabled else "OFF"
-        model_state = self._fit(self.model_label, 18) if self.model_label else "unconfigured"
-        state_line = (
-            f"TASK {self.projection.status}  SURFACE {surface}  OI {oi_state}  MODEL {model_state}"
+        right = self._frame_composer.right_lines(
+            inner_h,
+            inner_w_right,
+            display=self.display,
+            right_scroll=self._right_scroll,
+            details=self.details,
+            scene=self.scene,
+            mascot=self.mascot,
+            mascot_enabled=self.mascot_enabled,
         )
-        lines[controls_y + 1] = self._fit(state_line, cols)
-
-        # Row 2 (compact: skipped): activity + model area
-        # RUNNING indicator, unavailable hardware controls, and view identity.
-        if not compact:
-            running = self.projection.status in {
-                "EXECUTING",
-                "THINKING",
-                "RESPONDING",
-                "SEARCHING",
-                "READING",
-                "INSPECTING",
-                "TOOLS",
-                "APPROVAL",
-                "DELEGATED",
-            }
-            run_indicator = "●" if running else "◌"
-            status_short = self.projection.status[:6].ljust(6)
-            identity = f"ATHENA  {status_short}  {run_indicator}"
-            # BRIGHTNESS / FOCUS have no hardware backing in this context;
-            # render neutral unavailable labels rather than fake data. VIEW
-            # is the actual frontend state, not a fictional power sensor.
-            cluster = "BRIGHT —  FOCUS —"
-            view = (
-                "GLASS" if self._full_screen and self.display == "glass" else self.display.upper()
-            )
-            lines[controls_y + 2] = self._fit(f"{identity}  {cluster}  VIEW {view}", cols)
-
-            # Row 3: prompt separator + prompt text — write into the real
-            # prompt area from layout, not into rail slots.
-            prompt_y = layout.prompt.y
-            lines[prompt_y] = self._fit("─" * max(cols - 4, 1), cols)
-            if prompt_y + 1 < rows:
-                prompt_text = self._prompt_text or "type a request · /help for controls"
-                lines[prompt_y + 1] = self._fit(
-                    f"❯ {prompt_text}    Ctrl-C cancel · Ctrl-D exit", cols
-                )
-        else:
-            # Compact: 2-row rail — lamps on row 1, prompt separator + text
-            # into the real prompt area from layout (not into rail slots).
-            prompt_y = layout.prompt.y
-            if prompt_y < rows:
-                lines[prompt_y] = self._fit("─" * max(cols - 4, 1), cols)
-            if prompt_y + 1 < rows:
-                prompt_text = self._prompt_text or "type a request · /help for controls"
-                lines[prompt_y + 1] = self._fit(f"❯ {prompt_text}", cols)
-
-        return lines
+        return self._chassis_composer.compose(
+            layout=layout,
+            left=left,
+            right=right,
+            status=self.projection.status,
+            display=self.display,
+            full_screen=self._full_screen,
+            oi_enabled=self.oi_enabled,
+            model_label=self.model_label,
+            prompt_text=self._prompt_text,
+            right_scroll=self._right_scroll,
+        )
 
     def repaint_oi(self, *, force: bool = False) -> None:
         """Paint a complete frame, eliminating stale overlay borders."""
@@ -1520,63 +1164,12 @@ class DualPaneSurface(OperatorSurface):
             self._present_glass()
 
     def _present_glass(self) -> None:
-        """Present a retained CRT base plus a clipped animated overlay."""
-        viewport = self.layout.oi
-        pixel_width = max(viewport.width * 10, 80)
-        pixel_height = max((viewport.height - 2) * 20, 60)
-        base = self.oi_framebuffer.render_base(self.scene, pixel_width, pixel_height)
-        motion = self.oi_framebuffer.render_motion_overlay(
-            self.scene, self.animator.visual, pixel_width, pixel_height
+        """Present the retained CRT layers through the owned pixel seam."""
+        self.glass_presentation.present(
+            layout=self.layout,
+            scene=self.scene,
+            visual=self.animator.visual,
         )
-        overlay = self.oi_framebuffer.render_overlay(
-            self.scene, self.animator.visual, pixel_width, pixel_height
-        )
-        if base is None or motion is None or overlay is None:
-            return
-        command = ""
-        if base.base_key != self._glass_base_key:
-            # The opaque scene changes only when canonical projection content
-            # changes. It stays resident while animation updates Buddy.
-            command += self.kitty.present(
-                KittyAsset(self._glass_frame_id, base.png),
-                x=viewport.x + 1,
-                y=viewport.y + 1,
-                columns=max(viewport.width - 2, 1),
-                rows=max(viewport.height - 2, 1),
-            )
-            self._glass_base_key = base.base_key
-
-        if motion.png and motion.dirty_region:
-            left, top, region_width, region_height = motion.dirty_region
-            command += self.kitty.present(
-                KittyAsset(self._glass_motion_id, motion.png),
-                x=viewport.x + 1 + left // 10,
-                y=viewport.y + 1 + top // 20,
-                columns=max((region_width + 9) // 10, 1),
-                rows=max((region_height + 19) // 20, 1),
-            )
-        else:
-            command += self.kitty.delete(self._glass_motion_id)
-
-        if overlay.png and overlay.dirty_region:
-            left, top, region_width, region_height = overlay.dirty_region
-            command += self.kitty.present(
-                KittyAsset(self._glass_overlay_id, overlay.png),
-                x=viewport.x + 1 + left // 10,
-                y=viewport.y + 1 + top // 20,
-                columns=max((region_width + 9) // 10, 1),
-                rows=max((region_height + 19) // 20, 1),
-            )
-        else:
-            # A hidden Buddy must not leave its previous placement above the
-            # retained base scene.
-            command += self.kitty.delete(self._glass_overlay_id)
-        # Kitty placements with C=1 leave the cursor at the placement origin.
-        # Put it back on the integrated prompt before line input resumes.
-        if command:
-            command += f"\x1b[{self.layout.prompt.y + 2};1H"
-            self.output.write(command)
-            self.output.flush()
 
     def snapshot_oi(self, height: int | None = None) -> list[str]:
         return self.window.snapshot(height or self.oi_height, self._term_cols)

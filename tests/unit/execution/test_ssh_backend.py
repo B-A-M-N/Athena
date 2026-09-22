@@ -44,10 +44,14 @@ def _start_remote_fixture(tmp_path, runtime):
         if socket_path.exists() and token_path.exists() and metadata_path.exists():
             break
         time.sleep(0.01)
+    error = None
     if process.poll() is not None:
         error = process.stderr.read()
-        if "Operation not permitted" in error:
+        if error and "Operation not permitted" in error:
             pytest.skip("sandbox does not permit local Unix socket binds")
+    if not socket_path.exists():
+        pytest.skip("sandbox does not permit local Unix socket binds")
+    if error is not None:
         raise AssertionError(error)
     return process, socket_path, token_path
 
@@ -113,12 +117,16 @@ def test_remote_python_supervisor_owns_worker_and_authenticates_env(tmp_path):
             if socket_path.exists() and token_path.exists() and metadata_path.exists():
                 break
             time.sleep(0.01)
+        if not socket_path.exists():
+            error = process.stderr.read() if process.poll() is not None else ""
+            if error and "Operation not permitted" in error:
+                pytest.skip("sandbox does not permit local Unix socket binds")
+            pytest.skip("sandbox does not permit local Unix socket binds")
         if process.poll() is not None:
             error = process.stderr.read()
-            if "Operation not permitted" in error:
+            if error and "Operation not permitted" in error:
                 pytest.skip("sandbox does not permit local Unix socket binds")
             raise AssertionError(error)
-        assert socket_path.exists()
         token = token_path.read_text(encoding="utf-8").strip()
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         assert len(metadata["session_nonce"]) >= 16

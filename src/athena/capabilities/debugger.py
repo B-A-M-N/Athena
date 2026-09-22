@@ -7,6 +7,7 @@ ordinary runtime session.
 """
 
 from __future__ import annotations
+from athena.capabilities.operations import native_descriptor
 
 import asyncio
 import importlib
@@ -19,7 +20,6 @@ from typing import Any
 
 from athena.protocol.capabilities import (
     Availability,
-    CapabilityDescriptor,
     CapabilityOrigin,
     CapabilityRequest,
     CapabilityResult,
@@ -144,7 +144,7 @@ class _DAPClient:
 class DebuggerCapability:
     """Launch and inspect Python programs through a governed DAP session."""
 
-    descriptor = CapabilityDescriptor(
+    descriptor = native_descriptor(
         id="debugger",
         description=(
             "Launch Python scripts under debugpy and use the Debug Adapter "

@@ -25,7 +25,7 @@ class _Runtime:
 
 def test_owned_process_requires_matching_start_identity():
     manager = ExecutionManager()
-    manager._task_sessions["task-1"] = [(_Runtime(), "session-1")]
+    manager._cancellation_registry.task_sessions["task-1"] = [(_Runtime(), "session-1")]
     identity = process_start_identity(os.getpid())
 
     assert identity is not None

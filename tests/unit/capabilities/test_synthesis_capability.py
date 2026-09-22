@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -873,6 +874,12 @@ async def test_promotion_persistence_failure_keeps_task_overlay_live(tmp_path, m
                     "properties": {"ok": {"type": "boolean"}},
                     "additionalProperties": False,
                 },
+                "output_schema": {
+                    "type": "object",
+                    "required": ["ok"],
+                    "properties": {"ok": {"type": "boolean"}},
+                    "additionalProperties": False,
+                },
                 "validation_cases": [{"args": {"ok": True}}],
             },
         )
@@ -936,6 +943,8 @@ async def test_promotion_persistence_failure_keeps_task_overlay_live(tmp_path, m
 
 @pytest.mark.asyncio
 async def test_candidate_can_be_rehydrated_and_promoted_after_restart(tmp_path):
+    if os.environ.get("ATHENA_SKIP_BWRAP_HEAVY") == "1":
+        pytest.skip("bwrap-heavy validation skipped for constrained host")
     db = Database(str(tmp_path / "candidate.db"))
     store = GeneratedCapabilityStore(db)
 

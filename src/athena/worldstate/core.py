@@ -29,7 +29,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from athena.execution.async_call import run_blocking
+from athena.concurrency import run_blocking
 from athena.protocol.ids import new_id
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -510,7 +510,7 @@ class TaskWorldState:
 
         def _git():
             try:
-                proc = subprocess.run(  # architecture-lint: allow subprocess-outside-approved-backends reason=read-only git observation
+                proc = subprocess.run(  # architecture-lint: allow subprocess-outside-approved-backends reason=read-only git observation; architecture-exception: worldstate-git-observation
                     ["git", "-C", root, "status", "--porcelain"],
                     capture_output=True,
                     text=True,

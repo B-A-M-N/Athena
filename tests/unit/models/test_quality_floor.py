@@ -10,6 +10,7 @@ from __future__ import annotations
 
 
 from athena.models.router import ModelRouter
+from athena.models.inventory import normalize_model
 from athena.kernel.kernel import _escalated_quality_floor
 from athena.protocol.models import ModelInfo, ModelQualityTier
 from athena.protocol.tasks import ModelPolicy
@@ -29,6 +30,9 @@ class _StaticRegistry:
 
     async def list_models(self):
         return list(self._models)
+
+    async def list_effective_models(self):
+        return tuple(normalize_model(info) for info in self._models)
 
     def provider_for(self, name):
         return None

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 
+from athena.capabilities.operations import native_descriptor
+
 from athena.delegates.sessions import ExternalDelegateManager
 from athena.protocol.capabilities import (
-    CapabilityDescriptor,
     CapabilityOrigin,
     CapabilityRequest,
     CapabilityResult,
@@ -16,7 +17,7 @@ from athena.protocol.capabilities import (
 
 
 class ExternalDelegateCapability:
-    descriptor = CapabilityDescriptor(
+    descriptor = native_descriptor(
         id="delegate.external",
         description=(
             "Consult a host-registered external specialist through a persistent "

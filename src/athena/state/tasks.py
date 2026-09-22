@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 from athena.protocol.errors import IllegalStateTransition, TaskOwnershipLost
 from athena.protocol.messages import utcnow
@@ -133,22 +133,7 @@ class TaskStore:
 
     async def update_metadata(self, task_id: str, updates: dict[str, Any]) -> bool:
         """Merge durable metadata fields without changing task authority state."""
-        async with self._db.transaction() as db:
-            row = await db.fetch_one_raw("SELECT metadata FROM tasks WHERE id = ?", (task_id,))
-            if row is None:
-                return False
-            try:
-                metadata = json.loads(row.get("metadata") or "{}")
-            except (TypeError, ValueError):
-                metadata = {}
-            if not isinstance(metadata, dict):
-                metadata = {}
-            metadata.update(dict(updates))
-            cursor = await db.execute_raw(
-                "UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ?",
-                (json.dumps(metadata, default=str), utcnow().isoformat(), task_id),
-            )
-            return cursor.rowcount == 1
+        return await self._mutate_metadata(task_id, lambda meta: meta.update(dict(updates)))
 
     async def list_children(self, parent_task_id: str) -> list[dict]:
         """Every task whose ``parent_task_id`` points at the given task."""
@@ -167,76 +152,96 @@ class TaskStore:
         return int(row["n"]) if row and row.get("n") is not None else 0
 
     async def list_descendants(self, task_id: str) -> list[dict]:
-        """Every descendant task reachable through the parent links, breadth-first."""
-        out: list[dict] = []
-        seen: set[str] = set()
-        id_frontier = [task_id]
-        while id_frontier:
-            nxt: list[dict] = []
-            for pid in id_frontier:
-                for child in await self.list_children(pid):
-                    if child["id"] not in seen:
-                        seen.add(child["id"])
-                        nxt.append(child)
-            out.extend(nxt)
-            id_frontier = [child["id"] for child in nxt]
-        return out
+        """Every descendant task reachable through the parent links.
+
+        SQLite owns traversal in one recursive statement.  This avoids the
+        previous one-query-per-parent N+1 pattern on cancellation, budget,
+        and orchestration paths that walk task trees.
+        """
+        rows = await self._db.fetch_all(
+            """
+            WITH RECURSIVE descendants AS (
+                SELECT * FROM tasks WHERE parent_task_id = ?
+                UNION
+                SELECT t.*
+                FROM tasks t
+                JOIN descendants d ON t.parent_task_id = d.id
+            )
+            SELECT * FROM descendants ORDER BY created_at ASC
+            """,
+            (task_id,),
+        )
+        return [_decode_task_row(r) for r in rows]
 
     async def child_ids(self, task_id: str) -> list[str]:
         return [r["id"] for r in await self.list_children(task_id)]
 
     async def descendant_ids(self, task_id: str) -> list[str]:
-        return [r["id"] for r in await self.list_descendants(task_id)]
+        """Return descendant identities without decoding full task records."""
+        rows = await self._db.fetch_all(
+            """
+            WITH RECURSIVE descendants AS (
+                SELECT id, parent_task_id FROM tasks WHERE parent_task_id = ?
+                UNION
+                SELECT t.id, t.parent_task_id
+                FROM tasks t
+                JOIN descendants d ON t.parent_task_id = d.id
+            )
+            SELECT id FROM descendants ORDER BY id ASC
+            """,
+            (task_id,),
+        )
+        return [str(row["id"]) for row in rows]
+
+    async def _mutate_metadata(
+        self,
+        task_id: str,
+        mutator: Callable[[dict[str, Any]], None],
+    ) -> bool:
+        """Atomically read-modify-write the task metadata document.
+
+        The read, mutation, and write execute inside one transaction so two
+        concurrent writers cannot overwrite each other's fields (the previous
+        SELECT-decode-UPDATE sequence was not serialized as a unit). Returns
+        False when the task does not exist.
+        """
+        async with self._db.transaction() as db:
+            row = await db.fetch_one_raw("SELECT metadata FROM tasks WHERE id = ?", (task_id,))
+            if row is None:
+                return False
+            try:
+                metadata = json.loads(row.get("metadata") or "{}")
+            except (TypeError, ValueError):
+                metadata = {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            mutator(metadata)
+            cursor = await db.execute_raw(
+                "UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(metadata, default=str), utcnow().isoformat(), task_id),
+            )
+            return cursor.rowcount == 1
 
     async def set_retry_count(self, task_id: str, count: int) -> None:
         """Persist ``worker_retries`` into the task's metadata column."""
-        row = await self._db.fetch_one("SELECT metadata FROM tasks WHERE id = ?", (task_id,))
-        if row is None:
-            return
-        try:
-            meta = json.loads(row["metadata"] or "{}")
-        except (TypeError, ValueError):
-            meta = {}
-        meta["worker_retries"] = count
-        await self._db.execute(
-            "UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ?",
-            (json.dumps(meta), utcnow().isoformat(), task_id),
-        )
+        await self._mutate_metadata(task_id, lambda meta: meta.update(worker_retries=count))
 
     async def record_recovery_marker(self, task_id: str, marker: dict[str, Any]) -> None:
         """Persist uncertainty evidence without pretending the task succeeded."""
-        row = await self._db.fetch_one("SELECT metadata FROM tasks WHERE id = ?", (task_id,))
-        if row is None:
+
+        def _apply(metadata: dict[str, Any]) -> None:
+            markers = list(metadata.get("recovery_markers") or [])
+            markers.append(dict(marker))
+            metadata["recovery_markers"] = markers[-32:]
+            metadata["recovery_required"] = True
+
+        applied = await self._mutate_metadata(task_id, _apply)
+        if not applied:
             raise KeyError(f"Task not found: {task_id}")
-        try:
-            metadata = json.loads(row.get("metadata") or "{}")
-        except (TypeError, ValueError):
-            metadata = {}
-        markers = list(metadata.get("recovery_markers") or [])
-        markers.append(dict(marker))
-        metadata["recovery_markers"] = markers[-32:]
-        metadata["recovery_required"] = True
-        await self._db.execute(
-            "UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ?",
-            (json.dumps(metadata, default=str), utcnow().isoformat(), task_id),
-        )
 
     async def persist_budget_usage(self, task_id: str, usage: dict[str, Any]) -> None:
         """Persist the budget ledger checkpoint without changing task state."""
-        row = await self._db.fetch_one("SELECT metadata FROM tasks WHERE id = ?", (task_id,))
-        if row is None:
-            return
-        try:
-            metadata = json.loads(row.get("metadata") or "{}")
-        except (TypeError, ValueError):
-            metadata = {}
-        if not isinstance(metadata, dict):
-            metadata = {}
-        metadata["_budget_usage"] = dict(usage)
-        await self._db.execute(
-            "UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ?",
-            (json.dumps(metadata), utcnow().isoformat(), task_id),
-        )
+        await self._mutate_metadata(task_id, lambda meta: meta.update(_budget_usage=dict(usage)))
 
     async def persist_runtime_recovery_hint(
         self,
@@ -256,37 +261,28 @@ class TaskStore:
         survived a service restart.  Keeping this beside the durable task
         record makes the warning available to every resumed model turn.
         """
-        row = await self._db.fetch_one("SELECT metadata FROM tasks WHERE id = ?", (task_id,))
-        if row is None:
-            return
-        try:
-            metadata = json.loads(row.get("metadata") or "{}")
-        except (TypeError, ValueError):
-            metadata = {}
-        if not isinstance(metadata, dict):
-            metadata = {}
-        metadata["_runtime_recovery_hint"] = {
-            "runtime_session_id": str(runtime_session_id),
-            "backend": str(backend or "unknown"),
-            "runtime": str(runtime or backend or "unknown"),
-            "cwd": str(cwd) if cwd else None,
-            "recovery_route": "execute",
-            "replay_command": False,
-            "recovery_action": "reestablish_runtime",
-            "released_resources": dict(released_resources or {}),
-            "checkpoint_id": str(checkpoint_id) if checkpoint_id else None,
-            "resume_consequence": resume_consequence,
-            "message": (
-                "Runtime state was lost across restart. Do not assume prior "
-                "process variables or session state exist; invoke execute with a fresh "
-                "task-owned runtime and reconstruct required state explicitly. Do not "
-                "replay a stale command automatically."
-            ),
-        }
-        await self._db.execute(
-            "UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ?",
-            (json.dumps(metadata), utcnow().isoformat(), task_id),
-        )
+
+        def _apply(metadata: dict[str, Any]) -> None:
+            metadata["_runtime_recovery_hint"] = {
+                "runtime_session_id": str(runtime_session_id),
+                "backend": str(backend or "unknown"),
+                "runtime": str(runtime or backend or "unknown"),
+                "cwd": str(cwd) if cwd else None,
+                "recovery_route": "execute",
+                "replay_command": False,
+                "recovery_action": "reestablish_runtime",
+                "released_resources": dict(released_resources or {}),
+                "checkpoint_id": str(checkpoint_id) if checkpoint_id else None,
+                "resume_consequence": resume_consequence,
+                "message": (
+                    "Runtime state was lost across restart. Do not assume prior "
+                    "process variables or session state exist; invoke execute with a fresh "
+                    "task-owned runtime and reconstruct required state explicitly. Do not "
+                    "replay a stale command automatically."
+                ),
+            }
+
+        await self._mutate_metadata(task_id, _apply)
 
     async def persist_result(
         self,

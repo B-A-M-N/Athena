@@ -1,13 +1,13 @@
 {
-  "generated_at": "2026-09-10T20:19:32.242750+00:00",
+  "generated_at": "2026-09-11T03:19:09.637899+00:00",
   "repo_root": "/home/bamn/Athena",
-  "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+  "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
   "release_run_id": "local",
   "source_identity": {
-    "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+    "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
     "release_run_id": "local",
     "dirty": true,
-    "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+    "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
     "python": "/home/bamn/Athena/.venv/bin/python3",
     "python_version": "3.12.13",
     "platform": "linux"
@@ -19,7 +19,7 @@
       "family": "FUSE",
       "title": "Single ModelRouter construction; kernel receives injected router",
       "required": false,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -36,18 +36,18 @@
             "tests/unit/models/test_role_router.py::test_router_exposes_selected_provider_without_second_authority"
           ],
           "exit_code": 0,
-          "duration_s": 2.276,
-          "tail": ".                                                                        [100%]\n1 passed in 0.32s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 1.784,
+          "tail": ".                                                                        [100%]\n1 passed in 0.12s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.276,
+      "duration_s": 1.784,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -65,7 +65,7 @@
       "family": "FUSE",
       "title": "No kernel-constructed ModelRouter fallback",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -84,18 +84,18 @@
             "tests/unit/models/test_router_authority.py::test_kernel_holds_the_injected_router_instance"
           ],
           "exit_code": 0,
-          "duration_s": 1.046,
-          "tail": "..                                                                       [100%]\n2 passed in 0.13s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 2.116,
+          "tail": "..                                                                       [100%]\n2 passed in 0.34s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 1.047,
+      "duration_s": 2.116,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -113,7 +113,7 @@
       "family": "FUSE",
       "title": "Direct execution routes through the dispatcher and records audit",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -130,18 +130,18 @@
             "tests/unit/service/test_direct_execution.py::test_direct_execution_routes_through_dispatcher_and_records_audit"
           ],
           "exit_code": 0,
-          "duration_s": 2.545,
-          "tail": ".                                                                        [100%]\n1 passed in 0.34s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 2.198,
+          "tail": ".                                                                        [100%]\n1 passed in 0.24s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.545,
+      "duration_s": 2.198,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -159,7 +159,7 @@
       "family": "FUSE",
       "title": "Kernel loop drives model+capabilities to completion under one authority",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -178,18 +178,18 @@
             "tests/unit/kernel/test_kernel_loop.py::test_scripted_capability_then_answer_runs_two_iterations"
           ],
           "exit_code": 0,
-          "duration_s": 2.777,
-          "tail": "..                                                                       [100%]\n2 passed in 1.10s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 3.41,
+          "tail": "..                                                                       [100%]\n2 passed in 1.41s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.777,
+      "duration_s": 3.41,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -206,7 +206,7 @@
       "family": "FUSE",
       "title": "Durable workflow resume reuses completed receipts and rejects drift",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -231,18 +231,18 @@
             "tests/unit/workflows/test_executor.py::test_same_process_approval_replay_keeps_workflow_identity"
           ],
           "exit_code": 0,
-          "duration_s": 2.848,
-          "tail": ".....                                                                    [100%]\n5 passed in 1.04s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 2.802,
+          "tail": ".....                                                                    [100%]\n5 passed in 0.53s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.848,
+      "duration_s": 2.802,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -260,7 +260,7 @@
       "family": "FUSE",
       "title": "Verified external outcomes resume workflows without redispatch",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -281,18 +281,18 @@
             "tests/unit/capabilities/test_workflow_promotion.py::test_workflow_recovery_uses_durable_external_receipt"
           ],
           "exit_code": 0,
-          "duration_s": 2.997,
-          "tail": "...                                                                      [100%]\n3 passed in 0.77s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 1.738,
+          "tail": "...                                                                      [100%]\n3 passed in 0.32s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.997,
+      "duration_s": 1.738,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -310,9 +310,9 @@
       "family": "FUSE",
       "title": "Installed artifacts complete a natural-language capability task",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
-      "status": "failed",
+      "status": "passed",
       "evidence": [
         {
           "kind": "pytest",
@@ -326,19 +326,19 @@
           "nodeids": [
             "tests/e2e/test_release_black_box.py::test_installed_artifacts_cover_application_entry_paths"
           ],
-          "exit_code": 1,
-          "duration_s": 93.008,
-          "tail": "ssions and owner of that directory. If executing pip with sudo, you should use sudo's -H flag.\nWARNING: Retrying (Retry(total=4, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError('<pip._vendor.urllib3.connection.HTTPSConnection object at 0x728e924417c0>: Failed to establish a new connection: [Errno -2] Name or service not known')': /simple/httpx/\nWARNING: Retrying (Retry(total=3, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError('<pip._vendor.urllib3.connection.HTTPSConnection object at 0x728e91f18470>: Failed to establish a new connection: [Errno -2] Name or service not known')': /simple/httpx/\nWARNING: Retrying (Retry(total=2, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError('<pip._vendor.urllib3.connection.HTTPSConnection object at 0x728e91efd2b0>: Failed to establish a new connection: [Errno -2] Name or service not known')': /simple/httpx/\nWARNING: Retrying (Retry(total=1, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError('<pip._vendor.urllib3.connection.HTTPSConnection object at 0x728e91efe0f0>: Failed to establish a new connection: [Errno -2] Name or service not known')': /simple/httpx/\nWARNING: Retrying (Retry(total=0, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError('<pip._vendor.urllib3.connection.HTTPSConnection object at 0x728e91f18740>: Failed to establish a new connection: [Errno -2] Name or service not known')': /simple/httpx/\nERROR: Could not find a version that satisfies the requirement httpx>=0.27 (from athena-agent) (from versions: none)\nERROR: No matching distribution found for httpx>=0.27\n=========================== short test summary info ============================\nFAILED tests/e2e/test_release_black_box.py::test_installed_artifacts_cover_application_entry_paths\n1 failed in 91.06s (0:01:31)\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "exit_code": 0,
+          "duration_s": 92.009,
+          "tail": ".                                                                        [100%]\n1 passed in 90.85s (0:01:30)\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 93.008,
+      "duration_s": 92.009,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -356,7 +356,7 @@
       "family": "SYNTH",
       "title": "Generated capabilities validate against fixtures before admission",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -377,18 +377,18 @@
             "tests/unit/synthesis/test_synthesis.py::test_validate_reports_invalid_generated_schema_as_admission_failure"
           ],
           "exit_code": 0,
-          "duration_s": 3.245,
-          "tail": "...                                                                      [100%]\n3 passed in 1.12s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 1.363,
+          "tail": "...                                                                      [100%]\n3 passed in 0.43s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 3.245,
+      "duration_s": 1.363,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -405,7 +405,7 @@
       "family": "SYNTH",
       "title": "Registration refuses unvalidated generated code; validated code runs",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -424,18 +424,18 @@
             "tests/unit/synthesis/test_synthesis.py::test_register_ephemeral_registers_validated_and_invokes"
           ],
           "exit_code": 0,
-          "duration_s": 3.255,
-          "tail": "..                                                                       [100%]\n2 passed in 0.93s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 1.227,
+          "tail": "..                                                                       [100%]\n2 passed in 0.33s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 3.255,
+      "duration_s": 1.227,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -452,7 +452,7 @@
       "family": "SYNTH",
       "title": "Generated authority derives from sandbox profile, not declared effects",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -469,18 +469,18 @@
             "tests/unit/synthesis/test_synthesis.py::test_generated_authority_is_sandbox_profile_not_declared_effects"
           ],
           "exit_code": 0,
-          "duration_s": 4.164,
-          "tail": ".                                                                        [100%]\n1 passed in 0.85s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 1.005,
+          "tail": ".                                                                        [100%]\n1 passed in 0.17s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 4.164,
+      "duration_s": 1.005,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -497,7 +497,7 @@
       "family": "SYNTH",
       "title": "Generated machinery reuse: proof stats and skill promotion after two uses",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -516,18 +516,18 @@
             "tests/unit/synthesis/test_synthesis.py::test_to_skill_candidate_requires_diverse_repeated_success"
           ],
           "exit_code": 0,
-          "duration_s": 4.288,
-          "tail": "..                                                                       [100%]\n2 passed in 1.60s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 1.481,
+          "tail": "..                                                                       [100%]\n2 passed in 0.85s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 4.288,
+      "duration_s": 1.481,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -544,7 +544,7 @@
       "family": "SYNTH",
       "title": "Model can synthesize a task-local tool with strict generated schema",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -565,18 +565,18 @@
             "tests/unit/capabilities/test_synthesis_capability.py::test_synthesis_output_schema_inference_distinguishes_booleans"
           ],
           "exit_code": 0,
-          "duration_s": 7.527,
-          "tail": "...                                                                      [100%]\n3 passed in 4.64s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 3.116,
+          "tail": "...                                                                      [100%]\n3 passed in 2.12s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 7.527,
+      "duration_s": 3.116,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -593,7 +593,7 @@
       "family": "SYNTH",
       "title": "Generated tools compose declared native capabilities through the dispatcher",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -614,18 +614,18 @@
             "tests/unit/synthesis/test_synthesis.py::test_generated_validation_rejects_undeclared_native_write"
           ],
           "exit_code": 0,
-          "duration_s": 3.134,
-          "tail": "...                                                                      [100%]\n3 passed in 1.14s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 1.587,
+          "tail": "...                                                                      [100%]\n3 passed in 0.61s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 3.134,
+      "duration_s": 1.587,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -643,7 +643,7 @@
       "family": "SYNTH",
       "title": "Successful workflow execution feeds the governed learning lifecycle",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -672,18 +672,18 @@
             "tests/unit/capabilities/test_workflow_promotion.py::test_workflow_promotion_requires_distinct_observations"
           ],
           "exit_code": 0,
-          "duration_s": 2.81,
-          "tail": ".......                                                                  [100%]\n7 passed in 0.59s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 2.054,
+          "tail": ".......                                                                  [100%]\n7 passed in 0.22s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.81,
+      "duration_s": 2.054,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -701,7 +701,7 @@
       "family": "AUTH",
       "title": "Generated-capability promotion is policy checked and task scoped",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -722,18 +722,18 @@
             "tests/unit/capabilities/test_synthesis_capability.py::test_synthesis_requires_task_scope"
           ],
           "exit_code": 0,
-          "duration_s": 8.435,
-          "tail": "...                                                                      [100%]\n3 passed in 6.52s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 5.856,
+          "tail": "...                                                                      [100%]\n3 passed in 4.67s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 8.435,
+      "duration_s": 5.856,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -750,7 +750,7 @@
       "family": "AUTH",
       "title": "Restored generated tools re-check source and authority against profile",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -771,18 +771,18 @@
             "tests/unit/affordances/test_fabric.py::test_restore_executor_rejects_persisted_authority_outside_profile"
           ],
           "exit_code": 0,
-          "duration_s": 6.088,
-          "tail": "...                                                                      [100%]\n3 passed in 4.48s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 3.921,
+          "tail": "...                                                                      [100%]\n3 passed in 2.84s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 6.088,
+      "duration_s": 3.921,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -799,7 +799,7 @@
       "family": "AUTH",
       "title": "Scratch/generated execution rejects host escape before running",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -818,18 +818,18 @@
             "tests/unit/affordances/test_validation.py::test_source_validation_rejects_host_escape_primitives_before_execution"
           ],
           "exit_code": 0,
-          "duration_s": 2.108,
-          "tail": "..                                                                       [100%]\n2 passed in 0.31s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 1.361,
+          "tail": "..                                                                       [100%]\n2 passed in 0.18s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.108,
+      "duration_s": 1.361,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -846,7 +846,7 @@
       "family": "AUTH",
       "title": "Task deny is a hard ceiling for capability policy containment",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -865,18 +865,18 @@
             "tests/contract/test_capability_policy_enforcement.py::TestPolicyEnforcement::test_task_deny_never_calls_executor"
           ],
           "exit_code": 0,
-          "duration_s": 1.91,
-          "tail": "..                                                                       [100%]\n2 passed in 0.37s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 2.173,
+          "tail": "..                                                                       [100%]\n2 passed in 0.38s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 1.91,
+      "duration_s": 2.173,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -893,7 +893,7 @@
       "family": "COMPAT",
       "title": "Provider streams translate and accumulate without losing content",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -916,18 +916,18 @@
             "tests/unit/models/test_response_accumulator.py::test_registry_invoke_uses_the_same_accumulator"
           ],
           "exit_code": 0,
-          "duration_s": 1.83,
-          "tail": "....                                                                     [100%]\n4 passed in 0.20s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 1.812,
+          "tail": "....                                                                     [100%]\n4 passed in 0.25s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 1.83,
+      "duration_s": 1.812,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -944,7 +944,7 @@
       "family": "COMPAT",
       "title": "Assistant-turn replay preserves mixed text/tool history across providers",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -963,18 +963,18 @@
             "tests/unit/kernel/test_model_tool_history.py::test_kernel_stream_assembly_keeps_text_and_tool_delta"
           ],
           "exit_code": 0,
-          "duration_s": 2.659,
-          "tail": "..                                                                       [100%]\n2 passed in 0.55s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 2.287,
+          "tail": "..                                                                       [100%]\n2 passed in 0.68s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.659,
+      "duration_s": 2.287,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -991,7 +991,7 @@
       "family": "COMPAT",
       "title": "Deterministic tool-input repair fixes real malformations only",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -1014,18 +1014,18 @@
             "tests/unit/models/test_compat_kernel.py::test_repair_is_idempotent"
           ],
           "exit_code": 0,
-          "duration_s": 2.235,
-          "tail": "....                                                                     [100%]\n4 passed in 0.40s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 3.276,
+          "tail": "....                                                                     [100%]\n4 passed in 0.82s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.235,
+      "duration_s": 3.276,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -1042,7 +1042,7 @@
       "family": "COMPAT",
       "title": "Repair never invents data: unknown fields invalid, streams never repaired",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -1065,18 +1065,18 @@
             "tests/unit/models/test_toolcall_candidates.py::test_empty_candidate_is_not_rewritten_as_an_empty_object"
           ],
           "exit_code": 0,
-          "duration_s": 2.147,
-          "tail": "....                                                                     [100%]\n4 passed in 0.46s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 3.005,
+          "tail": "....                                                                     [100%]\n4 passed in 0.95s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.147,
+      "duration_s": 3.005,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -1093,7 +1093,7 @@
       "family": "COMPAT",
       "title": "Prefix-cache telemetry is honest and boundary-marked",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -1118,18 +1118,18 @@
             "tests/unit/models/test_compat_kernel.py::test_no_cache_hit_inferred_without_telemetry"
           ],
           "exit_code": 0,
-          "duration_s": 1.323,
-          "tail": ".....                                                                    [100%]\n5 passed in 0.12s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 2.097,
+          "tail": ".....                                                                    [100%]\n5 passed in 0.27s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 1.323,
+      "duration_s": 2.097,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -1146,7 +1146,7 @@
       "family": "COMPAT",
       "title": "Repaired arguments flow through dispatch preflight and are durable",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -1165,18 +1165,18 @@
             "tests/unit/capabilities/test_tool_repair_store.py::test_parallel_repair_receipt_is_durable_and_replayable"
           ],
           "exit_code": 0,
-          "duration_s": 2.642,
-          "tail": "..                                                                       [100%]\n2 passed in 0.64s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 1.833,
+          "tail": "..                                                                       [100%]\n2 passed in 0.53s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.642,
+      "duration_s": 1.833,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -1193,7 +1193,7 @@
       "family": "BODY",
       "title": "PTY terminal sessions: create, send, screen, kill with task ownership",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -1212,18 +1212,18 @@
             "tests/unit/capabilities/test_terminal_session.py::test_task_ownership_enforced"
           ],
           "exit_code": 0,
-          "duration_s": 3.674,
-          "tail": "..                                                                       [100%]\n2 passed in 2.05s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 3.374,
+          "tail": "..                                                                       [100%]\n2 passed in 2.03s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 3.674,
+      "duration_s": 3.374,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -1240,7 +1240,7 @@
       "family": "BODY",
       "title": "Terminal screen emulation reproduces rendered output",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -1261,18 +1261,18 @@
             "tests/unit/capabilities/test_screen_emulator.py::test_alternate_screen_overwrite_via_cursor_reposition"
           ],
           "exit_code": 0,
-          "duration_s": 1.933,
-          "tail": "...                                                                      [100%]\n3 passed in 0.35s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 2.511,
+          "tail": "...                                                                      [100%]\n3 passed in 0.66s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 1.933,
+      "duration_s": 2.511,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -1289,7 +1289,7 @@
       "family": "BODY",
       "title": "Real runtimes execute and keep state (shell, python, persistent session)",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -1312,18 +1312,18 @@
             "tests/unit/execution/test_shell_runtime.py::test_shell_completion_marker_is_invocation_specific_and_exact"
           ],
           "exit_code": 0,
-          "duration_s": 23.09,
-          "tail": "....                                                                     [100%]\n4 passed in 21.51s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 26.033,
+          "tail": "....                                                                     [100%]\n4 passed in 23.60s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 23.09,
+      "duration_s": 26.033,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -1340,7 +1340,7 @@
       "family": "BODY",
       "title": "Process identity and owned-process signal semantics",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -1361,18 +1361,18 @@
             "tests/unit/capabilities/test_system.py::test_process_tree_and_usage"
           ],
           "exit_code": 0,
-          "duration_s": 1.984,
-          "tail": "...                                                                      [100%]\n3 passed in 0.35s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 1.416,
+          "tail": "...                                                                      [100%]\n3 passed in 0.26s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 1.984,
+      "duration_s": 1.416,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -1389,7 +1389,7 @@
       "family": "BODY",
       "title": "Debugger capability uses governed DAP execution",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -1414,18 +1414,18 @@
             "tests/unit/capabilities/test_debugger.py::test_session_ownership_is_enforced"
           ],
           "exit_code": 0,
-          "duration_s": 2.157,
-          "tail": ".ss.s                                                                    [100%]\n2 passed, 3 skipped in 0.31s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 1.179,
+          "tail": ".ss.s                                                                    [100%]\n2 passed, 3 skipped in 0.12s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.157,
+      "duration_s": 1.179,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -1443,7 +1443,7 @@
       "family": "BODY",
       "title": "Machine introspection reports truthful, redacted environment",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -1462,18 +1462,18 @@
             "tests/unit/capabilities/test_system.py::test_machine_env_redacts_secrets"
           ],
           "exit_code": 0,
-          "duration_s": 2.008,
-          "tail": "..                                                                       [100%]\n2 passed in 0.36s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 1.663,
+          "tail": "..                                                                       [100%]\n2 passed in 0.17s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.008,
+      "duration_s": 1.663,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -1490,7 +1490,7 @@
       "family": "WORLD",
       "title": "World-state registry projects claims, contradictions and unknowns",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -1509,18 +1509,18 @@
             "tests/unit/shadow/test_shadow_and_worldstate.py::test_invariant_envelope_detects_violation"
           ],
           "exit_code": 0,
-          "duration_s": 3.545,
-          "tail": "..                                                                       [100%]\n2 passed in 1.87s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 3.094,
+          "tail": "..                                                                       [100%]\n2 passed in 1.16s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 3.545,
+      "duration_s": 3.094,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -1537,7 +1537,7 @@
       "family": "WORLD",
       "title": "World state survives restart and stays per-task scoped",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -1558,18 +1558,18 @@
             "tests/unit/worldstate/test_store.py::test_mutations_get_durable_task_sequences"
           ],
           "exit_code": 0,
-          "duration_s": 3.768,
-          "tail": "...                                                                      [100%]\n3 passed in 1.75s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 2.205,
+          "tail": "...                                                                      [100%]\n3 passed in 1.09s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 3.768,
+      "duration_s": 2.205,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -1586,7 +1586,7 @@
       "family": "WORLD",
       "title": "Invalidation flips persist and mark claims contradicted",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -1605,18 +1605,18 @@
             "tests/unit/worldstate/test_store.py::test_mark_contradicted"
           ],
           "exit_code": 0,
-          "duration_s": 3.185,
-          "tail": "..                                                                       [100%]\n2 passed in 1.48s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 4.433,
+          "tail": "..                                                                       [100%]\n2 passed in 1.85s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 3.185,
+      "duration_s": 4.433,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -1633,7 +1633,7 @@
       "family": "CLAIM",
       "title": "Claims go stale after a dependent mutation",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -1650,18 +1650,18 @@
             "tests/unit/shadow/test_shadow_and_worldstate.py::test_claims_go_stale_after_dependent_mutation"
           ],
           "exit_code": 0,
-          "duration_s": 2.948,
-          "tail": ".                                                                        [100%]\n1 passed in 1.28s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 2.462,
+          "tail": ".                                                                        [100%]\n1 passed in 0.89s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.948,
+      "duration_s": 2.462,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -1678,7 +1678,7 @@
       "family": "CLAIM",
       "title": "Experiment commit binds claims and invalidates stale ones",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -1695,18 +1695,18 @@
             "tests/unit/fusion/test_orchestrator.py::test_experiment_commit_binds_claim_and_invalidates"
           ],
           "exit_code": 0,
-          "duration_s": 13.002,
-          "tail": ".                                                                        [100%]\n1 passed in 11.41s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 6.367,
+          "tail": ".                                                                        [100%]\n1 passed in 5.33s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 13.002,
+      "duration_s": 6.367,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -1723,7 +1723,7 @@
       "family": "CLAIM",
       "title": "Claim leases are not consumed until execution finishes",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -1742,18 +1742,18 @@
             "tests/unit/kernel/test_continuation_store.py::test_restart_releases_claims_and_lists_recoverable_tasks"
           ],
           "exit_code": 0,
-          "duration_s": 3.319,
-          "tail": "..                                                                       [100%]\n2 passed in 1.54s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 3.46,
+          "tail": "..                                                                       [100%]\n2 passed in 1.94s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 3.319,
+      "duration_s": 3.46,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -1770,7 +1770,7 @@
       "family": "TX",
       "title": "Shadow commit applies proven changes only",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -1787,18 +1787,18 @@
             "tests/unit/shadow/test_shadow_and_worldstate.py::test_shadow_commit_applies_proven_changes"
           ],
           "exit_code": 0,
-          "duration_s": 9.97,
-          "tail": ".                                                                        [100%]\n1 passed in 8.36s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 14.633,
+          "tail": ".                                                                        [100%]\n1 passed in 11.78s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 9.97,
+      "duration_s": 14.633,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -1815,7 +1815,7 @@
       "family": "TX",
       "title": "Shadow discard leaves reality untouched; commit requires verification",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -1834,18 +1834,18 @@
             "tests/unit/shadow/test_shadow_and_worldstate.py::test_commit_requires_verified_branch"
           ],
           "exit_code": 0,
-          "duration_s": 5.808,
-          "tail": "..                                                                       [100%]\n2 passed in 4.13s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 8.525,
+          "tail": "..                                                                       [100%]\n2 passed in 6.32s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 5.808,
+      "duration_s": 8.525,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -1862,7 +1862,7 @@
       "family": "TX",
       "title": "Shadow diffs detect same-size content edits and conflicts",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -1881,18 +1881,18 @@
             "tests/unit/shadow/test_shadow_manifest.py::test_shadow_conflict_rejects_same_size_concurrent_edit"
           ],
           "exit_code": 0,
-          "duration_s": 2.074,
+          "duration_s": 2.204,
           "tail": "..                                                                       [100%]\n2 passed in 0.28s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.074,
+      "duration_s": 2.204,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -1909,7 +1909,7 @@
       "family": "TX",
       "title": "Effect contracts are truthful: routing, WAL-before-effect, reversibility",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -1932,18 +1932,18 @@
             "tests/unit/capabilities/test_fs_mutations.py::test_delete_snapshot_failure_is_not_reversible"
           ],
           "exit_code": 0,
-          "duration_s": 2.805,
-          "tail": "....                                                                     [100%]\n4 passed in 0.94s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 3.706,
+          "tail": "....                                                                     [100%]\n4 passed in 1.28s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.805,
+      "duration_s": 3.706,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -1960,7 +1960,7 @@
       "family": "TX",
       "title": "Failed/invalidated experiments are discarded, never committed",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -1979,18 +1979,18 @@
             "tests/unit/fusion/test_orchestrator.py::test_invariant_violation_blocks_commit"
           ],
           "exit_code": 0,
-          "duration_s": 8.415,
-          "tail": "..                                                                       [100%]\n2 passed in 6.56s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 10.475,
+          "tail": "..                                                                       [100%]\n2 passed in 7.97s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 8.415,
+      "duration_s": 10.475,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -2007,7 +2007,7 @@
       "family": "TX",
       "title": "Service control uses durable prepare/apply/verify/compensate receipts",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -2028,18 +2028,18 @@
             "tests/unit/capabilities/test_effect_routing.py::test_service_transaction_phases_have_exact_external_effect_contracts"
           ],
           "exit_code": 0,
-          "duration_s": 2.272,
-          "tail": "...                                                                      [100%]\n3 passed in 0.41s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 2.917,
+          "tail": "...                                                                      [100%]\n3 passed in 0.80s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.272,
+      "duration_s": 2.917,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -2057,7 +2057,7 @@
       "family": "TX",
       "title": "Database writes use durable idempotent reversible receipts",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -2080,18 +2080,18 @@
             "tests/unit/capabilities/test_effect_routing.py::test_database_transaction_phases_have_exact_external_effect_contracts"
           ],
           "exit_code": 0,
-          "duration_s": 1.937,
-          "tail": "....                                                                     [100%]\n4 passed in 0.44s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 8.591,
+          "tail": "....                                                                     [100%]\n4 passed in 3.45s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 1.937,
+      "duration_s": 8.591,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -2109,7 +2109,7 @@
       "family": "TX",
       "title": "HTTP external effects distinguish apply, recovery, and compensation proof",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -2132,18 +2132,18 @@
             "tests/unit/capabilities/test_environment.py::test_reconstructed_http_capability_refuses_apply_after_crash"
           ],
           "exit_code": 0,
-          "duration_s": 1.831,
-          "tail": "....                                                                     [100%]\n4 passed in 0.30s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 7.127,
+          "tail": "....                                                                     [100%]\n4 passed in 1.19s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 1.831,
+      "duration_s": 7.128,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -2161,7 +2161,7 @@
       "family": "FORK",
       "title": "Fork creates a new task with causal metadata; unknown task rejected",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -2180,18 +2180,18 @@
             "tests/unit/causal/test_fork_checkpoint.py::test_fork_unknown_task_raises"
           ],
           "exit_code": 0,
-          "duration_s": 4.712,
-          "tail": "..                                                                       [100%]\n2 passed in 2.48s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 11.149,
+          "tail": "..                                                                       [100%]\n2 passed in 7.65s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 4.712,
+      "duration_s": 11.149,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -2208,7 +2208,7 @@
       "family": "FORK",
       "title": "Checkpoint capture/restore with concurrent-change rejection",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -2229,18 +2229,18 @@
             "tests/unit/causal/test_fork_checkpoint.py::test_checkpoint_materialize_creates_independent_workspace"
           ],
           "exit_code": 0,
-          "duration_s": 3.546,
-          "tail": "...                                                                      [100%]\n3 passed in 2.03s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 8.578,
+          "tail": "...                                                                      [100%]\n3 passed in 4.62s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 3.546,
+      "duration_s": 8.578,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -2257,7 +2257,7 @@
       "family": "FORK",
       "title": "Fusion forks from events with checkpoints and speculative cleanup",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -2276,18 +2276,18 @@
             "tests/unit/causal/test_fork_checkpoint.py::test_fork_task_creation_failure_removes_speculative_session"
           ],
           "exit_code": 0,
-          "duration_s": 4.463,
-          "tail": "..                                                                       [100%]\n2 passed in 2.92s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 9.816,
+          "tail": "..                                                                       [100%]\n2 passed in 6.94s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 4.463,
+      "duration_s": 9.816,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -2304,7 +2304,7 @@
       "family": "ENV",
       "title": "Environment capability gates database access on workspace context",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -2323,18 +2323,18 @@
             "tests/unit/capabilities/test_environment.py::test_database_read_connection_cannot_attach_or_mutate"
           ],
           "exit_code": 0,
-          "duration_s": 1.703,
-          "tail": "..                                                                       [100%]\n2 passed in 0.19s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 5.353,
+          "tail": "..                                                                       [100%]\n2 passed in 0.65s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 1.703,
+      "duration_s": 5.353,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -2351,7 +2351,7 @@
       "family": "ENV",
       "title": "Project adaptation: skills discovered from environment are injected",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -2368,18 +2368,18 @@
             "tests/integration/test_skill_injection.py::test_skill_injected_when_trigger_in_objective"
           ],
           "exit_code": 0,
-          "duration_s": 3.611,
-          "tail": ".                                                                        [100%]\n1 passed in 1.38s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 8.633,
+          "tail": ".                                                                        [100%]\n1 passed in 3.65s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 3.611,
+      "duration_s": 8.633,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -2396,7 +2396,7 @@
       "family": "ENV",
       "title": "Watch capability observes filesystem/process reality truthfully",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -2415,18 +2415,18 @@
             "tests/unit/capabilities/test_watch.py::test_process_exit_observation_is_one_shot_and_truthful"
           ],
           "exit_code": 0,
-          "duration_s": 2.448,
+          "duration_s": 2.826,
           "tail": "..                                                                       [100%]\n2 passed in 0.66s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.448,
+      "duration_s": 2.826,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -2443,7 +2443,7 @@
       "family": "RECOVERY",
       "title": "Running tasks recover after hard kill; parallelism is real",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -2462,18 +2462,18 @@
             "tests/crash/test_hard_crash_recovery.py::test_worker_parallelism_real"
           ],
           "exit_code": 0,
-          "duration_s": 28.507,
-          "tail": "..                                                                       [100%]\n2 passed in 26.74s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 31.524,
+          "tail": "..                                                                       [100%]\n2 passed in 29.43s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 28.507,
+      "duration_s": 31.524,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -2490,7 +2490,7 @@
       "family": "RECOVERY",
       "title": "Task states reconcile truthfully across restart",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -2511,18 +2511,18 @@
             "tests/crash/test_task_recovery.py::test_mutation_intent_wal_survives_crash"
           ],
           "exit_code": 0,
-          "duration_s": 18.65,
-          "tail": "...                                                                      [100%]\n3 passed in 16.84s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 23.425,
+          "tail": "...                                                                      [100%]\n3 passed in 21.81s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 18.65,
+      "duration_s": 23.425,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -2539,9 +2539,9 @@
       "family": "RECOVERY",
       "title": "Scheduler occurrences reconcile on restart; no double fire",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
-      "status": "failed",
+      "status": "passed",
       "evidence": [
         {
           "kind": "pytest",
@@ -2557,19 +2557,19 @@
             "tests/crash/test_scheduler_recovery.py::test_claimed_occurrence_reconciled_to_fired_on_restart",
             "tests/crash/test_scheduler_recovery.py::test_job_not_fired_before_stop_fires_after_restart"
           ],
-          "exit_code": 1,
-          "duration_s": 5.485,
-          "tail": "=========================\n______________ test_job_not_fired_before_stop_fires_after_restart ______________\n\nmake_durable_service = <function make_durable_service.<locals>.make at 0x72af2f07aa20>\ndurable_db_path = '/tmp/athena-db-x6ypsivn/athena.db'\n\n    async def test_job_not_fired_before_stop_fires_after_restart(make_durable_service, durable_db_path):\n        \"\"\"A scheduled job stopped before firing runs normally after restart.\"\"\"\n        job_id = \"job-never-fired\"\n        due = _due_iso()\n        token = new_id(\"session\")\n    \n        svc1 = await make_durable_service(durable_db_path, scripts=None)\n        await svc1._store_schedules.upsert_job(\n            job_id,\n            \"never-fired\",\n            payload={\n                \"template\": {\"objective\": \"SCHED_FIRED_OK\", \"session_id\": token},\n            },\n            trigger_spec={\"type\": \"once\", \"at\": due},\n            enabled=True,\n            next_run=due,\n        )\n        await svc1.stop()  # stopped before it fired\n    \n        assert await _read_run(durable_db_path, job_id) is None\n    \n        svc2 = await make_durable_service(durable_db_path, scripts=None)\n        fired = await svc2._scheduler.tick()\n        assert fired == 1\n        run = await _read_run(durable_db_path, job_id)\n        assert run is not None\n        assert run[\"status\"] == \"FIRED\", run[\"status\"]\n        assert run[\"task_id\"], \"fired occurrence missing a linked task\"\n        status = await svc2.get_task_status(run[\"task_id\"])\n>       assert status in (\n            TaskStatus.COMPLETE.value,\n            TaskStatus.RUNNING.value,\n            TaskStatus.QUEUED.value,\n        ), status\nE       AssertionError: FAILED\nE       assert 'FAILED' in ('COMPLETE', 'RUNNING', 'QUEUED')\n\ntests/crash/test_scheduler_recovery.py:111: AssertionError\n=========================== short test summary info ============================\nFAILED tests/crash/test_scheduler_recovery.py::test_job_not_fired_before_stop_fires_after_restart\n1 failed, 1 passed in 4.32s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "exit_code": 0,
+          "duration_s": 8.05,
+          "tail": "..                                                                       [100%]\n2 passed in 6.33s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 5.485,
+      "duration_s": 8.051,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -2586,7 +2586,7 @@
       "family": "RECOVERY",
       "title": "External effects fail closed on restart and remain explicitly recoverable",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -2607,18 +2607,18 @@
             "tests/unit/state/test_external_effects.py::test_recovery_provenance_survives_durable_restart"
           ],
           "exit_code": 0,
-          "duration_s": 3.111,
-          "tail": ".....                                                                    [100%]\n5 passed in 0.96s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 2.688,
+          "tail": ".....                                                                    [100%]\n5 passed in 0.60s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 3.111,
+      "duration_s": 2.688,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -2635,7 +2635,7 @@
       "family": "PROJECTION",
       "title": "OI viewer renders events to configured output, never process stdout",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -2654,18 +2654,18 @@
             "tests/unit/cli/test_oi_stream.py::test_oi_viewer_does_not_write_to_process_stdout"
           ],
           "exit_code": 0,
-          "duration_s": 1.852,
-          "tail": "..                                                                       [100%]\n2 passed in 0.20s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 2.138,
+          "tail": "..                                                                       [100%]\n2 passed in 0.45s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 1.852,
+      "duration_s": 2.138,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -2682,7 +2682,7 @@
       "family": "PROJECTION",
       "title": "CLI surface groups code/runtime output and shares the execution surface",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -2701,18 +2701,18 @@
             "tests/unit/cli/test_surface.py::test_direct_shell_escape_uses_the_same_execution_surface"
           ],
           "exit_code": 0,
-          "duration_s": 2.116,
-          "tail": "..                                                                       [100%]\n2 passed in 0.40s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 3.36,
+          "tail": "..                                                                       [100%]\n2 passed in 0.48s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.116,
+      "duration_s": 3.36,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -2729,7 +2729,7 @@
       "family": "PROJECTION",
       "title": "Operator API views project consistent read-only snapshots",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -2750,18 +2750,18 @@
             "tests/unit/service/test_operator_views.py::test_operator_artifacts_empty"
           ],
           "exit_code": 0,
-          "duration_s": 3.977,
-          "tail": "...                                                                      [100%]\n3 passed in 2.48s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 6.606,
+          "tail": "...                                                                      [100%]\n3 passed in 4.75s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 3.977,
+      "duration_s": 6.606,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -2778,9 +2778,9 @@
       "family": "VHS",
       "title": "Demo render publishes a validated gif or a documented failure code",
       "required": false,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
-      "status": "skipped",
+      "status": "passed",
       "evidence": [
         {
           "kind": "probe",
@@ -2788,20 +2788,20 @@
             "scripts/render-demo",
             "capability_fabric"
           ],
-          "exit_code": 2,
-          "duration_s": 0.066,
-          "tail": "render-demo: tape=demos/capability_fabric.tape timeout=600s temp=demos/.capability_fabric.F45JTA.gif\nerror connecting to /tmp/tmux-1000/athena-vhs-6688 (Operation not permitted)\nrender-demo: could not create the VHS PTY session\nrender-demo: vhs exited rc=2 after 0s\nrender-demo: renderer/PTY unavailable; previous demos/capability_fabric.gif is preserved\n",
-          "probe_exit": "tool-or-argument-error",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "exit_code": 0,
+          "duration_s": 502.696,
+          "tail": "render-demo: tape=demos/capability_fabric.tape timeout=600s temp=demos/.capability_fabric.YttD4O.gif\nrender-demo: vhs exited rc=0 after 501s\nrender-demo: validated demos/.capability_fabric.YttD4O.gif \u2014 1280x720, 93.520s, 2338 frames\nrender-demo: published demos/capability_fabric.gif\n",
+          "probe_exit": "success",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 0.066,
+      "duration_s": 502.698,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -2819,7 +2819,7 @@
       "family": "VHS",
       "title": "Demo driver consumes the generated-capability fabric fixtures",
       "required": false,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -2836,18 +2836,18 @@
             "tests/unit/capabilities/test_synthesis_capability.py::test_synthesis_create_uses_canonical_dispatcher"
           ],
           "exit_code": 0,
-          "duration_s": 2.171,
-          "tail": ".                                                                        [100%]\n1 passed in 0.63s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 1.788,
+          "tail": ".                                                                        [100%]\n1 passed in 0.60s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.171,
+      "duration_s": 1.788,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -2865,7 +2865,7 @@
       "family": "VHS",
       "title": "GIF artifact validation itself is byte-correct",
       "required": false,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -2888,18 +2888,18 @@
             "tests/unit/scripts/test_render_demo_validation.py::test_published_demo_gif_has_correct_header"
           ],
           "exit_code": 0,
-          "duration_s": 1.81,
-          "tail": "....                                                                     [100%]\n4 passed in 0.29s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 2.466,
+          "tail": "....                                                                     [100%]\n4 passed in 0.16s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 1.81,
+      "duration_s": 2.466,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -2917,7 +2917,7 @@
       "family": "CONTEXT",
       "title": "Compression stays within budget and covers complete omitted ranges",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -2936,18 +2936,18 @@
             "tests/unit/context/test_compression.py::test_long_summary_maps_complete_range_before_reducing"
           ],
           "exit_code": 0,
-          "duration_s": 1.815,
-          "tail": "..                                                                       [100%]\n2 passed in 0.30s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 2.864,
+          "tail": "..                                                                       [100%]\n2 passed in 0.72s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 1.815,
+      "duration_s": 2.864,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -2964,7 +2964,7 @@
       "family": "CONTEXT",
       "title": "Durable digest survives restart and preserves evidence semantics",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -2983,18 +2983,18 @@
             "tests/unit/context/test_digest.py::test_digest_builder_requires_evidence_for_decisions_and_completed_work"
           ],
           "exit_code": 0,
-          "duration_s": 2.065,
-          "tail": "..                                                                       [100%]\n2 passed in 0.55s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 5.643,
+          "tail": "..                                                                       [100%]\n2 passed in 1.18s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.065,
+      "duration_s": 5.643,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -3011,7 +3011,7 @@
       "family": "MEMORY",
       "title": "Promoted memory retains canonical scope and metadata",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -3030,18 +3030,18 @@
             "tests/unit/service/test_knowledge_wiring.py::test_completed_task_records_episodic_memory"
           ],
           "exit_code": 0,
-          "duration_s": 4.408,
-          "tail": "..                                                                       [100%]\n2 passed in 2.70s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 5.884,
+          "tail": "..                                                                       [100%]\n2 passed in 3.01s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 4.408,
+      "duration_s": 5.884,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -3058,7 +3058,7 @@
       "family": "MEMORY",
       "title": "Learned conclusions retain evidence and require review",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -3077,18 +3077,18 @@
             "tests/unit/skills/test_candidate_lifecycle.py::test_skill_candidate_survives_restart_and_requires_explicit_promotion"
           ],
           "exit_code": 0,
-          "duration_s": 2.306,
-          "tail": "..                                                                       [100%]\n2 passed in 0.93s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 4.244,
+          "tail": "..                                                                       [100%]\n2 passed in 1.92s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.306,
+      "duration_s": 4.244,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -3105,7 +3105,7 @@
       "family": "HISTORY",
       "title": "Principal history search returns source-session provenance",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -3124,18 +3124,18 @@
             "tests/unit/state/test_session_search.py::test_search_finds_historical_turn_by_content"
           ],
           "exit_code": 0,
-          "duration_s": 2.331,
-          "tail": "..                                                                       [100%]\n2 passed in 0.80s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 4.32,
+          "tail": "..                                                                       [100%]\n2 passed in 0.86s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.331,
+      "duration_s": 4.32,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -3152,7 +3152,7 @@
       "family": "HISTORY",
       "title": "Historical transcript search cannot cross principal ownership",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -3171,18 +3171,18 @@
             "tests/unit/state/test_session_search.py::test_search_never_matches_unscoped"
           ],
           "exit_code": 0,
-          "duration_s": 2.17,
-          "tail": "..                                                                       [100%]\n2 passed in 0.81s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 3.349,
+          "tail": "..                                                                       [100%]\n2 passed in 0.85s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.17,
+      "duration_s": 3.349,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -3199,7 +3199,7 @@
       "family": "PRINCIPAL",
       "title": "Configured namespace controls cache and service ownership",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -3218,18 +3218,18 @@
             "tests/unit/kernel/test_kernel_loop.py::test_cache_namespace_uses_compiler_identity_not_public_task_metadata"
           ],
           "exit_code": 0,
-          "duration_s": 2.099,
-          "tail": "..                                                                       [100%]\n2 passed in 0.54s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 2.99,
+          "tail": "..                                                                       [100%]\n2 passed in 1.40s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.099,
+      "duration_s": 2.99,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -3246,7 +3246,7 @@
       "family": "PRINCIPAL",
       "title": "Principal ownership is enforced in durable session state",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -3265,18 +3265,18 @@
             "tests/unit/state/test_session_search.py::test_principal_history_search_and_anchor_read_are_host_scoped"
           ],
           "exit_code": 0,
-          "duration_s": 2.628,
-          "tail": "..                                                                       [100%]\n2 passed in 0.79s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 4.974,
+          "tail": "..                                                                       [100%]\n2 passed in 1.54s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.628,
+      "duration_s": 4.975,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -3293,7 +3293,7 @@
       "family": "PRINCIPAL",
       "title": "Durable user state survives restart without crossing principals",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -3310,18 +3310,18 @@
             "tests/e2e/test_principal_isolation.py::test_user_scoped_state_isolated_across_service_restarts"
           ],
           "exit_code": 0,
-          "duration_s": 5.853,
-          "tail": ".                                                                        [100%]\n1 passed in 3.97s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 15.796,
+          "tail": ".                                                                        [100%]\n1 passed in 12.35s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 5.853,
+      "duration_s": 15.797,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -3339,9 +3339,9 @@
       "family": "RESEARCH",
       "title": "Research runs through capture, evidence, verification, and bundle",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
-      "status": "failed",
+      "status": "passed",
       "evidence": [
         {
           "kind": "pytest",
@@ -3359,19 +3359,19 @@
             "tests/unit/research/test_research_fabric.py::test_run_composes_objective_capture_search_evidence_and_verification",
             "tests/unit/research/test_research_fabric.py::test_plan_assess_and_bundle_require_verified_evidence"
           ],
-          "exit_code": 1,
-          "duration_s": 2.062,
-          "tail": "100%]\n=================================== FAILURES ===================================\n_______ test_local_research_discover_capture_evidence_and_contradiction ________\n\ntmp_path = PosixPath('/tmp/pytest-of-bamn/pytest-783/test_local_research_discover_c0')\n\n    @pytest.mark.dsh_release\n    @pytest.mark.athena_evidence(\"e2e\", \"security\")\n    @pytest.mark.asyncio\n    async def test_local_research_discover_capture_evidence_and_contradiction(tmp_path):\n>       server = ThreadingHTTPServer((\"127.0.0.1\", 0), _ResearchFixtureHandler)\n                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\ntests/e2e/test_research_journey.py:58: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ \n/usr/lib/python3.12/socketserver.py:453: in __init__\n    self.socket = socket.socket(self.address_family,\n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ \n\nself = <socket.socket fd=-1, family=0, type=0, proto=0>\nfamily = <AddressFamily.AF_INET: 2>, type = <SocketKind.SOCK_STREAM: 1>\nproto = 0, fileno = None\n\n    def __init__(self, family=-1, type=-1, proto=-1, fileno=None):\n        # For user code address family and type values are IntEnum members, but\n        # for the underlying _socket.socket they're just integers. The\n        # constructor of _socket.socket converts the given argument to an\n        # integer automatically.\n        if fileno is None:\n            if family == -1:\n                family = AF_INET\n            if type == -1:\n                type = SOCK_STREAM\n            if proto == -1:\n                proto = 0\n>       _socket.socket.__init__(self, family, type, proto, fileno)\nE       PermissionError: [Errno 1] Operation not permitted\n\n/usr/lib/python3.12/socket.py:233: PermissionError\n=========================== short test summary info ============================\nFAILED tests/e2e/test_research_journey.py::test_local_research_discover_capture_evidence_and_contradiction\n1 failed, 2 passed in 0.41s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "exit_code": 0,
+          "duration_s": 5.657,
+          "tail": "...                                                                      [100%]\n3 passed in 1.84s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.062,
+      "duration_s": 5.657,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -3388,7 +3388,7 @@
       "family": "RESEARCH",
       "title": "Discovery providers are policy-filtered and provenance-preserving",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -3407,18 +3407,18 @@
             "tests/unit/research/test_discovery_provider.py::test_http_discovery_provider_rechecks_resolved_addresses"
           ],
           "exit_code": 0,
-          "duration_s": 2.227,
-          "tail": "..                                                                       [100%]\n2 passed in 0.46s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 5.129,
+          "tail": "..                                                                       [100%]\n2 passed in 0.82s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.227,
+      "duration_s": 5.129,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -3435,7 +3435,7 @@
       "family": "BROWSER",
       "title": "Browser state persists across navigation and interaction calls",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -3454,18 +3454,18 @@
             "tests/unit/capabilities/test_interaction_packs.py::test_browser_preserves_state_per_task_until_shutdown"
           ],
           "exit_code": 0,
-          "duration_s": 2.211,
-          "tail": "..                                                                       [100%]\n2 passed in 0.31s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 6.664,
+          "tail": "..                                                                       [100%]\n2 passed in 0.71s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.211,
+      "duration_s": 6.664,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -3482,7 +3482,7 @@
       "family": "BROWSER",
       "title": "Restricted browser navigation and subresources fail closed",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -3501,18 +3501,18 @@
             "tests/unit/network/test_target_policy.py::test_playwright_driver_policy_intercepts_private_subresources"
           ],
           "exit_code": 0,
-          "duration_s": 1.837,
-          "tail": "..                                                                       [100%]\n2 passed in 0.34s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 4.265,
+          "tail": "..                                                                       [100%]\n2 passed in 0.62s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 1.837,
+      "duration_s": 4.265,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -3529,7 +3529,7 @@
       "family": "COMPUTER",
       "title": "Computer observe persists a PNG artifact and model reference",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -3548,18 +3548,18 @@
             "tests/unit/capabilities/test_interaction_packs.py::test_visual_result_transcript_keeps_reference_without_pixels"
           ],
           "exit_code": 0,
-          "duration_s": 2.165,
-          "tail": "..                                                                       [100%]\n2 passed in 0.41s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 5.332,
+          "tail": "..                                                                       [100%]\n2 passed in 1.03s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.165,
+      "duration_s": 5.332,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -3576,7 +3576,7 @@
       "family": "COMPUTER",
       "title": "Computer health reports unavailable backends honestly",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -3595,18 +3595,18 @@
             "tests/unit/capabilities/test_interaction_packs.py::test_computer_drives_backend_and_reports_shape"
           ],
           "exit_code": 0,
-          "duration_s": 2.954,
-          "tail": "..                                                                       [100%]\n2 passed in 0.36s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 5.891,
+          "tail": "..                                                                       [100%]\n2 passed in 1.46s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.954,
+      "duration_s": 5.891,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -3623,9 +3623,9 @@
       "family": "MCP",
       "title": "Stdio MCP transport discovers, calls, closes, and reconnects",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
-      "status": "failed",
+      "status": "passed",
       "evidence": [
         {
           "kind": "pytest",
@@ -3639,19 +3639,19 @@
           "nodeids": [
             "tests/e2e/test_mcp_transport.py::test_mcp_stdio_transport_discovers_calls_and_reconnects"
           ],
-          "exit_code": 1,
-          "duration_s": 35.579,
-          "tail": "        server_params = make_stdio_parameters(\n                        sdk,\n                        command=_require_str(self.command),\n                        args=self.args,\n                        env=self.env if self.env else None,\n                        cwd=self.cwd,\n                    )\n                    stdio_ctx = make_stdio_context(sdk, server_params)\n                    read, write = await self._bounded(stack.enter_async_context(stdio_ctx))\n                session = await self._bounded(\n                    stack.enter_async_context(make_session(sdk, read, write))\n                )\n                await self._bounded(session.initialize())\n                self._session = session\n                self._exit_stack = stack\n                self._connected = True\n                self._last_error = None\n                self._connected_at = datetime.now(timezone.utc).isoformat()\n                self._last_successful_connection = self._connected_at\n                return self\n        except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 - normalize transport failures\n            try:\n                await self._bounded(stack.aclose())\n            except Exception:  # noqa: BLE001 - close is best effort after transport failure\n                pass\n            self._session = None\n            self._exit_stack = None\n            self._connected = False\n            self._last_error = \"transport connection failed\"\n>           raise MCPError(\n                f\"failed to connect to MCP server {self.connection_id!r}: \"\n                \"transport error or server unavailable\"\n            ) from exc\nE           athena.protocol.errors.MCPError: failed to connect to MCP server 'fixture-stdio': transport error or server unavailable\n\nsrc/athena/mcp/client.py:267: MCPError\n=========================== short test summary info ============================\nFAILED tests/e2e/test_mcp_transport.py::test_mcp_stdio_transport_discovers_calls_and_reconnects\n1 failed in 33.67s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "exit_code": 0,
+          "duration_s": 5.546,
+          "tail": "s                                                                        [100%]\n1 skipped in 0.45s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 35.579,
+      "duration_s": 5.546,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -3668,7 +3668,7 @@
       "family": "MCP",
       "title": "MCP annotations cannot downgrade conservative network effects",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -3685,18 +3685,18 @@
             "tests/unit/mcp/test_adapter.py::test_malicious_annotations_cannot_downgrade_effects"
           ],
           "exit_code": 0,
-          "duration_s": 2.333,
-          "tail": ".                                                                        [100%]\n1 passed in 0.29s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 3.183,
+          "tail": ".                                                                        [100%]\n1 passed in 0.71s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.333,
+      "duration_s": 3.183,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -3713,7 +3713,7 @@
       "family": "SKILL",
       "title": "Relevant skills are selected by the deterministic selector",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -3730,18 +3730,18 @@
             "tests/unit/skills/test_selector.py::test_selector_ranks_by_keyword_match"
           ],
           "exit_code": 0,
-          "duration_s": 2.237,
-          "tail": ".                                                                        [100%]\n1 passed in 0.28s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 4.633,
+          "tail": ".                                                                        [100%]\n1 passed in 0.99s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.238,
+      "duration_s": 4.633,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -3758,7 +3758,7 @@
       "family": "SKILL",
       "title": "Skill candidates survive restart and require explicit promotion",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -3775,18 +3775,18 @@
             "tests/unit/skills/test_candidate_lifecycle.py::test_skill_candidate_survives_restart_and_requires_explicit_promotion"
           ],
           "exit_code": 0,
-          "duration_s": 2.298,
-          "tail": ".                                                                        [100%]\n1 passed in 0.58s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 4.508,
+          "tail": ".                                                                        [100%]\n1 passed in 1.03s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.298,
+      "duration_s": 4.508,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -3803,7 +3803,7 @@
       "family": "DELEGATION",
       "title": "Delegated children inherit explicit lineage and budgets",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -3822,18 +3822,18 @@
             "tests/unit/tasks/test_delegation_unit.py::test_child_budget_derived_from_parent"
           ],
           "exit_code": 0,
-          "duration_s": 3.887,
-          "tail": "..                                                                       [100%]\n2 passed in 1.51s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 5.506,
+          "tail": "..                                                                       [100%]\n2 passed in 1.95s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 3.887,
+      "duration_s": 5.506,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -3850,7 +3850,7 @@
       "family": "DELEGATION",
       "title": "Delegation refuses unsafe depth and preserves ownership",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -3869,18 +3869,18 @@
             "tests/unit/tasks/test_delegation_unit.py::test_max_child_depth_blocks_grandchildren"
           ],
           "exit_code": 0,
-          "duration_s": 3.084,
-          "tail": "..                                                                       [100%]\n2 passed in 0.84s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 4.818,
+          "tail": "..                                                                       [100%]\n2 passed in 1.28s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 3.084,
+      "duration_s": 4.818,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -3897,7 +3897,7 @@
       "family": "SCHEDULE",
       "title": "A due occurrence is admitted before its fired claim",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -3914,18 +3914,18 @@
             "tests/unit/scheduler/test_scheduler_reconciliation.py::test_reconcile_enqueues_created_occurrence_before_firing_claim"
           ],
           "exit_code": 0,
-          "duration_s": 2.352,
-          "tail": ".                                                                        [100%]\n1 passed in 0.64s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 5.748,
+          "tail": ".                                                                        [100%]\n1 passed in 1.14s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.352,
+      "duration_s": 5.749,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -3942,7 +3942,7 @@
       "family": "SCHEDULE",
       "title": "Schedule API enforces owner visibility and durable round trips",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -3959,18 +3959,18 @@
             "tests/unit/capabilities/test_schedule_capability.py::test_schedule_api_round_trips_jobs_and_enforces_owner_visibility"
           ],
           "exit_code": 0,
-          "duration_s": 2.701,
-          "tail": ".                                                                        [100%]\n1 passed in 0.85s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 2.865,
+          "tail": ".                                                                        [100%]\n1 passed in 1.52s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.701,
+      "duration_s": 2.865,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -3987,7 +3987,7 @@
       "family": "RUNTIME",
       "title": "Runtime sessions persist backend, runtime, and identity separately",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -4006,18 +4006,18 @@
             "tests/unit/execution/test_execution_cancellation.py::test_real_execution_manager_preserves_remaining_session_for_retry"
           ],
           "exit_code": 0,
-          "duration_s": 2.368,
-          "tail": "..                                                                       [100%]\n2 passed in 0.55s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 4.585,
+          "tail": "..                                                                       [100%]\n2 passed in 0.82s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.368,
+      "duration_s": 4.585,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -4034,7 +4034,7 @@
       "family": "RUNTIME",
       "title": "Container runtime identity is bounded by workspace and network policy",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -4053,18 +4053,18 @@
             "tests/unit/execution/test_container.py::test_container_reattach_proves_identity_and_rejects_tampering"
           ],
           "exit_code": 0,
-          "duration_s": 2.069,
-          "tail": "..                                                                       [100%]\n2 passed in 0.31s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 2.942,
+          "tail": "..                                                                       [100%]\n2 passed in 0.21s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.069,
+      "duration_s": 2.942,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -4081,7 +4081,7 @@
       "family": "PROOF",
       "title": "Real service/runtime/memory/schedule/reality product proof",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -4092,19 +4092,19 @@
             "scripts/functional-proof"
           ],
           "exit_code": 0,
-          "duration_s": 29.451,
-          "tail": "......                                                                   [100%]\n6 passed in 27.11s\n",
+          "duration_s": 44.596,
+          "tail": "......                                                                   [100%]\n6 passed in 41.41s\n",
           "probe_exit": "success",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 29.451,
+      "duration_s": 44.599,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -4122,9 +4122,9 @@
       "family": "PROOF",
       "title": "Installed artifact acceptance exercises the public application surface",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
-      "status": "failed",
+      "status": "passed",
       "evidence": [
         {
           "kind": "pytest",
@@ -4138,19 +4138,19 @@
           "nodeids": [
             "tests/e2e/test_release_black_box.py::test_installed_artifacts_cover_application_entry_paths"
           ],
-          "exit_code": 1,
-          "duration_s": 23.391,
-          "tail": " the permissions and owner of that directory. If executing pip with sudo, you should use sudo's -H flag.\nWARNING: Retrying (Retry(total=4, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError('<pip._vendor.urllib3.connection.HTTPSConnection object at 0x7472afb0c2f0>: Failed to establish a new connection: [Errno -2] Name or service not known')': /simple/httpx/\nWARNING: Retrying (Retry(total=3, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError('<pip._vendor.urllib3.connection.HTTPSConnection object at 0x7472afb0cad0>: Failed to establish a new connection: [Errno -2] Name or service not known')': /simple/httpx/\nWARNING: Retrying (Retry(total=2, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError('<pip._vendor.urllib3.connection.HTTPSConnection object at 0x7472afaf4530>: Failed to establish a new connection: [Errno -2] Name or service not known')': /simple/httpx/\nWARNING: Retrying (Retry(total=1, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError('<pip._vendor.urllib3.connection.HTTPSConnection object at 0x7472afaf6d80>: Failed to establish a new connection: [Errno -2] Name or service not known')': /simple/httpx/\nWARNING: Retrying (Retry(total=0, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError('<pip._vendor.urllib3.connection.HTTPSConnection object at 0x7472afb0cda0>: Failed to establish a new connection: [Errno -2] Name or service not known')': /simple/httpx/\nERROR: Could not find a version that satisfies the requirement httpx>=0.27 (from athena-agent) (from versions: none)\nERROR: No matching distribution found for httpx>=0.27\n=========================== short test summary info ============================\nFAILED tests/e2e/test_release_black_box.py::test_installed_artifacts_cover_application_entry_paths\n1 failed in 21.58s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "exit_code": 0,
+          "duration_s": 80.645,
+          "tail": ".                                                                        [100%]\n1 passed in 78.61s (0:01:18)\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 23.391,
+      "duration_s": 80.645,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -4168,7 +4168,7 @@
       "family": "REALITY",
       "title": "Reality classification is deterministic and explainable",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -4185,18 +4185,18 @@
             "tests/unit/reality/test_beta_contracts.py::test_reality_classifier_is_deterministic_and_explainable"
           ],
           "exit_code": 0,
-          "duration_s": 1.858,
-          "tail": ".                                                                        [100%]\n1 passed in 0.28s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 2.367,
+          "tail": ".                                                                        [100%]\n1 passed in 0.20s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 1.858,
+      "duration_s": 2.367,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -4213,7 +4213,7 @@
       "family": "REALITY",
       "title": "Verified candidate completion commits through the canonical path",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -4232,18 +4232,18 @@
             "tests/unit/capabilities/test_reality_integrity.py::test_internal_preimage_cas_refuses_stale_write"
           ],
           "exit_code": 0,
-          "duration_s": 10.427,
-          "tail": "..                                                                       [100%]\n2 passed in 8.87s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 7.306,
+          "tail": "..                                                                       [100%]\n2 passed in 5.83s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 10.427,
+      "duration_s": 7.307,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -4260,7 +4260,7 @@
       "family": "REALITY",
       "title": "Verification failure cannot complete or leak a candidate",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -4277,18 +4277,18 @@
             "tests/unit/capabilities/test_reality_coordinator.py::test_unverified_candidate_yields_partial_not_complete"
           ],
           "exit_code": 0,
-          "duration_s": 4.881,
-          "tail": ".                                                                        [100%]\n1 passed in 3.18s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 3.913,
+          "tail": ".                                                                        [100%]\n1 passed in 2.02s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 4.881,
+      "duration_s": 3.913,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -4305,7 +4305,7 @@
       "family": "REALITY",
       "title": "Stale verification certificates fail closed",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -4322,18 +4322,18 @@
             "tests/unit/shadow/test_commit_discard.py::test_commit_through_ask_profile_suspends_instead_of_auto_approving"
           ],
           "exit_code": 0,
-          "duration_s": 10.44,
-          "tail": ".                                                                        [100%]\n1 passed in 7.65s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 7.037,
+          "tail": ".                                                                        [100%]\n1 passed in 5.90s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 10.44,
+      "duration_s": 7.037,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -4350,7 +4350,7 @@
       "family": "REALITY",
       "title": "Complete-base drift retains the candidate and preserves reality",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -4367,18 +4367,18 @@
             "tests/unit/shadow/test_commit_discard.py::test_commit_returns_conflict_when_reality_drifted"
           ],
           "exit_code": 0,
-          "duration_s": 9.284,
-          "tail": ".                                                                        [100%]\n1 passed in 6.53s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 6.974,
+          "tail": ".                                                                        [100%]\n1 passed in 5.43s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 9.284,
+      "duration_s": 6.974,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -4395,7 +4395,7 @@
       "family": "REALITY",
       "title": "Active candidate branches rehydrate after restart",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -4412,18 +4412,18 @@
             "tests/unit/shadow/test_shadow_manifest.py::test_shadow_branch_metadata_survives_engine_restart"
           ],
           "exit_code": 0,
-          "duration_s": 3.855,
-          "tail": ".                                                                        [100%]\n1 passed in 1.68s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 3.228,
+          "tail": ".                                                                        [100%]\n1 passed in 1.00s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 3.855,
+      "duration_s": 3.228,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -4440,7 +4440,7 @@
       "family": "REALITY",
       "title": "Interrupted commits become explicit recovery state",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -4457,18 +4457,18 @@
             "tests/unit/shadow/test_shadow_manifest.py::test_interrupted_commit_reconciles_without_guessing_outcome"
           ],
           "exit_code": 0,
-          "duration_s": 3.089,
-          "tail": ".                                                                        [100%]\n1 passed in 0.85s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 2.485,
+          "tail": ".                                                                        [100%]\n1 passed in 0.72s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 3.09,
+      "duration_s": 2.485,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -4485,7 +4485,7 @@
       "family": "REALITY",
       "title": "Restart refuses finalization after proven workspace drift",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -4502,18 +4502,18 @@
             "tests/unit/reality/test_beta_contracts.py::test_restart_completion_refuses_final_workspace_drift"
           ],
           "exit_code": 0,
-          "duration_s": 2.111,
-          "tail": ".                                                                        [100%]\n1 passed in 0.29s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 1.839,
+          "tail": ".                                                                        [100%]\n1 passed in 0.47s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.111,
+      "duration_s": 1.839,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -4530,7 +4530,7 @@
       "family": "REALITY",
       "title": "Transactional compensation restores the owned checkpoint",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -4547,18 +4547,18 @@
             "tests/unit/capabilities/test_reality_gate_escalation.py::test_transactional_checkpoints_real_workspace_and_compensates"
           ],
           "exit_code": 0,
-          "duration_s": 5.223,
-          "tail": ".                                                                        [100%]\n1 passed in 3.48s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 3.284,
+          "tail": ".                                                                        [100%]\n1 passed in 1.74s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 5.223,
+      "duration_s": 3.284,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -4575,7 +4575,7 @@
       "family": "REALITY",
       "title": "Transactional compensation refuses unrelated drift",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -4592,18 +4592,18 @@
             "tests/unit/capabilities/test_reality_integrity.py::test_transaction_compensation_refuses_unrelated_drift_after_owned_write"
           ],
           "exit_code": 0,
-          "duration_s": 3.109,
-          "tail": ".                                                                        [100%]\n1 passed in 1.57s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 1.994,
+          "tail": ".                                                                        [100%]\n1 passed in 1.02s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 3.109,
+      "duration_s": 1.994,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -4620,7 +4620,7 @@
       "family": "REALITY",
       "title": "Rollback refuses to overwrite externally changed reality",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -4637,18 +4637,18 @@
             "tests/unit/capabilities/test_reality_integrity.py::test_rollback_refuses_to_overwrite_external_edit"
           ],
           "exit_code": 0,
-          "duration_s": 2.95,
-          "tail": ".                                                                        [100%]\n1 passed in 0.90s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 1.653,
+          "tail": ".                                                                        [100%]\n1 passed in 0.30s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 2.951,
+      "duration_s": 1.653,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -4665,7 +4665,7 @@
       "family": "REALITY",
       "title": "Unsupported resource types are rejected before commit",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -4682,18 +4682,18 @@
             "tests/unit/shadow/test_commit_discard.py::test_commit_retains_and_reports_unsupported_symlink"
           ],
           "exit_code": 0,
-          "duration_s": 5.643,
-          "tail": ".                                                                        [100%]\n1 passed in 3.03s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 3.234,
+          "tail": ".                                                                        [100%]\n1 passed in 2.50s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 5.643,
+      "duration_s": 3.234,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -4710,7 +4710,7 @@
       "family": "REALITY",
       "title": "Opaque execution is isolated from the real workspace",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -4727,18 +4727,18 @@
             "tests/unit/capabilities/test_reality_gate.py::test_opaque_execution_cannot_write_the_real_workspace"
           ],
           "exit_code": 0,
-          "duration_s": 4.013,
-          "tail": ".                                                                        [100%]\n1 passed in 1.81s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 2.44,
+          "tail": ".                                                                        [100%]\n1 passed in 1.05s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 4.013,
+      "duration_s": 2.44,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -4755,7 +4755,7 @@
       "family": "REALITY",
       "title": "Transactional verification uses compare-and-swap ownership",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -4772,18 +4772,18 @@
             "tests/unit/capabilities/test_reality_integrity.py::test_transactional_verification_uses_cas_against_verified_revision"
           ],
           "exit_code": 0,
-          "duration_s": 5.217,
-          "tail": ".                                                                        [100%]\n1 passed in 3.05s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 4.851,
+          "tail": ".                                                                        [100%]\n1 passed in 3.22s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 5.217,
+      "duration_s": 4.851,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -4800,7 +4800,7 @@
       "family": "REALITY",
       "title": "Completion recovery fails closed without final reality identity",
       "required": true,
-      "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+      "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
       "release_run_id": "local",
       "status": "passed",
       "evidence": [
@@ -4817,18 +4817,18 @@
             "tests/unit/capabilities/test_reality_integrity.py::test_completion_recovery_requires_fingerprint_and_final_identity"
           ],
           "exit_code": 0,
-          "duration_s": 3.18,
-          "tail": ".                                                                        [100%]\n1 passed in 0.51s\n",
-          "commit_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+          "duration_s": 1.646,
+          "tail": ".                                                                        [100%]\n1 passed in 0.29s\n",
+          "commit_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
           "release_run_id": "local"
         }
       ],
-      "duration_s": 3.18,
+      "duration_s": 1.646,
       "source_identity": {
-        "head_sha": "6e68da9ce4ec3d803e3e18c3202a757c4fe737c8",
+        "head_sha": "5e7da37ae30a4bd64c03b494fa63bf57a19b2438",
         "release_run_id": "local",
         "dirty": true,
-        "status_digest": "e76fa91ae8a05fabbcfd00fd02cc0066b47bea6c2854c358e285de25cd4bb377",
+        "status_digest": "af30a0a495a85cceec57001190e78705e6b7c74c23ebd85d474b4d0f9b942a96",
         "python": "/home/bamn/Athena/.venv/bin/python3",
         "python_version": "3.12.13",
         "platform": "linux"
@@ -4845,8 +4845,8 @@
     "FUSE": {
       "description": "one AgentKernel/model/task/execution authority",
       "total": 7,
-      "passed": 6,
-      "failed": 1,
+      "passed": 7,
+      "failed": 0,
       "missing": 0,
       "skipped": 0
     },
@@ -4925,8 +4925,8 @@
     "RECOVERY": {
       "description": "hard-kill/restart truthfulness",
       "total": 4,
-      "passed": 3,
-      "failed": 1,
+      "passed": 4,
+      "failed": 0,
       "missing": 0,
       "skipped": 0
     },
@@ -4941,10 +4941,10 @@
     "VHS": {
       "description": "deterministic demo rendering and artifact validation",
       "total": 3,
-      "passed": 2,
+      "passed": 3,
       "failed": 0,
       "missing": 0,
-      "skipped": 1
+      "skipped": 0
     },
     "CONTEXT": {
       "description": "bounded compression and durable digest continuity",
@@ -4981,8 +4981,8 @@
     "RESEARCH": {
       "description": "discover/capture/evidence/claim research journeys",
       "total": 2,
-      "passed": 1,
-      "failed": 1,
+      "passed": 2,
+      "failed": 0,
       "missing": 0,
       "skipped": 0
     },
@@ -5005,8 +5005,8 @@
     "MCP": {
       "description": "real protocol transport and conservative tool policy",
       "total": 2,
-      "passed": 1,
-      "failed": 1,
+      "passed": 2,
+      "failed": 0,
       "missing": 0,
       "skipped": 0
     },
@@ -5045,8 +5045,8 @@
     "PROOF": {
       "description": "deterministic real-agent product proof workflow",
       "total": 2,
-      "passed": 1,
-      "failed": 1,
+      "passed": 2,
+      "failed": 0,
       "missing": 0,
       "skipped": 0
     },
@@ -5061,16 +5061,10 @@
   },
   "summary": {
     "total": 102,
-    "passed": 96,
-    "failed": 5,
+    "passed": 102,
+    "failed": 0,
     "missing": 0,
-    "skipped": 1,
-    "required_not_passed": [
-      "FUSE-007",
-      "RECOVERY-003",
-      "RESEARCH-001",
-      "MCP-001",
-      "PROOF-002"
-    ]
+    "skipped": 0,
+    "required_not_passed": []
   }
 }

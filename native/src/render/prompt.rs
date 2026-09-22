@@ -1,7 +1,11 @@
-use super::super::*;
+use crate::input::InputBuffer;
+
 use super::primitives::{draw_rect, with_scissor};
 use super::text::{FontRole, TextRenderer};
 use super::theme::{PRIMARY, SECONDARY};
+use crate::platform::*;
+use crate::x11::*;
+use crate::{Projection, VisualMode};
 
 /// Render the operator instrument and semantic labels. Layout is owned here;
 /// x11.rs only forwards input and invalidation events to the compositor.
@@ -32,7 +36,7 @@ pub(crate) fn draw_status_text(
         (geometry.prompt.width as c_int - geometry.prompt_padding_x as c_int * 2).max(1);
     let input_value = format!("{}{}", input.text(), input.composition());
     let prefix = "ATHENA ";
-    let (displayed, _display_cursor) = super::super::fit_input_in(
+    let (displayed, _display_cursor) = crate::x11::fit_input_in(
         text,
         input_role,
         &input_value,
@@ -54,7 +58,7 @@ pub(crate) fn draw_status_text(
     if draw_cursor {
         draw_status_cursor(text, geometry, focused, input, 0.0);
     }
-    let status = super::super::fit_text_in(
+    let status = crate::x11::fit_text_in(
         text,
         FontRole::Instrument,
         human_status(projection),
@@ -68,7 +72,7 @@ pub(crate) fn draw_status_text(
         if focused { PRIMARY } else { SECONDARY },
     );
     if let Some(hint_row) = prompt_layout.hint_row {
-        let hint = super::super::fit_text_in(
+        let hint = crate::x11::fit_text_in(
             text,
             FontRole::Instrument,
             "↑↓ SCROLL  ←→ EDIT  CTRL-C CANCEL",
@@ -112,7 +116,7 @@ pub(crate) fn draw_status_cursor(
         (geometry.prompt.width as c_int - geometry.prompt_padding_x as c_int * 2).max(1);
     let input_value = format!("{}{}", input.text(), input.composition());
     let prefix = "ATHENA ";
-    let (displayed, display_cursor) = super::super::fit_input_in(
+    let (displayed, display_cursor) = crate::x11::fit_input_in(
         text,
         input_role,
         &input_value,
@@ -133,10 +137,20 @@ pub(crate) fn draw_status_cursor(
     });
 }
 
-fn human_status(projection: &Projection) -> &str {
+fn human_status(projection: &Projection) -> &'static str {
     match VisualMode::from_projection(projection).prompt_state(projection) {
         "APPROVAL" => "WAITING APPROVAL",
-        "FAILURE" | "DISCONNECTED" => "VERIFICATION FAILED",
+        "DISCONNECTED" => "BRIDGE DISCONNECTED",
+        "FAILURE"
+            if projection
+                .verification
+                .status
+                .eq_ignore_ascii_case("failed") =>
+        {
+            "VERIFICATION FAILED"
+        }
+        "FAILURE" if projection.failure.kind == "model_routing" => "MODEL ROUTING FAILED",
+        "FAILURE" => "TASK FAILED",
         "READY" => "ATHENA READY",
         _ => "ATHENA WORKING",
     }

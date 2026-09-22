@@ -529,6 +529,95 @@ def test_pack_instrument_is_a_governed_callable_surface(tmp_path):
         raise AssertionError("disabled pack instrument remains registered")
 
 
+async def test_pack_hook_activation_rejects_effects_above_pack_ceiling(tmp_path):
+    source = tmp_path / "hook-pack"
+    (source / "hooks").mkdir(parents=True)
+    (source / "hooks" / "events.json").write_text(
+        json.dumps(
+            {
+                "hooks": [
+                    {
+                        "event": "TaskCompleted",
+                        "workflow": "review",
+                        "effects": ["NETWORK_WRITE"],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (source / "athena.pack.toml").write_text(
+        "id = 'hook-pack'\nversion = '1.0.0'\npublisher = 'test'\n"
+        "[provides]\nhooks = ['hooks/events.json']\n"
+        "[authority]\nrequested_effects = ['READ_LOCAL']\n",
+        encoding="utf-8",
+    )
+
+    class _Events:
+        def subscribe(self, callback, **kwargs):
+            self.callback = callback
+
+    class _Outbox:
+        pass
+
+    async def intake(_request, *, wait):
+        raise AssertionError("invalid hook must not enqueue work")
+
+    manager = PackManager(_PackStore(), install_root=str(tmp_path / "installed"))
+    manager.bind_integrations(event_store=_Events(), hook_outbox=_Outbox(), task_intake=intake)
+    try:
+        await manager.install(str(source), allowed_root=str(tmp_path))
+    except ValueError as exc:
+        assert "exceed the pack authority ceiling" in str(exc)
+    else:
+        raise AssertionError("hook above pack ceiling must be rejected")
+
+
+async def test_pack_hook_activation_rejects_recursion_limit_above_three(tmp_path):
+    source = tmp_path / "hook-pack"
+    (source / "hooks").mkdir(parents=True)
+    (source / "hooks" / "events.json").write_text(
+        json.dumps(
+            {
+                "hooks": [
+                    {
+                        "event": "TaskCompleted",
+                        "workflow": "review",
+                        "effects": ["READ_LOCAL"],
+                        "recursion_limit": 4,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (source / "athena.pack.toml").write_text(
+        "id = 'hook-pack'\nversion = '1.0.0'\npublisher = 'test'\n"
+        "[provides]\nhooks = ['hooks/events.json']\n"
+        "[authority]\nrequested_effects = ['READ_LOCAL']\n",
+        encoding="utf-8",
+    )
+
+    class _Events:
+        def subscribe(self, callback, **kwargs):
+            self.callback = callback
+
+    class _Outbox:
+        pass
+
+    async def intake(_request, *, wait):
+        raise AssertionError("invalid hook must not enqueue work")
+
+    manager = PackManager(_PackStore(), install_root=str(tmp_path / "installed"))
+    manager.bind_integrations(event_store=_Events(), hook_outbox=_Outbox(), task_intake=intake)
+    try:
+        await manager.install(str(source), allowed_root=str(tmp_path))
+    except ValueError as exc:
+        assert "between 0 and 3" in str(exc)
+    else:
+        raise AssertionError("hook recursion limit above 3 must be rejected")
+
+
 def test_pack_hook_is_durable_idempotent_and_effect_capped(tmp_path):
     source = tmp_path / "hook-pack"
     (source / "hooks").mkdir(parents=True)

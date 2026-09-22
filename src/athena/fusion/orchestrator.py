@@ -37,11 +37,13 @@ from __future__ import annotations
 
 import logging
 import os
-import dataclasses
 from dataclasses import dataclass, field
 from typing import Any
 
 from athena.causal.checkpoint import CheckpointManager
+from athena.fusion.comparison import ComparisonLifecycle
+from athena.fusion.ports import FusionPorts
+from athena.fusion.selection import CandidateSelectionStore
 from athena.causal.fork import TaskForker
 from athena.protocol.capabilities import CapabilityRequestOrigin
 from athena.protocol.ids import new_id
@@ -67,28 +69,103 @@ class ExperimentResult:
 
 
 class FusionOrchestrator:
-    """The integration layer binding all fusion engines together."""
+    """The integration layer binding all fusion engines together.
 
-    def __init__(self, service: Any) -> None:
-        self.service = service
-        self.shadow = service.shadow_engine()
-        state_root = getattr(service, "_runtime_state_root", None)
-        # Use the service-owned manager when the capability surface has
-        # already been registered.  A second manager pointed at the same
-        # directory would share snapshots but not ownership semantics.
-        self.checkpoints: CheckpointManager
-        service_checkpoints = getattr(service, "_checkpoints", None)
-        if service_checkpoints is not None:
-            self.checkpoints = service_checkpoints
-        else:
-            self.checkpoints = CheckpointManager(
-                root=(
-                    os.path.join(state_root, "checkpoints")
-                    if state_root
-                    else "/tmp/athena-checkpoints"
-                )
+    Accepts an explicit ``AthenaService`` (legacy) or an explicit ports dict
+    for decoupled construction. The ports dict is the preferred path because
+    it removes the runtime coupling between Fusion and the whole service.
+    """
+
+    def __init__(
+        self,
+        service: Any = None,
+        *,
+        ports: dict[str, Any] | None = None,
+        typed_ports: FusionPorts | None = None,
+    ) -> None:
+        self.ports: FusionPorts | None = typed_ports
+        if typed_ports is not None:
+            self.service = None
+            self.shadow = typed_ports.shadow
+            self.checkpoints = typed_ports.checkpoints
+            self._store_tasks = typed_ports.task_store
+            self._store_events = typed_ports.event_store
+            self._store_runtime_sessions = typed_ports.runtime_session_store
+            self._context_block_store = typed_ports.context_block_store
+            self._fabric = typed_ports.fabric
+            self._workflow_store = typed_ports.workflow_store
+            self._synthesis = typed_ports.synthesis
+            self._dispatcher = typed_ports.dispatcher
+            self._world_state_store = typed_ports.world_state_store
+            self._default_workspace = typed_ports.default_workspace
+            self._world_state_factory = typed_ports.world_state_factory
+            self._synthesis_ref = typed_ports.synthesis_ref
+            fork_ports = typed_ports.fork
+            self.forker = TaskForker(ports=fork_ports, checkpoint_manager=self.checkpoints)
+        elif ports is not None:
+            self.service = None
+            self.shadow = ports["shadow"]
+            self.checkpoints = ports["checkpoints"]
+            self.forker = TaskForker(
+                service=ports.get("service"), checkpoint_manager=self.checkpoints
             )
-        self.forker = TaskForker(service=service, checkpoint_manager=self.checkpoints)
+            self._store_tasks = ports.get("store_tasks")
+            self._default_workspace = ports.get("default_workspace")
+            self._world_state_factory = ports.get("world_state_factory")
+            self._synthesis_ref = ports.get("synthesis_ref")
+        else:
+            if service is None:
+                raise ValueError("FusionOrchestrator requires service or ports")
+            self.ports = None
+            self.service = service
+            self.shadow = service.shadow_engine()
+            state_root = getattr(service, "_runtime_state_root", None)
+            service_checkpoints = getattr(service, "_checkpoints", None)
+            if service_checkpoints is not None:
+                self.checkpoints = service_checkpoints
+            else:
+                self.checkpoints = CheckpointManager(
+                    root=(
+                        os.path.join(state_root, "checkpoints")
+                        if state_root
+                        else "/tmp/athena-checkpoints"
+                    )
+                )
+            self.forker = TaskForker(service=service, checkpoint_manager=self.checkpoints)
+            self._store_tasks = None
+            self._default_workspace = None
+            self._world_state_factory = None
+            self._synthesis_ref = None
+        state_root = str(getattr(self.shadow, "_state_root", "") or "/tmp/athena-fusion-selection")
+        self.selection_store = CandidateSelectionStore(state_root)
+
+    async def _task_for(self, task_id: str):
+        """Resolve a TaskSpec from the ports task store or the legacy service."""
+        store = self._store_tasks
+        if store is None:
+            store = getattr(self.service, "_store_tasks", None) if self.service else None
+        if task_id and store:
+            try:
+                row = await store.get(task_id)
+                if row:
+                    from athena.kernel.lifecycle import deserialize_task
+
+                    return deserialize_task(dict(row))
+            except Exception as exc:  # noqa: BLE001
+                _logger.warning("task lookup for %s failed: %s", task_id, exc)
+        return None
+
+    def _workspace_for_async(self, task_id: str):
+        """Legacy workspace resolution for the service path."""
+        return self._workspace_for(task_id)
+
+    def _world_state(self, task_id: str):
+        """Resolve world state from ports or legacy service."""
+        if self._world_state_factory is not None:
+            return self._world_state_factory(task_id)
+        if self.service is not None:
+            return self.service.world_state(task_id)
+        raise RuntimeError("FusionOrchestrator has no service bound for world_state")
 
     # ------------------------------------------------------------------
     # 1+3+4: speculative experiment with invariant gate and claims
@@ -98,32 +175,26 @@ class FusionOrchestrator:
         *,
         task_id: str,
         proposal: list[dict],
-        criteria_probes: list[dict] | None = None,
         invariants: list[dict] | None = None,
         profile: str | None = None,
         auto_fork_on_failure: bool = True,
-        commit: bool = True,
     ) -> ExperimentResult:
         """Run one full speculative experiment against reality.
 
-        criteria_probes : [{"id","command"}] executed INSIDE the shadow via
-                          the dispatcher ('execute' capability, same
-                          capability/policy path as proposals); all must pass
-                          for the branch to be verified.
-        invariants      : [{"description","command"|"probe"}] required-envelope
-                          checks evaluated AFTER execution but BEFORE commit;
-                          declarative "command" specs run inside the shadow
-                          through the dispatcher too.
-        auto_fork_on_failure: create a causal fork at the parent's latest
-                          event so an alternate approach can be tried.
-        commit: commit a verified branch to reality.  ``False`` is used by
-                comparative experiments and always discards the branch after
-                collecting its verification evidence.
+        Fusion terminal success is always ``CANDIDATE_READY``; promotion
+        belongs to the canonical candidate/reality path.
         """
-        ws = await self._workspace_for(task_id)
+        task = await self._task_for(task_id)
+        ws = (
+            task.workspace
+            if task is not None and task.workspace is not None
+            else (
+                getattr(self.service, "_default_workspace", None)
+                if self.service
+                else self._default_workspace
+            )
+        )
         result = ExperimentResult()
-        # Capture the PRE-EXPERIMENT event position (P1-40): a failure fork
-        # must branch from BEFORE the experiment ran, not from after it.
         pre_experiment_sequence = 0
         try:
             timeline = await self.forker.timeline(task_id)
@@ -131,9 +202,10 @@ class FusionOrchestrator:
         except Exception as exc:  # noqa: BLE001 - timeline lookup is best-effort before experiment
             _logger.warning("pre-experiment timeline failed: %s", exc)
 
-        # Pre-experiment checkpoint: the exact restore point if things go wrong.
         ckpt = await self.capture_checkpoint(
-            task_id=task_id or "unknown", workspace_root=ws.root, label="pre-experiment"
+            task_id=task_id or "unknown",
+            workspace_root=(ws.root if ws else ""),
+            label="pre-experiment",
         )
         ckpt_id = ckpt.get("checkpoint_id") or ckpt.get("id")
         _logger.info("experiment checkpoint %s", ckpt_id)
@@ -144,9 +216,6 @@ class FusionOrchestrator:
         )
         branch_checkpoint_owner = f"branch:{branch.id}"
         if ckpt_id:
-            # The task owns the capture; the retained branch owner keeps the
-            # restore boundary alive if this candidate enters conflict or
-            # recovery-required state after the task owner is released.
             self.checkpoints.retain(ckpt_id, owner=branch_checkpoint_owner)
         self.shadow.attach_checkpoint(branch, ckpt_id)
         result.branch_id = branch.id
@@ -166,57 +235,108 @@ class FusionOrchestrator:
             )
             return result
 
-        # Criteria probes run INSIDE the shadow workspace through the SAME
-        # capability/policy path as proposals (item 16): each probe is an
-        # 'execute' dispatch bound to branch.shadow_workspace. Commands
-        # written against the real workspace root are transparently rewritten
-        # to the shadow root so "test -f <real>/src/x.py" verifies the shadow
-        # copy.
-        verification = []
-        all_ok = True
-        for probe in criteria_probes or []:
-            command = self._rewrite_to_shadow(probe["command"], branch)
-            ok, detail = await self._dispatch_probe(
-                command, branch.shadow_workspace, profile, task_id=task_id
-            )
-            passed = ok if not probe.get("negate", False) else not ok
-            verification.append(
+        canonical_verifier = (
+            self.ports.candidate_verifier
+            if self.ports is not None and self.ports.candidate_verifier is not None
+            else getattr(self.service, "_reality_coordinator", None)
+        )
+        if task is None or canonical_verifier is None:
+            verification = [
                 {
-                    "id": probe.get("id") or new_id("ac"),
-                    "command": probe["command"],
-                    "passed": passed,
-                    "detail": detail[-400:],
+                    "id": "verification_unavailable",
+                    "passed": False,
+                    "reason": "no candidate-verification port composed",
                 }
+            ]
+            criteria_present = False
+            all_ok = False
+        else:
+            gate = (
+                self.ports.reality_gate
+                if self.ports is not None and self.ports.reality_gate is not None
+                else getattr(self.service, "_reality_gate", None)
             )
-            if not passed:
-                all_ok = False
+            deactivate = getattr(gate, "deactivate_branch", None)
+            if (
+                callable(deactivate)
+                and gate is not None
+                and task_id
+                and gate.active_branch(task_id) is branch
+            ):
+                await deactivate(task_id)
+            diff = getattr(self.shadow, "_diff_trees_async", None)
+            changes = await diff(branch) if callable(diff) else {}
+            changed_resources = tuple(
+                sorted(
+                    set(changes.get("modified", ()))
+                    | set(changes.get("added", ()))
+                    | set(changes.get("deleted", ()))
+                )
+            )
+            verifier_impact = getattr(
+                canonical_verifier,
+                "_candidate_verification",
+                canonical_verifier,
+            )
+            impact = await verifier_impact.impact_for(
+                (ws.root if ws else ""),
+                changed_resources,
+            )
+            verification = await canonical_verifier.verify_candidate(
+                task,
+                workspace=branch.shadow_workspace,
+                changed_resources=changed_resources,
+                impact=impact,
+                profile_workspace=ws,
+                deactivate_branch=deactivate,
+                task_id=task_id,
+            )
+            real_proof = [
+                item for item in verification if item.get("id") != "no_criteria_derivable"
+            ]
+            criteria_present = bool(real_proof)
+            all_ok = criteria_present and all(item.get("passed") for item in real_proof)
+        invariant_report: dict = {}
+        if all_ok:
+            invariant_set = self._build_invariants(
+                invariants,
+                branch=branch,
+                profile=profile,
+                task_id=task_id,
+            )
+            invariant_report = await invariant_set.check_all()
+            result.invariant_report = invariant_report
+            if not invariant_report.get("ok", False):
+                result.status = "FAILED"
+                result.error = "invariant violation: " + str(
+                    invariant_report.get("violations")
+                    or invariant_report.get("failed")
+                    or "required invariant failed"
+                )
+                await self.shadow.discard(branch, reason=result.error)
+                await self._fail_path(
+                    task_id,
+                    result,
+                    auto_fork_on_failure,
+                    ckpt_id,
+                    pre_experiment_sequence,
+                )
+                await self._close_experiment_checkpoint(
+                    ckpt_id,
+                    task_owner=checkpoint_owner,
+                    branch_owner=branch_checkpoint_owner,
+                    state="FAILED",
+                )
+                return result
+
         await self.shadow.record_verification(branch, verification)
         result.verification = verification
         if not all_ok:
             result.status = "FAILED"
-            result.error = "acceptance criteria failed in shadow"
-            await self.shadow.discard(branch, reason=result.error)
-            await self._fail_path(
-                task_id, result, auto_fork_on_failure, ckpt_id, pre_experiment_sequence
-            )
-            await self._close_experiment_checkpoint(
-                ckpt_id,
-                task_owner=checkpoint_owner,
-                branch_owner=branch_checkpoint_owner,
-                state="FAILED",
-            )
-            return result
-
-        # Invariant envelope BEFORE touching reality.
-        inv_set = self._build_invariants(
-            invariants, branch=branch, profile=profile, task_id=task_id
-        )
-        report = await inv_set.check_all()
-        result.invariant_report = report
-        if not report["ok"]:
-            result.status = "FAILED"
-            result.error = "invariant violation: " + "; ".join(
-                v["description"] for v in report["violations"]
+            result.error = (
+                "acceptance criteria failed in shadow"
+                if criteria_present
+                else "verification failed: no acceptance criteria were supplied"
             )
             await self.shadow.discard(branch, reason=result.error)
             await self._fail_path(
@@ -231,87 +351,12 @@ class FusionOrchestrator:
             return result
 
         result.verified = True
-        if not commit:
-            result.commit = await self.shadow.discard(
-                branch, reason="verified comparison candidate discarded"
-            )
-            result.status = "DISCARDED"
-            await self._close_experiment_checkpoint(
-                ckpt_id,
-                task_owner=checkpoint_owner,
-                branch_owner=branch_checkpoint_owner,
-                state="DISCARDED",
-            )
-            return result
-
-        # Commit and bind a claim to the evidence. Order matters:
-        # 1) invalidate claims overlapping the committed paths (they're stale
-        #    now that reality changed), 2) THEN record the fresh VERIFIED
-        #    claim for this experiment.
-        outcome = await self.shadow.commit(branch)
-        result.commit = outcome
-        if outcome.get("status") != "committed":
-            result.status = "FAILED"
-            result.error = str(
-                outcome.get("error")
-                or outcome.get("reason")
-                or f"shadow commit did not complete: {outcome.get('status', 'unknown')}"
-            )
-            await self._fail_path(
-                task_id,
-                result,
-                auto_fork_on_failure,
-                ckpt_id,
-                pre_experiment_sequence,
-            )
-            await self._close_experiment_checkpoint(
-                ckpt_id,
-                task_owner=checkpoint_owner,
-                branch_owner=branch_checkpoint_owner,
-                state=result.commit.get("status", "RECOVERY_REQUIRED"),
-                keep_branch=branch.status in {"CONFLICTED", "RECOVERY_REQUIRED"},
-            )
-            return result
-        wstate = self.service.world_state(task_id)
-        depends = tuple(outcome.get("written", []))
-        wstate.claims.invalidate_for_paths(list(depends))
-        event_sequence = 0
-        events = getattr(self.service, "_store_events", None)
-        if events is not None:
-            try:
-                event_sequence = await events.last_sequence(task_id)
-            except Exception as exc:  # noqa: BLE001 - telemetry lookup cannot block commit planning
-                _logger.warning("claim event boundary lookup failed: %s", exc)
-        claim = wstate.claims.record(
-            text=f"experiment {branch.id} verified ({len(verification)} criteria)",
-            evidence={
-                "branch": branch.id,
-                "checkpoint": ckpt_id,
-                "criteria": verification,
-                "invariants": report["results"],
-                "committed": outcome,
-                "event_sequence": event_sequence,
-                "mutation_sequence": max(
-                    (
-                        int(item.get("mutation_sequence"))
-                        for item in outcome.get("mutation_results", [])
-                        if item.get("mutation_sequence") is not None
-                    ),
-                    default=0,
-                ),
-                "workspace_revision": await self.checkpoints.fingerprint(ws.root),
-            },
-            task_id=task_id,
-            depends_on_paths=depends,
-        )
-        result.claim_id = claim.id
-        result.status = "COMMITTED"
+        result.status = "CANDIDATE_READY"
         await self._close_experiment_checkpoint(
             ckpt_id,
             task_owner=checkpoint_owner,
             branch_owner=branch_checkpoint_owner,
-            state="CLAIM_EVIDENCE",
-            claim_id=claim.id,
+            state="CANDIDATE_READY",
         )
         return result
 
@@ -320,59 +365,20 @@ class FusionOrchestrator:
         *,
         task_id: str,
         proposals: list[list[dict]],
-        criteria_probes: list[dict] | None = None,
         invariants: list[dict] | None = None,
         profile: str | None = None,
     ) -> dict[str, Any]:
-        """Run bounded alternatives from the same unchanged workspace.
+        """Run bounded alternatives; retained proof feeds exact selection."""
+        return await ComparisonLifecycle(self).compare(
+            task_id=task_id,
+            proposals=proposals,
+            invariants=invariants,
+            profile=profile,
+        )
 
-        Each proposal gets its own shadow branch and checkpoint.  Successful
-        branches are verified, then discarded rather than committed, so the
-        caller receives comparable proof without allowing comparison itself
-        to mutate reality.  A single kernel remains responsible for choosing
-        whether and when to run one proposal again with ``commit=True``.
-        """
-        if len(proposals) < 2:
-            raise ValueError("compare requires at least two proposals")
-        if len(proposals) > 8:
-            raise ValueError("compare accepts at most eight proposals")
-
-        candidates: list[dict[str, Any]] = []
-        for index, proposal in enumerate(proposals):
-            if not proposal:
-                candidates.append(
-                    {
-                        "candidate_index": index,
-                        "status": "FAILED",
-                        "verified": False,
-                        "error": "proposal must be non-empty",
-                    }
-                )
-                continue
-            outcome = await self.run_experiment(
-                task_id=task_id,
-                proposal=proposal,
-                criteria_probes=criteria_probes,
-                invariants=invariants,
-                profile=profile,
-                auto_fork_on_failure=False,
-                commit=False,
-            )
-            record = {
-                "candidate_index": index,
-                **dataclasses.asdict(outcome),
-            }
-            candidates.append(record)
-
-        return {
-            "status": "COMPLETED",
-            "task_id": task_id,
-            "candidate_count": len(candidates),
-            "verified_count": sum(bool(candidate.get("verified")) for candidate in candidates),
-            "candidates": candidates,
-            "selection": "kernel_decision_required",
-            "reality_mutated": False,
-        }
+    async def select_candidate(self, comparison_id: str, branch_id: str) -> dict:
+        """Select one verified candidate and discard verified losers."""
+        return await ComparisonLifecycle(self).select_candidate(comparison_id, branch_id)
 
     # ------------------------------------------------------------------
     # 2+5: fork with checkpoint restoration context
@@ -625,8 +631,13 @@ class FusionOrchestrator:
             engine = SynthesisEngine()
             # Services create the shared engine during startup. This fallback
             # keeps the orchestrator usable with lightweight test doubles.
-            self.service._synthesis = engine
-        engine.bind_dispatcher(getattr(self.service, "_dispatcher", None))
+            if self.service is not None:
+                if hasattr(self, "_synthesis_ref") and self._synthesis_ref is not None:
+                    self._synthesis_ref.set(engine)
+                else:
+                    self.service._synthesis = engine
+        dispatcher = getattr(self.service, "_dispatcher", None) if self.service else None
+        engine.bind_dispatcher(dispatcher)
 
         cap = engine.synthesize(
             name=name,
@@ -689,20 +700,30 @@ class FusionOrchestrator:
                 exc,
             )
 
-    async def _workspace_for(self, task_id: str):
-        base = self.service._default_workspace
-        if task_id and getattr(self.service, "_store_tasks", None):
+    async def _task_for_legacy(self, task_id: str):
+        store = self._store_tasks
+        if store is None and self.service:
+            store = getattr(self.service, "_store_tasks", None)
+        if task_id and store:
             try:
-                row = await self.service._store_tasks.get(task_id)
-                if row and row.get("workspace"):
+                row = await store.get(task_id)
+                if row:
                     from athena.kernel.lifecycle import deserialize_task
 
-                    spec = deserialize_task(dict(row))
-                    if spec.workspace is not None:
-                        return spec.workspace
+                    return deserialize_task(dict(row))
             except Exception as exc:  # noqa: BLE001 - workspace fallback keeps orchestration available
-                _logger.warning("workspace lookup for %s failed: %s", task_id, exc)
-        return base
+                _logger.warning("task lookup for %s failed: %s", task_id, exc)
+        return None
+
+    async def _workspace_for(self, task_id: str):
+        task = await self._task_for(task_id)
+        if task is not None and task.workspace is not None:
+            return task.workspace
+        if self._default_workspace is not None:
+            return self._default_workspace
+        if self.service is not None:
+            return getattr(self.service, "_default_workspace", None)
+        raise RuntimeError("FusionOrchestrator has no service bound for default workspace")
 
     async def _dispatch_probe(
         self, code: str, workspace, profile: str | None, task_id: str | None = None
@@ -713,7 +734,7 @@ class FusionOrchestrator:
         workspace so probes pass policy like every other operation instead
         of bypassing via raw subprocess.
         """
-        from athena.capabilities.dispatcher import SuspendedCall
+        from athena.protocol.continuations import SuspendedCall
         from athena.protocol.capabilities import CapabilityRequest
 
         dispatcher = getattr(self.service, "_dispatcher", None)

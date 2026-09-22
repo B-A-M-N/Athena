@@ -251,8 +251,8 @@ async def test_autonomous_acquisition_is_bounded_and_fetches_candidates():
             {"source": {"id": "source-1", "canonical_uri": args["uri"]}},
         )
 
-    capability._fetch = fake_fetch
-    captures, errors, summary = await capability._autonomous_acquire(  # noqa: SLF001
+    capability.service._fetch = fake_fetch
+    captures, errors, summary = await capability.service._autonomous_acquire(  # noqa: SLF001
         CapabilityRequest(
             capability_id="research",
             task_id="task-auto",

@@ -69,3 +69,17 @@ async def test_explicit_session_preserves_workspace_and_network_scope(tmp_path):
         network_policy=NetworkPolicy.ALLOW,
     )
     assert not runtime._request_matches_session(changed, session)
+
+
+async def test_base_runtime_session_locks_are_released_after_execution():
+    runtime = _ScopeRuntime()
+    for index in range(250):
+        request = ExecutionRequest(
+            runtime=runtime.name,
+            source="",
+            task_id=f"task-{index}",
+            workspace_id="workspace",
+        )
+        events = [event async for event in runtime.execute(request, f"exec-{index}")]
+        assert events[-1].type is ExecutionEventType.EXITED
+    assert len(runtime._session_locks) == 0

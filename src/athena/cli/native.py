@@ -19,13 +19,15 @@ import sys
 import tempfile
 from pathlib import Path
 
-from athena.execution.async_call import run_blocking
+from athena.concurrency import run_blocking
 from typing import Any
 
 
 NATIVE_REQUIREMENTS_MESSAGE = (
     "Athena native frontend requires Linux x86_64 GNU/glibc >= 2.34, X11, Xft and OpenGL."
 )
+
+
 class NativePreflight:
     """Deterministic host checks for the Linux native companion."""
 
@@ -175,7 +177,7 @@ def launch(options: Any) -> int:
             os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
         )
         try:
-            process = subprocess.run(  # architecture-lint: allow subprocess-outside-approved-backends reason=owned native frontend
+            process = subprocess.run(  # architecture-lint: allow subprocess-outside-approved-backends reason=owned native frontend; architecture-exception: cli-native-launch
                 argv, env=env, check=False
             )
         except OSError as exc:

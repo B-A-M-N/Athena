@@ -1,7 +1,9 @@
-use super::super::*;
 use super::primitives::{draw_outline_rect, draw_rect};
 use super::text::{FontRole, TextRenderer};
 use super::theme::{DIM, OPERATOR_BACKGROUND, PRIMARY, SECONDARY};
+use crate::platform::*;
+use crate::render::fit::rgb_f32;
+use crate::x11::*;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::{Color as TermColor, NamedColor};

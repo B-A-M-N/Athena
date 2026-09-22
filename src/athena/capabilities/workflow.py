@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import json
 import inspect
-import shutil
-import tempfile
-from dataclasses import replace
 from typing import Any
 
 from athena.protocol.capabilities import (
-    CapabilityDescriptor,
+    CapabilityFailure,
+    CapabilityFailureCode,
     CapabilityOrigin,
     CapabilityRequest,
     CapabilityResult,
@@ -20,12 +18,14 @@ from athena.protocol.capabilities import (
 )
 from athena.workflows.models import Workflow, WorkflowStep
 from athena.workflows.validation import WorkflowValidator
-from athena.protocol.tasks import MutationMode, NetworkPolicy
-from athena.workspace_manifest import copy_workspace_tree
+from athena.capabilities.operations import native_descriptor
+from athena.capabilities.workflow_effects import resolve_workflow_effects
+from athena.capabilities.workflow_graph import load_workflow_graph
+from athena.capabilities.workflow_workspace import cancel_safe_cleanup, stage_disposable_workspace
 
 
 class WorkflowCapability:
-    descriptor = CapabilityDescriptor(
+    descriptor = native_descriptor(
         id="workflow",
         description=(
             "Compose and run declarative capability workflows. Workflows may "
@@ -109,13 +109,47 @@ class WorkflowCapability:
         run_store=None,
         external_store=None,
         workflow_observer=None,
+        *,
+        max_trial_files: int = 100_000,
+        max_trial_bytes: int = 100 * 1024 * 1024,
     ) -> None:
+        if max_trial_files < 1 or max_trial_bytes < 1:
+            raise ValueError("workflow trial copy ceilings must be positive")
         self._store = store
         self._dispatcher = dispatcher
         self._fabric = fabric
         self._run_store = run_store
         self._external_store = external_store
         self._workflow_observer = workflow_observer
+        self._max_trial_files = max_trial_files
+        self._max_trial_bytes = max_trial_bytes
+
+    def _trial_copy_bytes(self, context: Any) -> int:
+        task_limit = getattr(getattr(context, "resource_budget", None), "max_artifact_bytes", None)
+        if task_limit is None:
+            return self._max_trial_bytes
+        return min(self._max_trial_bytes, max(1, int(task_limit)))
+
+    async def resolve_operation_effects(
+        self,
+        arguments,
+        *,
+        workspace,
+        task_id: str | None,
+        principal_id: str | None,
+    ) -> tuple[EffectClass, ...]:
+        operation = str((arguments or {}).get("operation") or "")
+        if operation not in {"run", "trial"}:
+            return tuple(self.descriptor.resolve_effects(arguments or {}))
+        return await resolve_workflow_effects(
+            arguments,
+            store=self._store,
+            fabric=self._fabric,
+            load_graph=lambda root, **kwargs: load_workflow_graph(self._store, root, **kwargs),
+            workspace=workspace,
+            task_id=task_id,
+            principal_id=principal_id,
+        )
 
     async def invoke(self, request: CapabilityRequest, *, context=None, **kw):
         args = dict(request.arguments or {})
@@ -263,7 +297,8 @@ class WorkflowCapability:
             # graph used by execution.  Creation must validate composition as
             # data, not reject a valid child merely because it is not a native
             # capability in the fabric.
-            graph = await self._load_graph(
+            graph = await load_workflow_graph(
+                self._store,
                 workflow,
                 task_id=request.task_id,
                 project_id=getattr(getattr(context, "workspace", None), "id", None),
@@ -298,7 +333,8 @@ class WorkflowCapability:
         if workflow is None:
             return _result(request, ok=False, error=f"unknown workflow: {workflow_id}")
 
-        graph = await self._load_graph(
+        graph = await load_workflow_graph(
+            self._store,
             workflow,
             task_id=request.task_id,
             project_id=context.workspace.id,
@@ -318,21 +354,15 @@ class WorkflowCapability:
 
         trial_root = None
         execution_workspace = context.workspace
-        if operation == "trial":
-            trial_root = tempfile.mkdtemp(prefix="athena-workflow-trial-")
-            copy_workspace_tree(
-                context.workspace.root,
-                trial_root,
-                dirs_exist_ok=True,
-            )
-            execution_workspace = replace(
-                context.workspace,
-                id=f"trial:{request.call_id}",
-                root=trial_root,
-                mutation_mode=MutationMode.DIRECT,
-                network_policy=NetworkPolicy.DENY,
-            )
         try:
+            if operation == "trial":
+                execution_workspace, trial_root = await stage_disposable_workspace(
+                    context.workspace,
+                    identifier=f"trial:{request.call_id}",
+                    prefix="athena-workflow-trial-",
+                    max_files=self._max_trial_files,
+                    max_bytes=self._trial_copy_bytes(context),
+                )
             # Keep the workflow package importable on its own.  The capabilities
             # package exports WorkflowCapability, while WorkflowExecutor also
             # depends on the dispatcher exported by that package.
@@ -355,6 +385,7 @@ class WorkflowCapability:
                 workspace=execution_workspace,
                 inputs=inputs,
                 session_id=request.session_id,
+                profile=getattr(context, "autonomy", None),
                 task_policy=getattr(context, "capability_policy", None),
                 task_budget=getattr(context, "resource_budget", None),
                 generated_call_depth=getattr(context, "generated_call_depth", 0),
@@ -365,7 +396,7 @@ class WorkflowCapability:
             )
         finally:
             if trial_root is not None:
-                shutil.rmtree(trial_root, ignore_errors=True)
+                await cancel_safe_cleanup(trial_root)
         if (
             operation == "run"
             and self._workflow_observer is not None
@@ -421,7 +452,8 @@ class WorkflowCapability:
         context: Any,
     ) -> dict[str, Any]:
         """Replay a candidate in a disposable workspace before promotion."""
-        graph = await self._load_graph(
+        graph = await load_workflow_graph(
+            self._store,
             workflow,
             task_id=request.task_id,
             project_id=context.workspace.id,
@@ -439,20 +471,14 @@ class WorkflowCapability:
                 user_id=getattr(context, "principal_id", None),
             ).descriptor
 
-        trial_root = tempfile.mkdtemp(prefix="athena-workflow-replay-")
+        execution_workspace, trial_root = await stage_disposable_workspace(
+            context.workspace,
+            identifier=f"replay:{request.call_id}",
+            prefix="athena-workflow-replay-",
+            max_files=self._max_trial_files,
+            max_bytes=self._trial_copy_bytes(context),
+        )
         try:
-            copy_workspace_tree(
-                context.workspace.root,
-                trial_root,
-                dirs_exist_ok=True,
-            )
-            execution_workspace = replace(
-                context.workspace,
-                id=f"replay:{request.call_id}",
-                root=trial_root,
-                mutation_mode=MutationMode.DIRECT,
-                network_policy=NetworkPolicy.DENY,
-            )
             from athena.workflows.executor import WorkflowExecutor
 
             outcome = await WorkflowExecutor(
@@ -476,42 +502,26 @@ class WorkflowCapability:
                 "workspace": "disposable",
             }
         finally:
-            shutil.rmtree(trial_root, ignore_errors=True)
-
-    async def _load_graph(
-        self,
-        root: Workflow,
-        *,
-        task_id: str | None,
-        project_id: str | None,
-        user_id: str | None,
-    ) -> dict[str, Workflow]:
-        graph = {root.id: root}
-        pending = [step.workflow_id for step in root.steps if step.workflow_id]
-        while pending:
-            workflow_id = pending.pop()
-            if workflow_id in graph:
-                continue
-            workflow = await self._store.get(
-                workflow_id,
-                task_id=task_id,
-                project_id=project_id,
-                user_id=user_id,
-            )
-            if workflow is None:
-                continue
-            graph[workflow.id] = workflow
-            pending.extend(step.workflow_id for step in workflow.steps if step.workflow_id)
-        return graph
-
+            await cancel_safe_cleanup(trial_root)
 
 def _result(request, *, ok=True, output="", error=None, metadata=None):
-    return CapabilityResult(
-        request.call_id,
-        request.capability_id,
-        CapabilityResultStatus.OK if ok else CapabilityResultStatus.FAILED,
+    if ok:
+        return CapabilityResult(
+            request.call_id,
+            request.capability_id,
+            CapabilityResultStatus.OK,
+            output=output,
+            error=error,
+            metadata=dict(metadata or {}),
+        )
+    return CapabilityResult.failure(
+        request,
+        CapabilityFailure(
+            code=CapabilityFailureCode.DOMAIN_REJECTED,
+            detail=error or "operation failed",
+            stage="invoke",
+        ),
         output=output,
-        error=error,
         metadata=dict(metadata or {}),
     )
 

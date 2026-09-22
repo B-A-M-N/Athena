@@ -176,6 +176,8 @@ class BudgetTracker:
         self._model_limits: dict[str, int] = {}
         self._execution_semaphores: dict[str, Any] = {}
         self._execution_limits: dict[str, int] = {}
+        self._model_leases: dict[str, int] = {}
+        self._execution_leases: dict[str, int] = {}
         # task_id -> (process-local monotonic checkpoint, durable UTC marker)
         self._active_compute: dict[str, tuple[float, datetime]] = {}
         import asyncio
@@ -238,6 +240,78 @@ class BudgetTracker:
                     mutations=max(0, summary.mutations - current.mutations),
                 ),
             )
+
+    def release_task_family(self, root_id: str) -> int:
+        """Remove registries once a root task and all descendants are quiescent.
+
+        Returns the number of task entries removed. This method now refuses
+        release when explicit lease ownership, active compute, or outstanding
+        reservations remain, so cleanup can never consume another waiter's
+        resource state.
+        """
+        with self._lock:
+            family = self._descendant_ids_locked(root_id)
+            if not self._family_quiescent_locked(family):
+                return 0
+            removed = 0
+            for task_id in family:
+                if task_id not in self._ledger:
+                    continue
+                self._ledger.pop(task_id, None)
+                self._budgets.pop(task_id, None)
+                self._parent.pop(task_id, None)
+                self._artifact_reservations.pop(task_id, None)
+                self._model_cost_reservations.pop(task_id, None)
+                self._model_cost_by_task.pop(task_id, None)
+                self._model_reservation_ids.pop(task_id, None)
+                self._model_accounting_ids.pop(task_id, None)
+                self._usage_hydrated.discard(task_id)
+                self._active_compute.pop(task_id, None)
+                self._model_leases.pop(task_id, None)
+                self._execution_leases.pop(task_id, None)
+                removed += 1
+            self._model_semaphores.pop(root_id, None)
+            self._model_limits.pop(root_id, None)
+            self._execution_semaphores.pop(root_id, None)
+            self._execution_limits.pop(root_id, None)
+            return removed
+
+    def can_release_family(self, root_id: str) -> bool:
+        """Return whether every family task is quiescent and lease-free."""
+        with self._lock:
+            return self._family_quiescent_locked(self._descendant_ids_locked(root_id))
+
+    def _family_quiescent_locked(self, family: list[str]) -> bool:
+        for task_id in family:
+            if task_id in self._active_compute:
+                return False
+            if int(self._model_leases.get(task_id) or 0):
+                return False
+            if int(self._execution_leases.get(task_id) or 0):
+                return False
+            if self._model_cost_by_task.get(task_id):
+                return False
+            if self._artifact_reservations.get(task_id):
+                return False
+        return True
+
+    def _descendant_ids_locked(self, root_id: str) -> list[str]:
+        """Bounded same-lock traversal of parent->child links (cycle-safe)."""
+        children: dict[str, list[str]] = {}
+        for task_id, parent in self._parent.items():
+            if parent is not None:
+                children.setdefault(parent, []).append(task_id)
+        family = [root_id]
+        stack = [root_id]
+        seen = {root_id}
+        while stack:
+            current = stack.pop()
+            for child in children.get(current, ()):
+                if child not in seen:
+                    seen.add(child)
+                    family.append(child)
+                    stack.append(child)
+        return family
 
     def record_child(self, parent_id: str) -> None:
         with self._lock:
@@ -671,9 +745,17 @@ class BudgetTracker:
                     f"model concurrency limit changed for root task {root}; restart required"
                 )
         await semaphore.acquire()
+        with self._lock:
+            self._model_leases[task_id] = int(self._model_leases.get(task_id) or 0) + 1
         try:
             yield
         finally:
+            with self._lock:
+                remaining = int(self._model_leases.get(task_id) or 0) - 1
+                if remaining > 0:
+                    self._model_leases[task_id] = remaining
+                else:
+                    self._model_leases.pop(task_id, None)
             semaphore.release()
 
     @asynccontextmanager
@@ -698,9 +780,17 @@ class BudgetTracker:
                     f"execution concurrency limit changed for root task {root}; restart required"
                 )
         await semaphore.acquire()
+        with self._lock:
+            self._execution_leases[task_id] = int(self._execution_leases.get(task_id) or 0) + 1
         try:
             yield
         finally:
+            with self._lock:
+                remaining = int(self._execution_leases.get(task_id) or 0) - 1
+                if remaining > 0:
+                    self._execution_leases[task_id] = remaining
+                else:
+                    self._execution_leases.pop(task_id, None)
             semaphore.release()
 
     async def _ancestor_ids(self, task_id: str) -> list[str]:

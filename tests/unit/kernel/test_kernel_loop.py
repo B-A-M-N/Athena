@@ -377,6 +377,34 @@ async def test_provider_assembled_before_receipt_fault_is_unknown(stack):
     )
 
 
+async def test_provider_completion_before_accounting_fault_is_recoverable(stack):
+    """A crash after provider completion cannot look like an uncharged success."""
+    response_store = ModelResponseStore(stack.db)
+    stack.kernel._model_response_store = response_store
+    stack.manager.set_model_response_store(response_store)
+    stack.kernel._provider_usage_store = _UsageRecorder()
+    stack.provider._scripts = [{"respond": {"text": "accounting boundary", "done": True}}]
+
+    async def fault(name: str) -> None:
+        if name == "usage-completion":
+            raise RuntimeError("fault after provider completion before accounting")
+
+    stack.kernel._inference_fault_injector = fault
+    spec = await _create(stack, "provider completion accounting boundary")
+    result = await stack.kernel.run_task(spec.id)
+
+    assert result.status is TaskStatus.RECOVERY_REQUIRED
+    attempts = await response_store.list_unresolved_attempts(spec.id)
+    assert len(attempts) == 1
+    assert attempts[0]["provider_outcome_status"] == "unknown"
+    receipt = await response_store.get_receipt(
+        task_id=spec.id,
+        request_fingerprint=attempts[0]["request_fingerprint"],
+    )
+    assert receipt is not None
+    assert receipt["response"]
+
+
 async def test_successful_model_calls_reconcile_cost_before_next_reservation(stack):
     """A completed call cannot leave its worst-case reservation behind."""
     stack.provider._info_kwargs["cost"] = CostInfo(per_1m_input=1.0, per_1m_output=100.0)

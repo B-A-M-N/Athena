@@ -1,4 +1,12 @@
-use super::*;
+use super::ffi::{
+    Display, MAX_XIM_BUFFER, Window, X_BUFFER_OVERFLOW, XCloseIM, XComposeStatus, XCreateIC,
+    XDestroyIC, XK_BACKSPACE, XK_DELETE, XK_DOWN, XK_END, XK_HOME, XK_LEFT, XK_PAGE_DOWN,
+    XK_PAGE_UP, XK_RETURN, XK_RIGHT, XK_TAB, XK_UP, XKeyEvent, XLookupString, XOpenIM, Xic, Xim,
+    Xutf8LookupString,
+};
+use alacritty_terminal::term::TermMode;
+use std::ffi::{CString, c_char, c_int, c_ulong};
+use std::ptr;
 
 pub(crate) struct InputMethod {
     im: *mut Xim,

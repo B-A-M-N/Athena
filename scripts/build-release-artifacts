@@ -109,11 +109,25 @@ if canonical_version(native_version) != python_version:
 lock_text = (root / "native" / "Cargo.lock").read_text()
 lock_data = tomllib.loads(lock_text)
 uv_lock_data = tomllib.loads((root / "uv.lock").read_text())
-binary = root / "native" / "target" / "release" / "athena-terminal"
-bridge = (root / "src" / "athena" / "cli" / "native_bridge.py").read_text()
+binary_candidates = [path for path in distributions.iterdir() if "native" in path.name and path.suffix == ".whl"]
+if not binary_candidates:
+    raise SystemExit("native companion wheel is missing before manifest generation")
+with __import__("zipfile").ZipFile(binary_candidates[0]) as native_archive:
+    binary_members = [
+        name
+        for name in native_archive.namelist()
+        if name.endswith("/athena-terminal") and not name.endswith("/")
+    ]
+if len(binary_members) != 1:
+    raise SystemExit(f"expected one native binary in companion wheel: {binary_members!r}")
+with __import__("zipfile").ZipFile(binary_candidates[0]) as native_archive:
+    binary_tmp = distributions / ".native-binary"
+    binary_tmp.write_bytes(native_archive.read(binary_members[0]))
+binary = binary_tmp
+schema = (root / "src" / "athena" / "presentation" / "schema.py").read_text()
 bridge_version = next(
     line.split("=", 1)[1].strip()
-    for line in bridge.splitlines()
+    for line in schema.splitlines()
     if line.startswith("NATIVE_BRIDGE_SCHEMA_VERSION")
 )
 rustc_details = run("rustc", "-vV")
@@ -131,7 +145,7 @@ artifacts = [
         "release_run_id": release_run_id,
     }
     for path in sorted(distributions.iterdir())
-    if path.is_file()
+    if path.is_file() and path != binary_tmp
 ]
 native_dynamic = run("readelf", "-d", str(binary))
 needed = re.findall(r"Shared library: \[([^]]+)\]", native_dynamic)
@@ -422,6 +436,7 @@ record = {
     "bridge_schema_version": int(bridge_version),
     "artifacts": artifacts,
 }
+binary_tmp.unlink(missing_ok=True)
 (out / "release-manifest.json").write_text(
     json.dumps(record, indent=2, sort_keys=True) + "\n"
 )

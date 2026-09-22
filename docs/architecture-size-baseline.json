@@ -1,17 +1,652 @@
 {
-  "schema": 1,
+  "default-callable-lines": 200,
+  "default-class-lines": 600,
+  "domain_host_allowlist": {
+    "files": {
+      "fusion/orchestrator.py": 20,
+      "packs/contribution_activation.py": 26,
+      "packs/hook_activation.py": 23,
+      "research/discovery_candidates.py": 7,
+      "research/workflow.py": 14,
+      "scheduler/control.py": 1,
+      "synthesis/proof_ledger.py": 1
+    },
+    "policy": "ratchet: reviewed migration sites may remain until ports migration completes; remove entries, never add them"
+  },
   "policy": "ratchet: each reviewed module may stay at or below this committed line count; reduce the baseline when decomposing",
   "python": {
-    "service/service.py": 3981,
-    "kernel/kernel.py": 2010,
-    "cli/app.py": 2504,
-    "capabilities/research.py": 1765,
-    "packs/manager.py": 1788
+    "acp/adapter.py": 487,
+    "affordances/fabric.py": 418,
+    "affordances/models.py": 425,
+    "affordances/optimizer.py": 72,
+    "affordances/scratch.py": 212,
+    "affordances/store.py": 593,
+    "affordances/validation.py": 453,
+    "api/app.py": 1249,
+    "api/decoders.py": 88,
+    "api/sse.py": 207,
+    "artifacts/cleanup.py": 93,
+    "artifacts/extractors.py": 181,
+    "artifacts/refs.py": 101,
+    "artifacts/store.py": 633,
+    "capabilities/artifacts.py": 511,
+    "capabilities/browser.py": 1105,
+    "capabilities/capsule.py": 442,
+    "capabilities/computer.py": 624,
+    "capabilities/context_blocks.py": 242,
+    "capabilities/debugger.py": 697,
+    "capabilities/delegate.py": 380,
+    "capabilities/dependency.py": 941,
+    "capabilities/diagnostics.py": 127,
+    "capabilities/dispatch_helpers.py": 345,
+    "capabilities/dispatch_mechanisms.py": 1325,
+    "capabilities/dispatcher.py": 1071,
+    "capabilities/environment.py": 62,
+    "capabilities/environment_common.py": 580,
+    "capabilities/environment_database.py": 910,
+    "capabilities/environment_network.py": 717,
+    "capabilities/environment_service.py": 554,
+    "capabilities/environment_workspace.py": 293,
+    "capabilities/execute.py": 531,
+    "capabilities/external_delegate.py": 155,
+    "capabilities/files.py": 15,
+    "capabilities/fs.py": 1115,
+    "capabilities/fusion.py": 305,
+    "capabilities/git.py": 302,
+    "capabilities/health.py": 363,
+    "capabilities/input_request.py": 74,
+    "capabilities/maintain.py": 621,
+    "capabilities/mcp_context.py": 144,
+    "capabilities/memory.py": 360,
+    "capabilities/mutation_recorder.py": 165,
+    "capabilities/observer.py": 253,
+    "capabilities/operations.py": 466,
+    "capabilities/packs.py": 216,
+    "capabilities/prepared.py": 80,
+    "capabilities/reflection.py": 784,
+    "capabilities/reflection_availability.py": 217,
+    "capabilities/reflection_inventory.py": 227,
+    "capabilities/reflection_passport.py": 250,
+    "capabilities/registry.py": 152,
+    "capabilities/research.py": 42,
+    "capabilities/research_contract.py": 211,
+    "capabilities/runtime_escalation.py": 227,
+    "capabilities/schedule.py": 367,
+    "capabilities/scratch.py": 243,
+    "capabilities/session_search.py": 249,
+    "capabilities/skills.py": 133,
+    "capabilities/synthesis.py": 113,
+    "capabilities/system.py": 535,
+    "capabilities/terminal_session.py": 631,
+    "capabilities/truth.py": 346,
+    "capabilities/watch.py": 678,
+    "capabilities/workflow.py": 533,
+    "causal/checkpoint.py": 761,
+    "causal/checkpoint_worker.py": 180,
+    "causal/fork.py": 333,
+    "cli/activity.py": 15,
+    "cli/animation.py": 180,
+    "cli/app.py": 2458,
+    "cli/chat.py": 554,
+    "cli/code_view.py": 10,
+    "cli/dual_pane.py": 1227,
+    "cli/duo_left.py": 6,
+    "cli/framebuffer.py": 791,
+    "cli/input.py": 39,
+    "cli/inspect.py": 388,
+    "cli/layout.py": 19,
+    "cli/native.py": 202,
+    "cli/native_bridge.py": 13,
+    "cli/native_session.py": 504,
+    "cli/oi_stream.py": 350,
+    "cli/operator_cli.py": 1070,
+    "cli/operator_commands.py": 557,
+    "cli/operator_handlers.py": 227,
+    "cli/projection.py": 10,
+    "cli/render/ansi.py": 5,
+    "cli/render/dotmatrix.py": 126,
+    "cli/render/kitty.py": 213,
+    "cli/render/scene.py": 9,
+    "cli/scene.py": 21,
+    "cli/surface.py": 532,
+    "cli/terminal.py": 82,
+    "concurrency/autonomy.py": 31,
+    "context/blocks.py": 6,
+    "context/compiler.py": 1814,
+    "context/compression.py": 520,
+    "context/contracts.py": 90,
+    "context/digest.py": 5,
+    "context/digest_builder.py": 229,
+    "context/instructions.py": 249,
+    "context/provenance.py": 156,
+    "context/requirements.py": 98,
+    "context/retrieval.py": 658,
+    "context/scoring.py": 141,
+    "context/selection.py": 165,
+    "delegates/models.py": 95,
+    "delegates/registry.py": 111,
+    "delegates/sessions.py": 465,
+    "delivery/adapters.py": 402,
+    "delivery/manager.py": 222,
+    "evaluation/context_fidelity.py": 116,
+    "evaluation/corpus.py": 46,
+    "evaluation/neutral.py": 308,
+    "evaluation/strategy_corpus.py": 60,
+    "evidence.py": 203,
+    "execution/async_call.py": 8,
+    "execution/backend.py": 137,
+    "execution/conformance.py": 603,
+    "execution/container.py": 357,
+    "execution/dependencies.py": 350,
+    "execution/dependency_lock.py": 154,
+    "execution/diagnostics.py": 362,
+    "execution/environment.py": 186,
+    "execution/local.py": 85,
+    "execution/manager.py": 440,
+    "execution/process_tree.py": 585,
+    "execution/runtime_host.py": 558,
+    "execution/runtimes/base.py": 327,
+    "execution/runtimes/node.py": 309,
+    "execution/runtimes/powershell.py": 267,
+    "execution/runtimes/python.py": 336,
+    "execution/runtimes/shell.py": 343,
+    "execution/ssh.py": 309,
+    "execution/ssh_protocol.py": 133,
+    "execution/ssh_remote_runtime.py": 625,
+    "fusion/comparison.py": 141,
+    "fusion/orchestrator.py": 856,
+    "fusion/ports.py": 69,
+    "fusion/selection.py": 214,
+    "hermes/agent_adapter.py": 334,
+    "hermes/config.py": 128,
+    "hermes/manager.py": 646,
+    "hermes/referee.py": 309,
+    "interpreter/context.py": 37,
+    "interpreter/extension.py": 171,
+    "interpreter/protocol.py": 110,
+    "interpreter/triggering.py": 109,
+    "kernel/continuations.py": 286,
+    "kernel/continuations_coordinator.py": 906,
+    "kernel/dispatch.py": 259,
+    "kernel/inference_broker.py": 502,
+    "kernel/kernel.py": 1719,
+    "kernel/lifecycle.py": 143,
+    "kernel/messages.py": 81,
+    "kernel/policy_context.py": 62,
+    "kernel/run_finalizer.py": 228,
+    "kernel/termination.py": 320,
+    "kernel/tokens.py": 173,
+    "kernel/verifiers.py": 611,
+    "knowledge/pipeline.py": 778,
+    "mcp/adapter.py": 224,
+    "mcp/client.py": 666,
+    "mcp/prompts.py": 157,
+    "mcp/resources.py": 137,
+    "mcp/sdk_compat.py": 205,
+    "mcp/supervisor.py": 136,
+    "mcp/tools.py": 301,
+    "memory/candidates.py": 309,
+    "memory/conflicts.py": 138,
+    "memory/embeddings.py": 134,
+    "memory/retrieval.py": 560,
+    "memory/store.py": 392,
+    "models/admission.py": 234,
+    "models/compat/anthropic_sdk.py": 52,
+    "models/compat/caching.py": 295,
+    "models/compat/candidates.py": 33,
+    "models/compat/profiles.py": 365,
+    "models/compat/toolrepair.py": 413,
+    "models/credentials.py": 266,
+    "models/fake.py": 12,
+    "models/inventory.py": 57,
+    "models/media.py": 48,
+    "models/providers/anthropic.py": 813,
+    "models/providers/fake.py": 255,
+    "models/providers/openai_compat.py": 799,
+    "models/ranking.py": 113,
+    "models/registry.py": 212,
+    "models/router.py": 341,
+    "models/tokens.py": 68,
+    "network/browser_proxy.py": 256,
+    "network/endpoint_security.py": 174,
+    "network/target_policy.py": 90,
+    "network/transport.py": 109,
+    "packs/activation.py": 109,
+    "packs/contribution_activation.py": 439,
+    "packs/hook_activation.py": 298,
+    "packs/hooks.py": 218,
+    "packs/install.py": 178,
+    "packs/lifecycle.py": 51,
+    "packs/manager.py": 600,
+    "packs/models.py": 59,
+    "packs/ports.py": 97,
+    "packs/provenance.py": 95,
+    "packs/runtime_state.py": 40,
+    "packs/source.py": 346,
+    "packs/store.py": 129,
+    "policy/approvals.py": 323,
+    "policy/credentials.py": 540,
+    "policy/engine.py": 522,
+    "policy/path_scope.py": 211,
+    "policy/profiles.py": 249,
+    "policy/rules.py": 194,
+    "policy/snapshot.py": 230,
+    "presentation/ansi.py": 122,
+    "presentation/ansi_scene.py": 572,
+    "presentation/code_view.py": 63,
+    "presentation/layout.py": 218,
+    "presentation/native_bridge.py": 431,
+    "presentation/projection.py": 979,
+    "presentation/scene.py": 738,
+    "presentation/schema.py": 121,
+    "presentation/semantics.py": 180,
+    "presentation/text.py": 37,
+    "project/index/builder.py": 704,
+    "project/index/coordinator.py": 184,
+    "project/index/impact.py": 13,
+    "project/index/lexical.py": 38,
+    "project/index/models.py": 179,
+    "project/index/semantic.py": 233,
+    "project/index/store.py": 62,
+    "project/profile.py": 443,
+    "protocol/affordances.py": 32,
+    "protocol/artifacts.py": 40,
+    "protocol/capabilities.py": 872,
+    "protocol/context.py": 236,
+    "protocol/continuations.py": 30,
+    "protocol/errors.py": 282,
+    "protocol/events.py": 129,
+    "protocol/execution.py": 161,
+    "protocol/failure.py": 169,
+    "protocol/hermes.py": 14,
+    "protocol/ids.py": 68,
+    "protocol/instruments.py": 85,
+    "protocol/memory.py": 77,
+    "protocol/messages.py": 191,
+    "protocol/models.py": 430,
+    "protocol/policy.py": 102,
+    "protocol/reality.py": 30,
+    "protocol/resources.py": 48,
+    "protocol/scheduling.py": 352,
+    "protocol/task_codec.py": 494,
+    "protocol/tasks.py": 927,
+    "protocol/termination.py": 21,
+    "protocol/work_classification.py": 154,
+    "protocol/workflows.py": 24,
+    "reality/candidate_verification.py": 472,
+    "reality/classification.py": 138,
+    "reality/completion.py": 138,
+    "reality/coordinator.py": 878,
+    "reality/gate.py": 269,
+    "recovery/manager.py": 250,
+    "release/gates.py": 483,
+    "release/native_abi.py": 134,
+    "release/provenance.py": 115,
+    "release/qualification.py": 111,
+    "research/acquisition.py": 115,
+    "research/commands.py": 50,
+    "research/discovery.py": 332,
+    "research/discovery_candidates.py": 181,
+    "research/domain_dispatch.py": 91,
+    "research/internal.py": 33,
+    "research/models.py": 515,
+    "research/policy.py": 156,
+    "research/result_codec.py": 164,
+    "research/service.py": 871,
+    "research/store.py": 513,
+    "research/verification.py": 104,
+    "research/workflow.py": 405,
+    "scheduler/authority.py": 148,
+    "scheduler/claims.py": 50,
+    "scheduler/control.py": 1239,
+    "scheduler/scheduler.py": 808,
+    "scheduler/triggers.py": 14,
+    "schema.py": 73,
+    "self_host/controller.py": 410,
+    "self_host/gates.py": 552,
+    "self_host/reviewer.py": 64,
+    "self_host/risk.py": 122,
+    "service/_parsing.py": 83,
+    "service/budget_cleanup.py": 69,
+    "service/candidates.py": 885,
+    "service/config.py": 1385,
+    "service/core_capabilities.py": 535,
+    "service/interaction.py": 568,
+    "service/lifecycle.py": 399,
+    "service/mcp_runtime.py": 291,
+    "service/observations.py": 92,
+    "service/operational_matrix.py": 70,
+    "service/operator_query.py": 530,
+    "service/provider_recovery.py": 422,
+    "service/provider_runtime.py": 193,
+    "service/readiness.py": 303,
+    "service/reasoning_components.py": 221,
+    "service/records.py": 95,
+    "service/recovery.py": 208,
+    "service/resource_finalizer.py": 604,
+    "service/self_host.py": 308,
+    "service/service.py": 2361,
+    "service/stop_sequence.py": 225,
+    "service/task_api.py": 391,
+    "service/task_intake.py": 343,
+    "service/watchers.py": 149,
+    "service/work_classification.py": 10,
+    "service/workflow_runner.py": 96,
+    "shadow/commit_mechanisms.py": 415,
+    "shadow/engine.py": 1033,
+    "shadow/persistence.py": 251,
+    "skills/candidates.py": 335,
+    "skills/lifecycle.py": 600,
+    "skills/loader.py": 332,
+    "skills/models.py": 96,
+    "skills/selector.py": 93,
+    "skills/validator.py": 106,
+    "state/approvals.py": 242,
+    "state/capability_health.py": 57,
+    "state/context_blocks.py": 345,
+    "state/context_digests.py": 103,
+    "state/database.py": 908,
+    "state/delegate_sessions.py": 116,
+    "state/events.py": 642,
+    "state/executions.py": 122,
+    "state/external_effects.py": 554,
+    "state/failure_memory.py": 171,
+    "state/input_requests.py": 199,
+    "state/messages.py": 506,
+    "state/model_responses.py": 817,
+    "state/mutation_manager.py": 77,
+    "state/mutations.py": 244,
+    "state/pack_hooks.py": 206,
+    "state/provider_usage.py": 105,
+    "state/resource_obligations.py": 157,
+    "state/rollback.py": 239,
+    "state/runtime_sessions.py": 223,
+    "state/schedules.py": 428,
+    "state/self_host.py": 163,
+    "state/sessions.py": 594,
+    "state/steering.py": 81,
+    "state/task_finalizations.py": 292,
+    "state/tasks.py": 638,
+    "state/tool_repairs.py": 141,
+    "strategy.py": 1150,
+    "synthesis/child_runtime.py": 442,
+    "synthesis/engine.py": 890,
+    "synthesis/helpers.py": 577,
+    "synthesis/models.py": 133,
+    "synthesis/promotion.py": 435,
+    "synthesis/proof_corpus.py": 114,
+    "synthesis/proof_ledger.py": 307,
+    "synthesis/runtime.py": 301,
+    "synthesis/validation.py": 426,
+    "synthesis/verifier.py": 43,
+    "tasks/budgets.py": 1068,
+    "tasks/cancellation.py": 319,
+    "tasks/delegation.py": 790,
+    "tasks/manager.py": 1053,
+    "tasks/worker.py": 464,
+    "verification/certificate.py": 80,
+    "verification/identity.py": 107,
+    "verification/planner.py": 280,
+    "voice/service.py": 289,
+    "workflows/executor.py": 819,
+    "workflows/graph_loader.py": 39,
+    "workflows/mining.py": 219,
+    "workflows/models.py": 150,
+    "workflows/runs.py": 489,
+    "workflows/store.py": 510,
+    "workflows/validation.py": 141,
+    "workspace_manifest.py": 437,
+    "worldstate/core.py": 529,
+    "worldstate/store.py": 242,
+    "affordances/discovery.py": 141,
+    "affordances/persistence.py": 67,
+    "affordances/records.py": 118,
+    "reality/transaction_state.py": 113,
+    "reality/sensitivity.py": 197,
+    "execution/backend_catalog.py": 101
   },
+  "python-class-budgets": {
+    "affordances/fabric.py": {
+      "CapabilityFabric": 386
+    },
+    "capabilities/dispatcher.py": {
+      "CapabilityDispatcher": 952
+    },
+    "capabilities/environment_database.py": {
+      "DatabaseCapability": 880
+    },
+    "capabilities/environment_network.py": {
+      "NetworkCapability": 681
+    },
+    "capabilities/fs.py": {
+      "FilesystemCapability": 617
+    },
+    "capabilities/reflection.py": {
+      "CapabilityReflection": 482
+    },
+    "capabilities/synthesis.py": {
+      "SynthesisCapability": 28
+    },
+    "cli/dual_pane.py": {
+      "DualPaneSurface": 487
+    },
+    "cli/framebuffer.py": {
+      "OIFrameBuffer": 682
+    },
+    "context/compiler.py": {
+      "ContextCompiler": 862
+    },
+    "execution/container.py": {
+      "ContainerBackend": 311
+    },
+    "execution/manager.py": {
+      "ExecutionManager": 385
+    },
+    "execution/ssh.py": {
+      "SSHBackend": 260
+    },
+    "fusion/orchestrator.py": {
+      "FusionOrchestrator": 785
+    },
+    "kernel/continuations_coordinator.py": {
+      "ContinuationCoordinator": 814
+    },
+    "kernel/inference_broker.py": {
+      "InferenceBroker": 391
+    },
+    "kernel/kernel.py": {
+      "AgentKernel": 1123
+    },
+    "memory/store.py": {
+      "MemoryStore": 360
+    },
+    "presentation/projection.py": {
+      "ProjectionState": 809
+    },
+    "reality/coordinator.py": {
+      "RealityCoordinator": 744
+    },
+    "reality/gate.py": {
+      "RealityGate": 194
+    },
+    "research/service.py": {
+      "ResearchService": 801
+    },
+    "scheduler/control.py": {
+      "ScheduleAPI": 648
+    },
+    "service/candidates.py": {
+      "CandidateService": 742
+    },
+    "service/lifecycle.py": {
+      "ServiceLifecycle": 347
+    },
+    "service/self_host.py": {
+      "SelfHostService": 268
+    },
+    "service/service.py": {
+      "AthenaService": 2194
+    },
+    "shadow/engine.py": {
+      "ShadowEngine": 878
+    },
+    "state/model_responses.py": {
+      "ModelResponseStore": 737
+    },
+    "synthesis/engine.py": {
+      "SynthesisEngine": 432
+    },
+    "synthesis/validation.py": {
+      "Validator": 384
+    },
+    "tasks/budgets.py": {
+      "BudgetTracker": 785
+    },
+    "tasks/manager.py": {
+      "TaskManager": 789
+    },
+    "workflows/executor.py": {
+      "WorkflowExecutor": 615
+    },
+    "workflows/runs.py": {
+      "WorkflowRunStore": 259
+    }
+  },
+  "python-function-budgets": {
+    "affordances/store.py": {
+      "save": 263
+    },
+    "capabilities/browser.py": {
+      "_dispatch": 243
+    },
+    "capabilities/debugger.py": {
+      "invoke": 244
+    },
+    "capabilities/dependency.py": {
+      "_replay": 208,
+      "invoke": 263
+    },
+    "capabilities/dispatcher.py": {
+      "_dispatch_prepared_core": 413
+    },
+    "capabilities/environment_database.py": {
+      "_database_transaction": 401
+    },
+    "capabilities/environment_network.py": {
+      "_http_transaction": 334
+    },
+    "capabilities/environment_service.py": {
+      "_service_transaction": 320
+    },
+    "capabilities/execute.py": {
+      "invoke": 287
+    },
+    "capabilities/reflection.py": {
+      "_environment_passport": 268
+    },
+    "capabilities/reflection_availability.py": {
+      "explain_availability": 203
+    },
+    "capabilities/schedule.py": {
+      "invoke": 218
+    },
+    "capabilities/synthesis.py": {
+      "invoke": 465
+    },
+    "capabilities/terminal_session.py": {
+      "invoke": 214
+    },
+    "capabilities/workflow.py": {
+      "invoke": 295
+    },
+    "cli/app.py": {
+      "_arg_parse": 217,
+      "_click_cli": 421
+    },
+    "cli/dual_pane.py": {
+      "observe": 211
+    },
+    "cli/operator_cli.py": {
+      "register_argparse_commands": 202,
+      "register_operator_commands": 698
+    },
+    "cli/operator_commands.py": {
+      "dispatch": 473
+    },
+    "cli/surface.py": {
+      "render_event": 247
+    },
+    "delivery/adapters.py": {
+      "send": 207
+    },
+    "execution/conformance.py": {
+      "run_backend_conformance": 268
+    },
+    "kernel/inference_broker.py": {
+      "_invoke": 16,
+      "utility_inference": 20
+    },
+    "packs/hook_activation.py": {
+      "activate_pack_hooks": 251
+    },
+    "presentation/ansi_scene.py": {
+      "render_scene_lines": 205
+    },
+    "presentation/native_bridge.py": {
+      "native_projection_frame": 289
+    },
+    "reality/coordinator.py": {
+      "_prepare_speculative_completion": 224
+    },
+    "release/gates.py": {
+      "release_commands": 353
+    },
+    "research/workflow.py": {
+      "run_bounded_research": 225
+    },
+    "service/config.py": {
+      "config_to_dict": 209
+    },
+    "service/core_capabilities.py": {
+      "register_core_capabilities": 510
+    },
+    "service/lifecycle.py": {
+      "_start_impl": 4
+    },
+    "service/reasoning_components.py": {
+      "build_reasoning_components": 205
+    },
+    "service/self_host.py": {
+      "continue_self_host": 9
+    },
+    "service/stop_sequence.py": {
+      "stop": 210
+    },
+    "strategy.py": {
+      "select_strategy": 291
+    },
+    "synthesis/engine.py": {
+      "_build_executor": 20
+    },
+    "synthesis/validation.py": {
+      "validate": 197
+    },
+    "workflows/executor.py": {
+      "_run_item": 257,
+      "_run_step": 368
+    }
+  },
+  "python-function-budgets-policy": "ratchet: named functions must be reduced when decomposed; new code may not exceed these",
   "rust": {
-    "main.rs": 1658,
-    "x11.rs": 3294,
-    "render/oi.rs": 2890,
-    "render/chassis.rs": 1169
-  }
+    "main.rs": 669,
+    "render/chassis.rs": 808,
+    "render/oi/scenes.rs": 1161,
+    "x11.rs": 484,
+    "x11/window_manager.rs": 453,
+    "x11/window_hints.rs": 70,
+    "render/fit.rs": 83,
+    "projection_schema.rs": 758,
+    "render/chassis_panels.rs": 309
+  },
+  "schema": 1
 }

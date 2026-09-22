@@ -1,31 +1,74 @@
-use super::super::*;
+use crate::input::InputBuffer;
+
+use crate::platform::*;
+use crate::render::text::FontRole;
+use crate::x11::*;
+
 use super::chassis::{ChassisMaterial, PresentationSettings, draw_chassis};
 use super::oi::{OiTarget, draw_oi_scene};
 use super::primitives::{draw_rect, with_crt_mask, with_scissor};
 use super::prompt::draw_status_cursor;
 use super::terminal::{draw_terminal_background, draw_terminal_text};
 use super::text::TextRenderer;
+use super::transcript::draw_transcript;
+use crate::{Projection, VisualMode};
+
+#[derive(Clone, Copy)]
+pub(crate) struct FrameContext<'a> {
+    pub(crate) width: i32,
+    pub(crate) height: i32,
+    pub(crate) core: &'a NativeTerminalCore,
+    pub(crate) projection: &'a Projection,
+    pub(crate) selection: Option<((usize, usize), (usize, usize))>,
+    pub(crate) text: &'a TextRenderer,
+    pub(crate) focused: bool,
+    pub(crate) input_buffer: &'a InputBuffer,
+    pub(crate) options: &'a RendererOptions,
+    pub(crate) presentation: PresentationSettings,
+    pub(crate) stencil_available: bool,
+    pub(crate) oi_target: &'a OiTarget,
+    pub(crate) chassis_material: &'a ChassisMaterial,
+    pub(crate) dirty: DirtyDomains,
+    pub(crate) effect_phase: f32,
+    pub(crate) motion_time: f32,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct TextLayerContext<'a> {
+    pub(crate) display: *mut Display,
+    pub(crate) width: i32,
+    pub(crate) height: i32,
+    pub(crate) core: &'a NativeTerminalCore,
+    pub(crate) projection: &'a Projection,
+    pub(crate) text: &'a TextRenderer,
+    pub(crate) focused: bool,
+    pub(crate) input_buffer: &'a InputBuffer,
+    pub(crate) options: &'a RendererOptions,
+    pub(crate) dirty: DirtyDomains,
+}
 
 /// Compose the platform-owned terminal and the Athena-owned visual surfaces.
 /// Event handling stays in x11.rs; this module owns render ordering and dirty
 /// domain isolation.
-pub(crate) fn draw_frame(
-    width: i32,
-    height: i32,
-    core: &NativeTerminalCore,
-    projection: &Projection,
-    selection: Option<((usize, usize), (usize, usize))>,
-    text: &TextRenderer,
-    focused: bool,
-    input_buffer: &InputBuffer,
-    options: &RendererOptions,
-    presentation: PresentationSettings,
-    stencil_available: bool,
-    oi_target: &OiTarget,
-    chassis_material: &ChassisMaterial,
-    dirty: DirtyDomains,
-    phase: f32,
-) {
+pub(crate) fn draw_frame(context: FrameContext<'_>) {
+    let FrameContext {
+        width,
+        height,
+        core,
+        projection,
+        selection,
+        text,
+        focused,
+        input_buffer,
+        options,
+        presentation,
+        stencil_available,
+        oi_target,
+        chassis_material,
+        dirty,
+        effect_phase,
+        motion_time,
+    } = context;
     let metrics = UiFontMetrics {
         body: text.metrics_for(FontRole::Body),
         input: text.metrics_for(FontRole::Input),
@@ -53,7 +96,7 @@ pub(crate) fn draw_frame(
             &geometry,
             projection,
             focused,
-            phase,
+            effect_phase,
             presentation,
             chassis_material,
         );
@@ -62,20 +105,21 @@ pub(crate) fn draw_frame(
                 draw_terminal_background(core, &geometry, selection);
             });
             with_crt_mask(height, geometry.oi_inner, stencil_available, || {
-                draw_oi_scene(
-                    oi_target,
-                    width,
-                    height,
-                    geometry.oi_inner.x,
-                    geometry.oi_inner.y,
-                    geometry.oi_inner.width,
-                    geometry.oi_inner.height,
+                draw_oi_scene(super::oi::OiSceneContext {
+                    target: oi_target,
+                    frame_width: width,
+                    frame_height: height,
+                    x: geometry.oi_inner.x,
+                    y: geometry.oi_inner.y,
+                    width: geometry.oi_inner.width,
+                    height: geometry.oi_inner.height,
                     projection,
-                    phase,
+                    effect_phase,
+                    motion_time,
                     options,
                     presentation,
                     stencil_available,
-                );
+                });
             });
         }
     }
@@ -93,20 +137,21 @@ pub(crate) fn draw_frame(
                 geometry.oi_inner.height,
                 super::theme::GLASS_BACKGROUND,
             );
-            draw_oi_scene(
-                oi_target,
-                width,
-                height,
-                geometry.oi_inner.x,
-                geometry.oi_inner.y,
-                geometry.oi_inner.width,
-                geometry.oi_inner.height,
+            draw_oi_scene(super::oi::OiSceneContext {
+                target: oi_target,
+                frame_width: width,
+                frame_height: height,
+                x: geometry.oi_inner.x,
+                y: geometry.oi_inner.y,
+                width: geometry.oi_inner.width,
+                height: geometry.oi_inner.height,
                 projection,
-                phase,
+                effect_phase,
+                motion_time,
                 options,
                 presentation,
                 stencil_available,
-            );
+            });
         });
     }
 
@@ -114,7 +159,7 @@ pub(crate) fn draw_frame(
     // copied with the cabinet before the window-owned Xft text is painted.
     if dirty.full && !options.cabinet_only {
         text.with_clip(geometry.prompt, || {
-            draw_status_cursor(text, &geometry, focused, input_buffer, phase);
+            draw_status_cursor(text, &geometry, focused, input_buffer, effect_phase);
         });
     }
 
@@ -127,18 +172,19 @@ pub(crate) fn draw_frame(
 /// visible X11 window. Xft is intentionally window-owned: several GLX/X11
 /// implementations do not expose XRender writes made to a GLX pixmap when
 /// that pixmap is subsequently copied with XCopyArea.
-pub(crate) fn draw_text_layer(
-    display: *mut Display,
-    width: i32,
-    height: i32,
-    core: &NativeTerminalCore,
-    projection: &Projection,
-    text: &TextRenderer,
-    focused: bool,
-    input_buffer: &InputBuffer,
-    options: &RendererOptions,
-    dirty: DirtyDomains,
-) {
+pub(crate) fn draw_text_layer(context: TextLayerContext<'_>) {
+    let TextLayerContext {
+        display,
+        width,
+        height,
+        core,
+        projection,
+        text,
+        focused,
+        input_buffer,
+        options,
+        dirty,
+    } = context;
     if options.cabinet_only || !(dirty.full || dirty.terminal) {
         return;
     }
@@ -151,12 +197,16 @@ pub(crate) fn draw_text_layer(
     let geometry = FrameGeometry::for_window(width, height, metrics);
     if dirty.full || dirty.terminal {
         text.with_clip(geometry.operator_viewport, || {
-            draw_terminal_text(
-                text,
-                core,
-                &geometry,
-                VisualMode::from_projection(projection) == VisualMode::Idle,
-            );
+            if !projection.conversation.is_empty() {
+                draw_transcript(text, projection, geometry.operator_viewport);
+            } else {
+                draw_terminal_text(
+                    text,
+                    core,
+                    &geometry,
+                    VisualMode::from_projection(projection) == VisualMode::Idle,
+                );
+            }
         });
     }
     if dirty.full {

@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 from typing import Any, AsyncIterator
 
-from athena.execution.async_call import run_blocking
+from athena.concurrency import run_blocking
 from athena.protocol.events import Event, make_event
 from athena.protocol.ids import new_id
 from athena.protocol.tasks import AgentRequest, AutonomyLevel, TaskResult

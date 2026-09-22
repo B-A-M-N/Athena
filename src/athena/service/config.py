@@ -20,7 +20,6 @@ Config layering (deterministic precedence, lowest to highest):
 from __future__ import annotations
 
 import json
-from enum import StrEnum
 from importlib import import_module
 import os
 import re
@@ -30,6 +29,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from athena.protocol.tasks import AutonomyLevel
+from athena.protocol.hermes import HermesSupervisionMode
 from athena.protocol.policy import DEFAULT_PRINCIPAL_ID
 from athena.policy.credentials import write_user_secret
 from athena.memory.embeddings import DEFAULT_FASTEMBED_MODEL
@@ -209,14 +209,6 @@ class VoiceConfig:
         if response_format not in {"mp3", "mpeg", "wav", "opus", "aac", "flac", "pcm"}:
             raise ValueError("voice.response_format must be a supported audio format")
         object.__setattr__(self, "response_format", response_format)
-
-
-class HermesSupervisionMode(StrEnum):
-    """Operator-selected strength of the optional Hermes boundary."""
-
-    OFF = "off"
-    ADVISORY = "advisory"
-    REQUIRED = "required"
 
 
 @dataclass(frozen=True)

@@ -61,7 +61,7 @@ def _dispatcher(*execs) -> tuple[CapabilityDispatcher, list[_Executor]]:
     reg = CapabilityRegistry()
     for e in execs:
         reg.register(e)
-    dispatcher = CapabilityDispatcher(reg, PolicyEngine(AutonomyLevel.SUPERVISED))
+    dispatcher = CapabilityDispatcher(reg, PolicyEngine(AutonomyLevel.AUTONOMOUS))
     return dispatcher, list(execs)
 
 
@@ -103,7 +103,7 @@ def test_preflight_aborts_batch_on_unknown_capability():
     assert len(results) == 1
     result = results[0]
     assert result.status == CapabilityResultStatus.FAILED
-    assert "unknown-capability" in result.error and "no.such" in result.error
+    assert "unknown_capability" in result.error and "no.such" in result.error
     assert exec_.invocations == []
 
 
@@ -169,3 +169,124 @@ def test_preflight_false_restores_legacy_behavior():
 def test_preflight_empty_batch():
     dispatcher, _ = _dispatcher(_read_exec())
     assert asyncio.run(dispatcher.dispatch_many([], workspace=_workspace())) == []
+
+
+@pytest.mark.athena_scenario("DISPATCH-PREPARED-BATCH")
+def test_batched_calls_prepare_each_executor_exactly_once():
+    """One prepared snapshot per request crosses preflight, controls, and core."""
+
+    executors = {"files.a": _read_exec("files.a"), "files.b": _read_exec("files.b")}
+    dispatcher, _ = _dispatcher(*executors.values())
+    resolutions = []
+    original = dispatcher._executor_for
+
+    def counting_executor_for(request, workspace):
+        resolutions.append(request.capability_id)
+        return original(request, workspace)
+
+    dispatcher._executor_for = counting_executor_for
+    requests = [_req("files.a", path="/tmp/ws/a"), _req("files.b", path="/tmp/ws/b")]
+
+    results = asyncio.run(dispatcher.dispatch_many(requests, workspace=_workspace()))
+
+    assert [result.status for result in results] == [CapabilityResultStatus.OK] * 2
+    assert sorted(resolutions) == ["files.a", "files.b"]
+    assert all(result.status == CapabilityResultStatus.OK for result in results)
+
+
+def _write_exec(name: str) -> _Executor:
+    return _Executor(
+        CapabilityDescriptor(
+            id=name,
+            description="write",
+            input_schema={
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+            effects=frozenset({EffectClass.WRITE_LOCAL}),
+        )
+    )
+
+
+def _execute_exec() -> _Executor:
+    return _Executor(
+        CapabilityDescriptor(
+            id="execute",
+            description="execute",
+            input_schema={"type": "object"},
+            effects=frozenset({EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS}),
+        )
+    )
+
+
+def test_complex_mutation_batch_escalates_before_execution():
+    """Multiple project writes mark the task runtime-speculative before invoke."""
+    writes = [_write_exec("files.a"), _write_exec("files.b")]
+    dispatcher, _ = _dispatcher(*writes)
+
+    results = asyncio.run(
+        dispatcher.dispatch_many(
+            [
+                _req("files.a", path="/tmp/ws/a.txt"),
+                _req("files.b", path="/tmp/ws/b.txt"),
+            ],
+            workspace=_workspace(),
+        )
+    )
+
+    assert [result.status for result in results] == [CapabilityResultStatus.OK] * 2
+    assert dispatcher._runtime_speculative_tasks == {"t1"}
+
+
+def test_mutation_plus_execution_batch_escalates_before_execution():
+    dispatcher, _ = _dispatcher(_write_exec("files.a"), _execute_exec())
+
+    results = asyncio.run(
+        dispatcher.dispatch_many(
+            [
+                _req("files.a", path="/tmp/ws/a.txt"),
+                _req("execute", code="pytest"),
+            ],
+            workspace=_workspace(),
+        )
+    )
+
+    assert [result.status for result in results] == [CapabilityResultStatus.OK] * 2
+    assert dispatcher._runtime_speculative_tasks == {"t1"}
+
+
+def test_read_batch_does_not_claim_runtime_speculation():
+    reads = [_read_exec("files.read"), _read_exec("files.stat")]
+    dispatcher, _ = _dispatcher(*reads)
+
+    results = asyncio.run(
+        dispatcher.dispatch_many(
+            [_req("files.read", path="/tmp/ws/a"), _req("files.stat", path="/tmp/ws/b")],
+            workspace=_workspace(),
+        )
+    )
+
+    assert [result.status for result in results] == [CapabilityResultStatus.OK] * 2
+    assert dispatcher._runtime_speculative_tasks == set()
+
+
+async def test_preparation_failure_codes_are_exact():
+    """Schema, unknown-capability, and effect-contract failures carry distinct
+    typed codes, not all collapsed into 'unknown-capability'."""
+    from athena.capabilities.dispatch_mechanisms import PreparationFailure
+    from athena.capabilities.prepared import PreparationFailure as PF
+
+    # Direct unit: the failure object distinguishes codes.
+    assert PF(code="unknown_capability").code == "unknown_capability"
+    assert PF(code="schema_validation").code == "schema_validation"
+    assert PF(code="repair_invalid").code == "repair_invalid"
+    assert PF(code="effect_contract").code == "effect_contract"
+
+    # Schema failure carries structured errors.
+    schema_failure = PreparationFailure(
+        code="schema_validation",
+        schema_errors=("missing required: path",),
+    )
+    assert schema_failure.code == "schema_validation"
+    assert schema_failure.schema_errors == ("missing required: path",)

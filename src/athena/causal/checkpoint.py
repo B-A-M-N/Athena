@@ -15,12 +15,14 @@ import logging
 import os
 import shutil
 import stat
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Literal
 
+from athena.concurrency import run_blocking
 from athena.protocol.ids import new_id
 from athena.workspace_manifest import copy_ignore, copy_workspace_tree, tree_paths
 
@@ -154,7 +156,7 @@ class CheckpointManager:
             metadata_payload = base64.b64encode(
                 json.dumps(metadata, sort_keys=True).encode("utf-8")
             ).decode("ascii")
-        manifest = await _run_worker(
+        manifest = await run_checkpoint_worker(
             "capture",
             root=str(self._root),
             task_id=task_id,
@@ -181,7 +183,7 @@ class CheckpointManager:
 
     async def inspect(self, checkpoint_id: str) -> dict:
         """Read an immutable checkpoint manifest, including semantic state."""
-        return await _run_worker(
+        return await run_checkpoint_worker(
             "inspect",
             root=str(self._root),
             checkpoint_id=checkpoint_id,
@@ -219,7 +221,7 @@ class CheckpointManager:
                 continue
             if not record.get("terminal_state"):
                 continue
-            await _run_worker(
+            await run_checkpoint_worker(
                 "delete",
                 root=str(self._root),
                 checkpoint_id=checkpoint_id,
@@ -255,7 +257,7 @@ class CheckpointManager:
             # Keep deletion on the same short-lived worker boundary as
             # capture/fingerprint/restore. A blocked filesystem thread must
             # never pin Athena's completion or recovery event loop.
-            await _run_worker(
+            await run_checkpoint_worker(
                 "delete",
                 root=str(self._root),
                 checkpoint_id=checkpoint_id,
@@ -382,7 +384,7 @@ class CheckpointManager:
 
     async def fingerprint(self, workspace_root: str) -> str:
         """Return the current revision fingerprint used for conflict checks."""
-        result = await _run_worker(
+        result = await run_checkpoint_worker(
             "fingerprint",
             root=str(self._root),
             workspace_root=workspace_root,
@@ -403,7 +405,7 @@ class CheckpointManager:
         expected_fingerprint: str | None = None,
     ) -> dict:
         """Restore a snapshot after integrity and concurrent-change checks."""
-        return await _run_worker(
+        return await run_checkpoint_worker(
             "restore",
             root=str(self._root),
             checkpoint_id=checkpoint_id,
@@ -706,41 +708,34 @@ def _resume_context(
     return context
 
 
-async def _run_worker(operation: str, **kwargs) -> dict:
+async def run_checkpoint_worker(operation: str, **kwargs) -> dict:
     """Run blocking checkpoint I/O in a short-lived child process.
 
     The service event loop must not perform copytree/rglob/hash work itself.
     A child process also avoids coupling checkpoint latency to asyncio's
     process-global default thread executor.
-
-    ``asyncio`` is imported lazily: this module is also the child worker's
-    import target, and a child that never awaits must not pay the ~0.5s
-    asyncio/ssl import cost on every spawn (measured stall contributor for
-    verification/commit chains, review P0-3 adjacent).
     """
-    import asyncio  # noqa: PLC0415 - see docstring; child process must not pay this
-
     command = [sys.executable, "-m", "athena.causal.checkpoint_worker", operation]
     for key, value in kwargs.items():
         if value is None:
             continue
         command.extend((f"--{key.replace('_', '-')}", str(value)))
-    process = await asyncio.create_subprocess_exec(  # architecture-lint: allow subprocess-outside-approved-backends reason=owned checkpoint worker
-        *command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        stdout, stderr = await process.communicate()
-    except asyncio.CancelledError:
-        # Shutdown/cancellation must not orphan the child (P0-2): kill it and
-        # wait for exit so no transport outlives the event loop.
-        process.kill()
-        try:
-            await process.wait()
-        except Exception:
-            pass
-        raise
+
+    def _run_worker_process() -> subprocess.CompletedProcess[bytes]:
+        # Wait directly on the child from an owned thread.  asyncio subprocess
+        # transports depend on an event-loop child watcher; on constrained
+        # hosts it can miss exit notifications and leave a completed worker
+        # pending forever.  ``subprocess.run`` uses waitpid, which has no such
+        # dependency.
+        return subprocess.run(  # noqa: S603 - fixed owned module command # architecture-lint: allow subprocess-outside-approved-backends reason=owned checkpoint worker; architecture-exception: checkpoint-worker
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+    process = await run_blocking(_run_worker_process)
+    stdout, stderr = process.stdout, process.stderr
     try:
         payload = json.loads(stdout.decode("utf-8")) if stdout else {}
     except json.JSONDecodeError as exc:

@@ -1,5 +1,5 @@
 from athena.protocol.tasks import Criterion, VerificationSpec, VerificationType
-from athena.reality.coordinator import _deduplicate_criteria
+from athena.reality.candidate_verification import _deduplicate_criteria
 from athena.self_host.gates import SelfHostGatePolicy
 from athena.verification.identity import command_proof_id, proof_subsumes, verification_proof_id
 

@@ -7,7 +7,6 @@ exists separately.
 
 from __future__ import annotations
 
-import asyncio
 from typing import AsyncIterator, Mapping
 
 from athena.execution.backend import BackendCapabilities, ExecutionBackend
@@ -80,21 +79,7 @@ class LocalBackend(ExecutionBackend):
         await self.manager.interrupt(execution_id)
 
     async def destroy_session(self, runtime_session_id: str) -> None:
-        for task_id in list(self.manager._task_sessions):  # noqa: SLF001
-            await self._destroy_in_task(task_id, runtime_session_id)
-
-    async def _destroy_in_task(self, task_id: str, runtime_session_id: str) -> None:
-        sessions = self.manager._task_sessions.get(task_id, [])  # noqa: SLF001
-        for rt, sid in list(sessions):
-            if sid == runtime_session_id:
-                self.manager._runtime_by_session.pop(sid, None)  # noqa: SLF001
-                sessions.remove((rt, sid))
-                close = getattr(rt, "close", None)
-                if close is not None:
-                    if asyncio.iscoroutinefunction(close):
-                        await close(sid)
-                    else:
-                        close(sid)
+        await self.manager.destroy_session(runtime_session_id)
 
     async def shutdown(self) -> None:
         await self.manager.close_all()

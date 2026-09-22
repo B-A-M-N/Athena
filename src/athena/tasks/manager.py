@@ -16,7 +16,9 @@ from athena.protocol.errors import (
     TaskDeadlineExceeded,
     TaskError,
 )
+from athena.protocol.failure import FailureInfo
 from athena.protocol.messages import utcnow
+from athena.protocol.task_codec import decode_task_spec
 from athena.protocol.tasks import (
     ContextRef,
     Durability,
@@ -54,9 +56,7 @@ Task = TaskSpec
 
 
 def _deserialize(row: dict[str, Any]) -> TaskSpec:
-    from athena.kernel.lifecycle import deserialize_task
-
-    return deserialize_task(row)
+    return decode_task_spec(row, status=row.get("status"))
 
 
 @dataclass(frozen=True)
@@ -127,6 +127,7 @@ class TaskManager:
         self._finalization_events: dict[str, asyncio.Event] = {}
         self._finalization_barrier: Any = None
         self._wakeup_callback: Any = None
+        self._terminal_failures: dict[str, FailureInfo] = {}
 
     def add_finalize_observer(self, observer: Any) -> None:
         """Register an async ``(task, result)`` post-finalization hook."""
@@ -442,6 +443,7 @@ class TaskManager:
         evidence: tuple = (),
         artifacts: tuple = (),
         mutations: tuple = (),
+        failure: FailureInfo | None = None,
         _allow_recovery_completion: bool = False,
     ) -> TaskResult:
         task_id = task.id if isinstance(task, TaskSpec) else str(task)
@@ -563,7 +565,7 @@ class TaskManager:
                 allow_recovery_completion=_allow_recovery_completion,
                 commit_pending=self._finalizations is not None,
             )
-            await self._post_commit(resolved, result)
+            await self._post_commit(resolved, result, failure=failure)
             return result
         finally:
             barrier.set()
@@ -618,7 +620,13 @@ class TaskManager:
             commit_pending=commit_pending,
         )
 
-    async def _post_commit(self, task: Task, result: TaskResult) -> None:
+    async def _post_commit(
+        self,
+        task: Task,
+        result: TaskResult,
+        *,
+        failure: FailureInfo | None = None,
+    ) -> None:
         """Publish a committed result and drain durable observers."""
         task_id = result.task_id
         if result.status in FINAL_STATUSES and self._steering_store is not None:
@@ -627,7 +635,10 @@ class TaskManager:
             except Exception as exc:
                 _logger.warning("could not mark pending steering missed for %s: %s", task_id, exc)
         self._running_emitted.discard(task_id)
-        await self._emit(task, result.status)
+        if failure is not None:
+            self._terminal_failures[task_id] = failure
+        emitted_failure = self._terminal_failures.pop(task_id, None)
+        await self._emit(task, result.status, failure=emitted_failure)
 
         if self._budgets is not None:
             await self._release_model_reservations_if_safe(task_id)
@@ -788,12 +799,21 @@ class TaskManager:
             usage=usage,
         )
 
-    async def _emit(self, task: Task, status: TaskStatus, *, reason: str = "") -> None:
+    async def _emit(
+        self,
+        task: Task,
+        status: TaskStatus,
+        *,
+        reason: str = "",
+        failure: FailureInfo | None = None,
+    ) -> None:
         if self._events is None:
             return
         payload: dict[str, Any] = {"status": status.value}
         if reason:
             payload["reason"] = reason
+        if failure is not None:
+            payload["failure"] = failure.as_dict()
         causal = (task.metadata or {}).get("_causal")
         if isinstance(causal, dict) and causal.get("kind") == "pack_hook":
             # Only the durable TaskSpec metadata may establish hook lineage;

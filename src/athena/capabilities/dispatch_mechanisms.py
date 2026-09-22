@@ -21,64 +21,63 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
-import time
+from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Mapping
 
-from athena.capabilities.registry import validate_schema
 from athena.policy.approvals import args_digest
 from athena.protocol.capabilities import (
     CapabilityRequest,
+    CapabilityRequestOrigin,
     CapabilityResult,
+    ExternalEffectPhase,
     CapabilityResultStatus,
     DispatchDirectives,
+    DispatchProvenance,
     EffectClass,
 )
 from athena.protocol.errors import CapabilityUnavailable, PersistenceError
 from athena.protocol.ids import new_id
 from athena.protocol.events import EV
-from athena.protocol.policy import ApprovalScope, PolicyDecision, PolicyVerdict
+from athena.protocol.policy import (
+    ApprovalScope,
+    PolicyDecision,
+    PolicyRequest,
+    PolicyVerdict,
+)
 from athena.protocol.tasks import CapabilityPolicy, capability_id_permitted
+from athena.schema import validate_schema
 from athena.protocol.tasks import ResourceBudget, WorkspaceSpec
 
 if TYPE_CHECKING:
     from athena.capabilities.dispatcher import CapabilityDispatcher
 
-__all__ = ["DispatchOrdering", "DispatchRepair", "PolicyGate", "ResultCache"]
+from athena.capabilities.prepared import PreparationFailure, PreparedCapabilityCall
+from athena.capabilities.dispatch_helpers import (
+    HIGH_RISK_EFFECTS,
+    ReferenceCountedKeyedLocks,
+    is_execution as _is_execution,
+    is_ordering_sensitive as _is_ordering_sensitive,
+    primary_effect as _primary_effect,
+    resource_key as _resource_key,
+    _STRICTNESS,
+)
+
+__all__ = ["DispatchOrdering", "DispatchRepair", "PolicyGate", "DispatchProvenance"]
 
 _logger = logging.getLogger("athena.capabilities")
 
 
-def _mod():
-    from athena.capabilities import dispatcher as m
-
-    return m
-
-
-def _primary_effect(available):
-    return _mod()._primary_effect(available)
-
-
-def _resource_key(workspace, value):
-    return _mod()._resource_key(workspace, value)
-
-
-def _is_ordering_sensitive(effects):
-    return _mod()._is_ordering_sensitive(effects)
-
-
-def _is_execution(effects):
-    return _mod()._is_execution(effects)
-
-
-def _bounded_diagnostics(values):
-    return _mod()._bounded_diagnostics(values)
-
-
 def _high_risk_effects():
-    # Bound lazily: the constant lives at the bottom of the dispatcher module.
-    return _mod().HIGH_RISK_EFFECTS
+    return HIGH_RISK_EFFECTS
+
+
+class _RealityBoundaryDenied(Exception):
+    """Internal: reality routing refused; carries the canonical result."""
+
+    def __init__(self, result: "CapabilityResult") -> None:
+        super().__init__(result.error or "reality boundary denied")
+        self.result = result
 
 
 class _Mechanism:
@@ -95,72 +94,157 @@ class DispatchOrdering(_Mechanism):
         workspace: WorkspaceSpec,
         effects: tuple[EffectClass, ...],
         batch_order_lock: asyncio.Lock | None,
-    ) -> list[asyncio.Lock] | list[asyncio.Lock]:
+    ) -> list[tuple[asyncio.Lock, ReferenceCountedKeyedLocks]]:
         """Ordering for one call, or [] when it may parallelize.
 
         Resource-ambiguous dependency-bearing calls — a write/delete/child/
         external with no concrete named resource — cannot prove independence
-        from siblings mutating ambient state, so they serialize against each
-        other in model order (asyncio.Lock is FIFO). Named-path calls
-        (already per-resource-locked, different paths independently parallel)
-        and pure reads bypass it.
+        from siblings mutating ambient state, so they serialize on a
+        dispatcher-owned lane keyed by the workspace/reality boundary and the
+        governed resource class (item 5). Two concurrent batches therefore
+        share one lane instead of each building an unrelated per-batch lock.
+        Named-path calls (already per-resource-locked) and pure reads bypass
+        the lane.  Workflow run/trial calls use a separate envelope lane:
+        their implementation awaits child dispatches, and holding the child
+        operation lane across that await is not reentrant.
         """
-        if batch_order_lock is None:
-            return []
         if not _is_ordering_sensitive(effects):
             return []
-        if self._d._locks_for_request(request, workspace, effects):
+        if self.resource_keys_for(request, workspace, effects):
             return []
-        return [batch_order_lock]
+        boundary = workspace.id or workspace.root
+        arguments = request.arguments or {}
+        if request.capability_id == "workflow" and arguments.get("operation") in {
+            "run",
+            "trial",
+        }:
+            envelope_identity = (
+                arguments.get("run_id")
+                or request.call_id
+                or arguments.get("workflow_id")
+            )
+            if envelope_identity:
+                envelope_key = (boundary, "workflow-envelope", str(envelope_identity))
+                return [
+                    (
+                        self._d._workflow_lanes.acquire_reference(envelope_key),
+                        self._d._workflow_lanes,
+                    )
+                ]
+        lane_key = (boundary, "ambient-order-lane")
+        return [
+            (
+                self._d._order_lanes.acquire_reference(lane_key),
+                self._d._order_lanes,
+            )
+        ]
 
     async def _dispatch_with_controls(
         self,
-        request: CapabilityRequest,
+        prepared: CapabilityRequest | PreparedCapabilityCall,
         *,
-        workspace: WorkspaceSpec,
-        profile: str | None,
-        task_policy: CapabilityPolicy | None,
-        model_policy: Any,
-        task_budget: ResourceBudget | None,
-        task_deadline: datetime | None,
-        runtime_remaining_s: float | None,
-        verification_environment: Any,
-        directives: DispatchDirectives | None,
-        prepared: bool,
+        workspace: WorkspaceSpec | None = None,
+        profile: str | None = None,
+        task_policy: CapabilityPolicy | None = None,
+        model_policy: Any = None,
+        task_budget: ResourceBudget | None = None,
+        task_deadline: datetime | None = None,
+        runtime_remaining_s: float | None = None,
+        verification_environment: Any = None,
+        directives: DispatchDirectives | None = None,
         batch_order_lock: asyncio.Lock | None = None,
+        provenance: DispatchProvenance | None = None,
+        **kwargs,
     ):
         """Apply task concurrency and resource conflict controls.
 
-        The capability itself remains the authority for effects.  This helper
-        only uses the already-declared contract to prevent an unbounded batch
-        from exceeding the task budget or racing requests targeting the same
-        resource.
+        A fully prepared call is consumed as-is. A raw request is resolved
+        once here for the direct/resume path. The capability itself remains
+        the authority for effects; controls only use the declared contract to
+        bound concurrency and prevent same-resource races.
         """
-        effects: tuple[EffectClass, ...] = ()
-        try:
-            executor = self._d._executor_for(request, workspace)
-            effects = self._d._resolve_effects_for(executor.descriptor, request.arguments or {})
-        except (CapabilityUnavailable, KeyError, TypeError, ValueError):
-            # dispatch() will return the canonical validation/effect error.
-            pass
+        if isinstance(prepared, PreparedCapabilityCall):
+            request = prepared.request
+            workspace = prepared.workspace
+            effects = prepared.effects
+            if prepared.executor is None:
+                # Preflight failures never enter controls; retain fail-closed.
+                raise ValueError("cannot dispatch an unprepared capability call")
+        else:
+            request = prepared
+            if workspace is None:
+                raise ValueError("workspace is required for an unprepared request")
+            try:
+                prepared = await self._d.prepare_one(
+                    request,
+                    workspace,
+                    provenance=provenance,
+                    directives=directives,
+                )
+            except (CapabilityUnavailable, KeyError, TypeError, ValueError) as exc:
+                return CapabilityResult(
+                    request.call_id or new_id("call"),
+                    request.capability_id,
+                    CapabilityResultStatus.FAILED,
+                    error=str(exc) or "unknown-capability",
+                )
+            request = prepared.request
+            effects = prepared.effects
 
-        locks = self._d._locks_for_request(request, workspace, effects)
+        # asyncio.Lock is not reentrant: a mediated nested dispatch would
+        # deadlock against its own outer lock, so track ownership per task and
+        # skip locks this task already holds.
+        current = asyncio.current_task()
+        if current is None:  # pragma: no cover - dispatch always runs in a task
+            raise RuntimeError("capability dispatch requires a running asyncio task")
+        held = self._d._task_held_locks.setdefault(current, set())
 
-        # Resource-ambiguous dependency-bearing calls join a per-batch
-        # ordering lane; named-path calls (already in ``locks``) and pure
-        # reads do not. Ambiguous means: carries a dependency-bearing effect
-        # but resolved no concrete resource key, so it cannot prove
-        # independence from sibling mutations/executes on ambient state.
-        order = self._d._batch_order(request, workspace, effects, batch_order_lock)
+        resource_keys = (
+            prepared.resource_keys
+            if isinstance(prepared, PreparedCapabilityCall)
+            else self.resource_keys_for(
+                request, workspace, effects, executor=getattr(prepared, "executor", None)
+            )
+        )
 
         async def invoke_with_locks():
-            for lock in order:
-                await lock.acquire()
-            for lock in locks:
-                await lock.acquire()
+            all_locks = self._locks_for_keys(resource_keys, workspace)
+            locks = [lock for lock in all_locks if lock not in held]
+            for lock in all_locks:
+                if lock in held:
+                    self._d._resource_locks.release_reference(lock)
+            order = self._d._batch_order(request, workspace, effects, batch_order_lock)
+            # Reservation is the ownership boundary, not lock state.  Acquire
+            # all ambient and resource locks as one transaction so cancellation
+            # cannot strand the ordering lane or a half-acquired resource set.
+            reserved = [
+                *order,
+                *((lock, self._d._resource_locks) for lock in locks),
+            ]
+            acquired: list[tuple[asyncio.Lock, ReferenceCountedKeyedLocks]] = []
             try:
-                return await self._d.dispatch(
-                    request,
+                for lock, table in reserved:
+                    await lock.acquire()
+                    acquired.append((lock, table))
+            except BaseException:
+                # Only a completed ``await lock.acquire()`` establishes
+                # ownership.  ``locked()`` says nothing about which task owns
+                # the lock, so it must never be used to infer cancellation
+                # cleanup ownership here.
+                for released_lock, table in reversed(acquired):
+                    released_lock.release()
+                    table.release_reference(released_lock)
+                outstanding = list(reserved)
+                for acquired_entry in acquired:
+                    outstanding.remove(acquired_entry)
+                for reserved_lock, table in outstanding:
+                    table.release_reference(reserved_lock)
+                raise
+            for lock, _table in acquired:
+                held.add(lock)
+            try:
+                return await self._d._dispatch_prepared_core(
+                    prepared,
                     workspace=workspace,
                     profile=profile,
                     task_policy=task_policy,
@@ -169,14 +253,17 @@ class DispatchOrdering(_Mechanism):
                     task_deadline=task_deadline,
                     runtime_remaining_s=runtime_remaining_s,
                     verification_environment=verification_environment,
-                    _directives=directives,
-                    _prepared=prepared,
+                    provenance=provenance,
                 )
             finally:
-                for lock in reversed(locks):
-                    lock.release()
-                for lock in reversed(order):
-                    lock.release()
+                for lock in locks:
+                    held.discard(lock)
+                self._d._resource_locks.release_many(locks)
+                if not held:
+                    self._d._task_held_locks.pop(current, None)
+                for lane_lock, lane_table in reversed(order):
+                    lane_lock.release()
+                    lane_table.release_reference(lane_lock)
 
         lease = None
         if request.task_id and _is_execution(effects):
@@ -200,32 +287,82 @@ class DispatchOrdering(_Mechanism):
         async with lease:
             return await invoke_with_locks()
 
-    def _locks_for_request(
+    def resource_keys_for(
         self,
         request: CapabilityRequest,
         workspace: WorkspaceSpec,
         effects: tuple[EffectClass, ...],
-    ) -> list[asyncio.Lock]:
+        *,
+        executor=None,
+    ) -> tuple[str, ...]:
+        """Resolve normalized resource identities without taking a lock."""
         if not set(effects) & {
             EffectClass.READ_LOCAL,
             EffectClass.WRITE_LOCAL,
             EffectClass.DELETE,
         }:
-            return []
+            return ()
         args = request.arguments or {}
+        if executor is None:
+            try:
+                executor = self._d._executor_for(request, workspace)
+            except (CapabilityUnavailable, KeyError, TypeError, ValueError):
+                return ()
+        descriptor = getattr(executor, "descriptor", None)
+        resolver = getattr(descriptor, "resource_key_resolver", None)
+        if resolver is not None:
+            try:
+                resolved = tuple(resolver(args, workspace))
+            except (OSError, TypeError, ValueError):
+                return ()
+            return tuple(sorted({key for key in resolved if isinstance(key, str) and key}))
         raw_resources = [args.get("path"), args.get("destination")]
-        resources = {
-            _resource_key(workspace, value)
-            for value in raw_resources
-            if isinstance(value, str) and value
-        }
+        return tuple(
+            sorted(
+                {
+                    _resource_key(workspace, value)
+                    for value in raw_resources
+                    if isinstance(value, str) and value
+                }
+            )
+        )
+
+    def _locks_for_request(
+        self,
+        request: CapabilityRequest,
+        workspace: WorkspaceSpec,
+        effects: tuple[EffectClass, ...],
+        *,
+        executor=None,
+    ) -> list[asyncio.Lock]:
+        resources = self.resource_keys_for(request, workspace, effects, executor=executor)
         if not resources:
             return []
         locks: list[asyncio.Lock] = []
         for resource in sorted(resources):
             key = (workspace.id or workspace.root, resource)
-            locks.append(self._d._resource_locks.setdefault(key, asyncio.Lock()))
+            locks.append(self._d._resource_locks.acquire_reference(key))
         return locks
+
+    def _locks_for_keys(
+        self,
+        resource_keys: tuple[str, ...],
+        workspace: WorkspaceSpec,
+    ) -> list[asyncio.Lock]:
+        if not resource_keys:
+            return []
+        boundary = workspace.id or workspace.root
+        return [
+            self._d._resource_locks.acquire_reference((boundary, resource))
+            for resource in resource_keys
+        ]
+
+    def _release_locks(self, locks: list[asyncio.Lock]) -> None:
+        """Release in reverse order, then release keyed-table references."""
+        for lock in reversed(locks):
+            lock.release()
+        for lock in locks:
+            self._d._resource_locks.release_reference(lock)
 
     def _executor_for(self, request: CapabilityRequest, workspace: WorkspaceSpec):
         fabric = self._d._fabric
@@ -242,26 +379,100 @@ class DispatchOrdering(_Mechanism):
 class DispatchRepair(_Mechanism):
     """Batch preflight validation/repair and durable repair receipts."""
 
+    async def prepare_one(
+        self,
+        request: CapabilityRequest,
+        workspace: WorkspaceSpec,
+        *,
+        provenance: DispatchProvenance | None = None,
+        directives: DispatchDirectives | None = None,
+    ) -> PreparedCapabilityCall:
+        """Repair, validate, and resolve one call into one invocation snapshot."""
+        return (
+            await self._prepare_each(
+                [request],
+                workspace=workspace,
+                provenance=provenance,
+                directives_by_call_id={request.call_id: directives}
+                if directives is not None
+                else None,
+            )
+        )[0]
+
     async def _preflight_batch(
         self,
         requests: list[CapabilityRequest],
         *,
         workspace: WorkspaceSpec,
-    ) -> list[str]:
-        """Validate/repair EVERY call before ANY executes; mutate nothing but
-        canonicalize repaired arguments via ``object.__setattr__`` (same as
-        ``dispatch``). Returns a list of issue paths (empty = all clear)."""
+        provenance: DispatchProvenance | None = None,
+        directives_by_call_id: Mapping[str, DispatchDirectives] | None = None,
+    ) -> list[PreparedCapabilityCall]:
+        """Canonicalize every call before any batch member executes."""
+        return [
+            await self.prepare_one(
+                request,
+                workspace,
+                provenance=provenance,
+                directives=directives_by_call_id.get(request.call_id)
+                if directives_by_call_id is not None
+                else None,
+            )
+            for request in requests
+        ]
+
+    @staticmethod
+    def preflight_issues(prepared_calls: list[PreparedCapabilityCall]) -> list[str]:
+        """Rebuild stable, order-aligned issue paths from failed entries."""
+        issues: list[str] = []
+        for index, prepared in enumerate(prepared_calls):
+            if prepared.executor is not None:
+                continue
+            path = f"[{index}] {prepared.capability_id}"
+            failure = prepared.failure
+            if failure is not None:
+                detail = failure.detail
+                if failure.schema_errors:
+                    detail = "; ".join(failure.schema_errors)
+                issues.append(f"{path}: {failure.code} {detail}")
+                continue
+            if isinstance(prepared.request.arguments, str):
+                issues.append(f"{path}: tool_input_invalid invalid JSON arguments")
+            else:
+                issues.append(f"{path}: schema_validation invalid arguments")
+        return issues
+
+    async def _prepare_each(
+        self,
+        requests: list[CapabilityRequest],
+        *,
+        workspace: WorkspaceSpec,
+        provenance: DispatchProvenance | None = None,
+        directives_by_call_id: Mapping[str, DispatchDirectives] | None = None,
+    ) -> list[PreparedCapabilityCall]:
+        """Canonicalize every call exactly once.
+
+        A failed entry carries no executor, so a batch can reject every call
+        without touching an executor a second time.
+        """
         from athena.models.compat.candidates import get_raw_candidate
 
-        issues: list[str] = []
-        for index, request in enumerate(requests):
-            path = f"[{index}] {request.capability_id}"
+        prepared_calls: list[PreparedCapabilityCall] = []
+        receipt = None
+        for request in requests:
             if not request.call_id:
-                object.__setattr__(request, "call_id", new_id("call"))
+                request = replace(request, call_id=new_id("call"))
             try:
                 executor = self._d._executor_for(request, workspace)
             except (CapabilityUnavailable, KeyError, TypeError, ValueError) as exc:
-                issues.append(f"{path}: unknown-capability ({exc})")
+                prepared_calls.append(
+                    PreparedCapabilityCall(
+                        request=request,
+                        workspace=workspace,
+                        executor=None,
+                        effects=(),
+                        failure=PreparationFailure(code="unknown_capability", detail=str(exc)),
+                    )
+                )
                 continue
 
             # Mirror dispatch()'s repair inputs (raw-candidate aware).
@@ -289,11 +500,12 @@ class DispatchRepair(_Mechanism):
                     mcp_origin=(getattr(executor.descriptor.origin, "value", None) == "MCP"),
                     provider_profile_id=(
                         getattr(candidate, "provider_profile_id", None)
-                        or self._d._provider_profile_id
+                        or (provenance.provider_profile_id if provenance else None)
                     ),
-                    model_id=getattr(candidate, "model_id", None) or self._d._model_id,
+                    model_id=getattr(candidate, "model_id", None)
+                    or (provenance.model_id if provenance else None),
                     completion_state=completion_state,
-                    mode=self._d._repair_mode,
+                    mode=(provenance.repair_mode if provenance else None),
                 )
                 if receipt.outcome == "INVALID":
                     await self._d._persist_repair(
@@ -302,9 +514,18 @@ class DispatchRepair(_Mechanism):
                         original_arguments=repair_arguments,
                         canonical_arguments=None,
                     )
-                    issues.append(
-                        f"{path}: tool_input_invalid "
-                        + ("; ".join(receipt.issue_codes) or "invalid arguments")
+                    prepared_calls.append(
+                        PreparedCapabilityCall(
+                            request=request,
+                            workspace=workspace,
+                            executor=None,
+                            effects=(),
+                            failure=PreparationFailure(
+                                code="repair_invalid",
+                                detail=f"repair outcome {receipt.outcome}",
+                                repair_receipt=receipt,
+                            ),
+                        )
                     )
                     continue
                 if receipt.outcome == "REPAIRED":
@@ -314,7 +535,7 @@ class DispatchRepair(_Mechanism):
                         original_arguments=repair_arguments,
                         canonical_arguments=repaired_args,
                     )
-                    object.__setattr__(request, "arguments", repaired_args)
+                    request = replace(request, arguments=dict(repaired_args))
                     await self._d._emit_repair(request, receipt, repaired_args)
                 else:
                     await self._d._persist_repair(
@@ -326,15 +547,58 @@ class DispatchRepair(_Mechanism):
 
             errors = validate_schema(executor.descriptor.input_schema, request.arguments or {})
             if errors:
-                issues.append(f"{path}: schema_validation ({'; '.join(errors)})")
+                prepared_calls.append(
+                    PreparedCapabilityCall(
+                        request=request,
+                        workspace=workspace,
+                        executor=None,
+                        effects=(),
+                        failure=PreparationFailure(
+                            code="schema_validation",
+                            detail="schema validation failed",
+                            schema_errors=tuple(str(e) for e in errors),
+                        ),
+                    )
+                )
                 continue
 
             try:
-                self._d._resolve_effects_for(executor.descriptor, request.arguments or {})
+                effects = await self._d._resolve_executor_effects(executor, request, workspace)
             except ValueError as exc:
-                issues.append(f"{path}: effects_unresolved ({exc})")
+                prepared_calls.append(
+                    PreparedCapabilityCall(
+                        request=request,
+                        workspace=workspace,
+                        executor=None,
+                        effects=(),
+                        failure=PreparationFailure(
+                            code="effect_contract",
+                            detail=str(exc),
+                        ),
+                    )
+                )
+                continue
 
-        return issues
+            prepared_calls.append(
+                PreparedCapabilityCall(
+                    request=request,
+                    workspace=workspace,
+                    executor=executor,
+                    effects=effects,
+                    directives=directives_by_call_id.get(request.call_id)
+                    if directives_by_call_id is not None
+                    else None,
+                    resource_keys=DispatchOrdering(self._d).resource_keys_for(
+                        request, workspace, effects, executor=executor
+                    ),
+                    canonical_request=request,
+                    descriptor=getattr(executor, "descriptor", None),
+                    repair_receipt=receipt,
+                    registry_generation=getattr(self._d.registry, "generation", None),
+                )
+            )
+
+        return prepared_calls
 
     async def _persist_repair(
         self,
@@ -388,14 +652,68 @@ class DispatchRepair(_Mechanism):
     # writes — even when an op name like "create" would suggest a write.
 
 
+_VERIFICATION_EFFECT_FLOOR = frozenset(
+    {
+        EffectClass.READ_LOCAL,
+        EffectClass.WRITE_LOCAL,
+        EffectClass.EXECUTE,
+        EffectClass.SPAWN_PROCESS,
+        EffectClass.NETWORK_READ,
+    }
+)
+
+
+def _combine_verdicts(
+    task_verdict: PolicyVerdict | None,
+    global_verdict: PolicyVerdict,
+    global_reason: str,
+) -> tuple[PolicyVerdict, str]:
+    """Merge task-policy and global verdicts, keeping the STRICTEST (P0-7).
+
+    The task policy is a hard ceiling: global policy may narrow further but never
+    expand task authority. Returns the combined verdict and a human reason.
+    """
+    if task_verdict is None or task_verdict == PolicyVerdict.ALLOW:
+        return global_verdict, global_reason
+    if _STRICTNESS[task_verdict.value] >= _STRICTNESS[global_verdict.value]:
+        return task_verdict, "required by task capability policy"
+    return global_verdict, global_reason
+
+
+def _verdict(value) -> PolicyVerdict:
+    if isinstance(value, PolicyVerdict):
+        return value
+    v = str(value or "").lower()
+    if v == "allow":
+        return PolicyVerdict.ALLOW
+    if v == "deny":
+        return PolicyVerdict.DENY
+    return PolicyVerdict.ASK
+
+
+# High-risk effects that should default to CALL scope even when the operator
+# chooses TASK or SESSION.  These effects have blast radius beyond a single
+# localized operation: network egress, external messages, privilege, secrets,
+# financial impact, and computer input.  Reusable grants for these are too
+# coarse — the operator should bind an explicit authority envelope.
+def _wrap_exception(exc, request) -> CapabilityResult:
+    call_id = getattr(request, "call_id", None) or ""
+    return CapabilityResult(
+        call_id,
+        getattr(request, "capability_id", ""),
+        CapabilityResultStatus.FAILED,
+        error=f"dispatch failed: {exc}",
+    )
+
+
 class PolicyGate(_Mechanism):
     """Effect resolution, task-policy ceiling, approval parking."""
 
     @staticmethod
     def _exec_capabilities():
-        # Single-sourced on the owning dispatcher class; bound lazily to
-        # avoid the module cycle.
-        return _mod().CapabilityDispatcher._EXEC_CAPABILITIES
+        from athena.capabilities.dispatch_helpers import EXEC_CAPABILITIES
+
+        return EXEC_CAPABILITIES
 
     @staticmethod
     def _resolve_effects_for(descriptor, arguments: Mapping[str, Any]) -> tuple[EffectClass, ...]:
@@ -416,7 +734,7 @@ class PolicyGate(_Mechanism):
             raise ValueError(str(exc)) from None
         if contract_effects:
             return contract_effects
-        return _mod().CapabilityDispatcher._resolve_effects(descriptor, arguments)
+        return PolicyGate._resolve_effects(descriptor, arguments)
 
     @staticmethod
     def _resolve_effects(descriptor, arguments: Mapping[str, Any]) -> tuple[EffectClass, ...]:
@@ -488,6 +806,157 @@ class PolicyGate(_Mechanism):
             return PolicyVerdict.DENY
         return None
 
+    async def _deny_path(
+        self,
+        *,
+        request: CapabilityRequest,
+        policy_failure: CapabilityResult | None,
+        reason: str,
+    ) -> CapabilityResult:
+        """Resolve the canonical DENY outcome (typed or prose failure)."""
+        error = (
+            "verification call requires effects outside the bounded verification envelope"
+            if policy_failure is not None
+            else f"denied: {reason or 'policy'}"
+        )
+        await self._d._emit(
+            EV["CAPABILITY_FAILED"],
+            {"call_id": request.call_id, "reason": "denied"},
+            request.task_id,
+            causal_id=request.call_id,
+        )
+        return (
+            policy_failure
+            if policy_failure is not None
+            else CapabilityResult(
+                request.call_id,
+                request.capability_id,
+                CapabilityResultStatus.FAILED,
+                error=error,
+            )
+        )
+
+    async def _ask_path(
+        self,
+        *,
+        request: CapabilityRequest,
+        workspace: WorkspaceSpec,
+        executor,
+        effects,
+        profile: str | None,
+        receipt,
+        directives: DispatchDirectives | None,
+        provenance: DispatchProvenance | None,
+    ):
+        """Park the call for approval and register its durable continuation."""
+        from athena.protocol.continuations import SuspendedCall
+
+        decision = self._d.policy.evaluate(
+            PolicyRequest(
+                principal=self._d._principal,
+                task_id=request.task_id,
+                capability_id=request.capability_id,
+                arguments=dict(request.arguments or {}),
+                workspace=workspace,
+                execution_backend=workspace.execution_backend or "local",
+                effects=frozenset(effects),
+                resources=executor.descriptor.resolve_resources(),
+                session_id=getattr(request, "session_id", None),
+                call_id=request.call_id,
+            ),
+            autonomy=profile,
+        )
+        approval_id = await self._park_for_approval(
+            request,
+            decision=decision,
+            workspace=workspace,
+            arguments=dict(request.arguments or {}),
+            effects=effects,
+            receipt=receipt,
+            directives=directives,
+            provenance=provenance,
+        )
+        suspended = SuspendedCall(
+            request.call_id,
+            request,
+            self._d.policy.evaluate(
+                PolicyRequest(
+                    principal=self._d._principal,
+                    task_id=request.task_id,
+                    capability_id=request.capability_id,
+                    arguments=dict(request.arguments or {}),
+                    workspace=workspace,
+                    execution_backend=workspace.execution_backend or "local",
+                    effects=frozenset(effects),
+                    resources=executor.descriptor.resolve_resources(),
+                    session_id=getattr(request, "session_id", None),
+                    call_id=request.call_id,
+                ),
+                autonomy=profile,
+            ),
+            approval_id,
+            directives,
+        )
+        self._d._suspended[request.call_id] = suspended
+        await self._d._emit(
+            EV["APPROVAL_REQUESTED"],
+            {
+                "call_id": request.call_id,
+                "capability_id": request.capability_id,
+                "task_id": request.task_id,
+                "approval_id": approval_id,
+            },
+            request.task_id,
+            causal_id=request.call_id,
+        )
+        return suspended
+
+    async def _route_reality(
+        self,
+        *,
+        request: CapabilityRequest,
+        workspace: WorkspaceSpec,
+        executor,
+        effects,
+        directives: DispatchDirectives | None,
+    ) -> tuple[WorkspaceSpec, dict[Any, Any], Any | None, bool]:
+        """Route through the reality boundary; return workspace/metadata/route/isolated."""
+        from athena.protocol.capabilities import CapabilityResultStatus
+        from athena.protocol.reality import ExecutionDisposition
+
+        if self._d._reality_gate is None:
+            return workspace, {}, None, False
+        try:
+            route = await self._d._reality_gate.route(
+                request,
+                workspace,
+                frozenset(effects),
+                executor.descriptor,
+                tier=(directives.reality_tier if directives is not None else None),
+            )
+        except PermissionError as exc:
+            result = CapabilityResult(
+                request.call_id,
+                request.capability_id,
+                CapabilityResultStatus.FAILED,
+                error=str(exc),
+                metadata={"decision": "reality_boundary", "code": "reality_boundary_denied"},
+            )
+            await self._d._emit(
+                EV["CAPABILITY_FAILED"],
+                {
+                    "call_id": request.call_id,
+                    "capability_id": request.capability_id,
+                    "reason": "reality_boundary",
+                    "error": result.error,
+                },
+                request.task_id,
+                causal_id=request.call_id,
+            )
+            raise _RealityBoundaryDenied(result) from exc
+        isolated = route.disposition is ExecutionDisposition.ISOLATED
+        return route.workspace, route.metadata(), route, isolated
+
     async def _park_for_approval(
         self,
         request: CapabilityRequest,
@@ -498,6 +967,7 @@ class PolicyGate(_Mechanism):
         effects,
         receipt=None,
         directives: DispatchDirectives | None = None,
+        provenance: DispatchProvenance | None = None,
     ) -> str | None:
         """Persist an ApprovalRequest and register it for later resolution.
 
@@ -583,9 +1053,12 @@ class PolicyGate(_Mechanism):
                     approval_id=approval_id,
                     provider_profile_id=(
                         getattr(request.candidate, "provider_profile_id", None)
-                        or self._d._provider_profile_id
+                        or (provenance.provider_profile_id if provenance else None)
                     ),
-                    model_id=(getattr(request.candidate, "model_id", None) or self._d._model_id),
+                    model_id=(
+                        getattr(request.candidate, "model_id", None)
+                        or (provenance.model_id if provenance else None)
+                    ),
                     repair_policy_version=getattr(receipt, "repair_policy_version", None),
                     policy_context={
                         "origin": getattr(request.origin, "value", request.origin),
@@ -617,111 +1090,153 @@ class PolicyGate(_Mechanism):
         self._d._resume_expiry[approval_id] = expires_at
         return approval_id
 
-
-class ResultCache(_Mechanism):
-    """Health persistence, observations, failure memory, result cache."""
-
-    async def _persist_health(self, capability_id: str) -> None:
-        persist = getattr(self._d._health, "persist", None)
-        if persist is None:
-            return
-        try:
-            await persist(capability_id)
-            mark_persisted = getattr(self._d._health, "mark_persisted", None)
-            if callable(mark_persisted):
-                mark_persisted(capability_id)
-        except Exception as exc:  # health persistence must not alter call truth
-            await self._d._emit(
-                "CapabilityHealthChanged",
-                {
-                    "capability_id": capability_id,
-                    "persistence_error": str(exc)[:500],
-                },
-                None,
-                causal_id=capability_id,
-            )
-
-    def _health_should_persist(self, capability_id: str, state_changed: bool) -> bool:
-        should_persist = getattr(self._d._health, "should_persist", None)
-        if callable(should_persist):
-            return bool(should_persist(capability_id, state_changed=state_changed))
-        return True
-
-    async def _emit_result_observations(
+    async def _evaluate_call_policy(
         self,
+        *,
         request: CapabilityRequest,
-        result: CapabilityResult,
-    ) -> None:
-        """Publish structured result evidence for projections and replay."""
-        metadata = result.metadata or {}
-        diagnostics = metadata.get("diagnostics")
-        if not isinstance(diagnostics, (list, tuple)) or not diagnostics:
-            return
+        workspace: WorkspaceSpec,
+        executor,
+        effects: tuple[EffectClass, ...],
+        profile: str | None,
+        task_policy: CapabilityPolicy | None,
+        directives: DispatchDirectives | None,
+    ) -> tuple[PolicyVerdict, str, CapabilityResult | None, frozenset[EffectClass]]:
+        """Evaluate global, task, verifier, external, and orchestration policy."""
+        policy_request = PolicyRequest(
+            principal=self._d._principal,
+            task_id=request.task_id,
+            capability_id=request.capability_id,
+            arguments=dict(request.arguments or {}),
+            workspace=workspace,
+            execution_backend=workspace.execution_backend or "local",
+            effects=frozenset(effects),
+            resources=executor.descriptor.resolve_resources(),
+            session_id=getattr(request, "session_id", None),
+            call_id=request.call_id,
+        )
+        decision = self._d.policy.evaluate(policy_request, autonomy=profile)
+        global_verdict = _verdict(decision.decision)
+
+        # The task capability policy is a ceiling on the task's work surface.
+        # SYSTEM-origin calls are the host auditing the task's own declared
+        # state (acceptance-criteria verification, internal memory recall):
+        # never model-controlled, never dispatched from natural language. A
+        # task that denies every capability must still be verifiable against
+        # the criteria it declared, so the host's own observation floor is not
+        # narrowed by the task's ceiling.
+        origin_value = getattr(request.origin, "value", request.origin)
+        host_observation = origin_value == CapabilityRequestOrigin.SYSTEM.value
+        # SYSTEM_VERIFICATION is the bounded verifier authority (P0-7): the
+        # acceptance verifier may execute operator-declared criteria, but it
+        # inherits none of the task's capability ceiling. It is still held to
+        # a restricted effect envelope — observation plus bounded execution,
+        # never secrets, privilege, external publication, or computer input.
+        verifier_authority = origin_value == CapabilityRequestOrigin.SYSTEM_VERIFICATION.value
+        if verifier_authority and not _VERIFICATION_EFFECT_FLOOR.issuperset(effects):
+            await self._d._emit(
+                EV["CAPABILITY_FAILED"],
+                {
+                    "call_id": request.call_id,
+                    "capability_id": request.capability_id,
+                    "reason": "verification_effect_ceiling",
+                    "effects": sorted(effect.value for effect in effects),
+                },
+                request.task_id,
+                causal_id=request.call_id,
+            )
+            return (
+                PolicyVerdict.DENY,
+                "verification call requires effects outside the bounded verification envelope",
+                CapabilityResult(
+                    request.call_id,
+                    request.capability_id,
+                    CapabilityResultStatus.FAILED,
+                    error=(
+                        "verification call requires effects outside the bounded verification envelope"
+                    ),
+                ),
+                frozenset(),
+            )
+        task_verdict = (
+            None
+            if host_observation or verifier_authority
+            else self._eval_task_policy(
+                request.capability_id, task_policy, request_effects=frozenset(effects)
+            )
+        )
+        combined, reason = _combine_verdicts(task_verdict, global_verdict, decision.reason)
+        external_contract = executor.descriptor.resolve_external_effect_contract(
+            request.arguments or {}
+        )
+        external_phase = str((request.arguments or {}).get("phase") or "").lower()
+        explicit_approval = str(decision.matched_rule or "").startswith("approval:")
+        external_floor_requires_approval = (
+            external_contract is not None
+            and external_contract.approval_floor == "ask"
+            and external_phase
+            in {
+                ExternalEffectPhase.APPLY.value,
+                ExternalEffectPhase.COMPENSATE.value,
+            }
+            and not explicit_approval
+        )
+        if external_contract is not None and external_contract.approval_floor == "deny":
+            combined = PolicyVerdict.DENY
+            reason = "forbidden by external-effect contract"
+        elif external_floor_requires_approval and combined is PolicyVerdict.ALLOW:
+            # A contract floor narrows an ordinary allow. An explicit
+            # operator grant is the one permitted exception; PolicyEngine
+            # marks those decisions with an approval rule.
+            combined = PolicyVerdict.ASK
+            reason = "requires approval by external-effect contract"
+        orchestration_approval_id = directives.approval_id if directives is not None else None
+        trusted_approval = (
+            orchestration_approval_id
+            and getattr(request.origin, "value", request.origin) == "trusted_orchestration"
+        )
+        if (
+            trusted_approval
+            and global_verdict is PolicyVerdict.ASK
+            and task_verdict in {None, PolicyVerdict.ALLOW}
+            and not external_floor_requires_approval
+            and not (external_contract is not None and external_contract.approval_floor == "deny")
+        ):
+            combined = PolicyVerdict.ALLOW
+            reason = f"approved orchestration plan {orchestration_approval_id}"
+        inherited_effects = frozenset(getattr(directives, "inherited_effects", ()))
+        generated_origin = (
+            getattr(request.origin, "value", request.origin)
+            == CapabilityRequestOrigin.GENERATED.value
+        )
+        if generated_origin and inherited_effects and not set(effects).issubset(inherited_effects):
+            combined = PolicyVerdict.DENY
+            reason = (
+                "generated call attempts effects outside its parent authority ceiling: "
+                f"{sorted(effect.value for effect in set(effects) - inherited_effects)}"
+            )
+        if (
+            combined == PolicyVerdict.ASK
+            and inherited_effects
+            and set(effects).issubset(inherited_effects)
+            and task_verdict in {None, PolicyVerdict.ALLOW}
+            and not external_floor_requires_approval
+            and not (external_contract is not None and external_contract.approval_floor == "deny")
+        ):
+            combined = PolicyVerdict.ALLOW
+            reason = (
+                "authorized by generated parent capability "
+                f"{getattr(directives, 'inherited_capability_id', None) or 'call'}"
+            )
         await self._d._emit(
-            EV["DIAGNOSTICS_PRODUCED"],
+            EV["POLICY_DECISION_MADE"],
             {
                 "call_id": request.call_id,
                 "capability_id": request.capability_id,
-                "diagnostics": _bounded_diagnostics(diagnostics),
-                "count": len(diagnostics),
+                "decision": combined.value,
+                "reason": reason,
+                "matched_rule": decision.matched_rule,
             },
             request.task_id,
             causal_id=request.call_id,
         )
-
-    async def _attach_failure_memory(
-        self,
-        request: CapabilityRequest,
-        result: CapabilityResult,
-        workspace,
-    ) -> None:
-        """Attach advisory deterministic repair history to failed results."""
-        if self._d._failure_memory is None or result.status is CapabilityResultStatus.OK:
-            return
-        diagnostics = (result.metadata or {}).get("diagnostics")
-        if not isinstance(diagnostics, (list, tuple)):
-            return
-        suggestions: list[dict[str, Any]] = []
-        environment = str((result.metadata or {}).get("failure_environment_fingerprint") or "")
-        for item in diagnostics[:8]:
-            if not isinstance(item, Mapping):
-                continue
-            signature = str(item.get("signature_fingerprint") or item.get("fingerprint") or "")
-            if not signature:
-                continue
-            try:
-                suggestions.extend(
-                    await self._d._failure_memory.retrieve(
-                        signature_fingerprint=signature,
-                        capability_id=request.capability_id,
-                        environment_fingerprint=environment,
-                        project_scope=getattr(workspace, "id", None),
-                        limit=4,
-                    )
-                )
-            except Exception:
-                continue
-        if suggestions:
-            metadata = dict(result.metadata or {})
-            metadata["failure_memory"] = suggestions[:8]
-            object.__setattr__(result, "metadata", metadata)
-
-    def _cached_result(
-        self,
-        key: tuple[str | None, str, str, str, str | None],
-    ) -> CapabilityResult | None:
-        entry = self._d._result_cache.get(key)
-        if entry is None:
-            return None
-        expires_at, result = entry
-        if time.monotonic() >= expires_at:
-            self._d._result_cache.pop(key, None)
-            return None
-        self._d._result_cache.move_to_end(key)
-        return result
-
-    def _invalidate_result_cache(self, workspace_root: str) -> None:
-        root = os.path.realpath(os.path.abspath(workspace_root))
-        for key in list(self._d._result_cache):
-            if key[1] == root:
-                self._d._result_cache.pop(key, None)
+        return combined, reason, None, inherited_effects

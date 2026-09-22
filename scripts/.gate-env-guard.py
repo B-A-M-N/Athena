@@ -94,11 +94,6 @@ def preflight() -> bool:
     ok = load1 <= LOAD_CEIL and avail >= MEM_FLOOR_GI and climbing <= TREND_RATIO
     log(
         f"preflight load1={load1:.2f} load5={load5:.2f} "
-        f"(trend x{clipping:.2f}) avail={avail:.1f}Gi -> "
-        f"{'GO' if ok else 'HOLD'}"
-        if False
-        else
-        f"preflight load1={load1:.2f} load5={load5:.2f} "
         f"(trend x{climbing:.2f}) avail={avail:.1f}Gi -> {'GO' if ok else 'HOLD'}"
     )
     return ok

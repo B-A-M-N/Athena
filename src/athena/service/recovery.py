@@ -3,7 +3,7 @@
 Moved verbatim from ``athena.service.service``. This is a subordinate
 mechanism, not a second authority: continuation/input stores, the task
 store/manager, the kernel, and the recovery-task registry all resolve
-through the owning :class:`AthenaService` instance (``self._svc``).
+through the explicit recovery ports owned by the application service.
 Recovery reconstructs only missing durable boundaries after a restart —
 it never re-runs model repair and never creates a new task.
 """
@@ -24,13 +24,37 @@ __all__ = ["RecoveryCoordinator"]
 _logger = logging.getLogger("athena.service")
 
 
+class RecoveryPorts:
+    """Explicit background-recovery ports owned by the application service.
+
+    Recovery may touch only the restart task registry and the application's
+    background-failure/tracking seams. All durable inputs arrive as method
+    arguments so this coordinator cannot browse or invent lifecycle state.
+    """
+
+    _RESOURCE_NAMES = {
+        "approval_recovery_tasks": "_approval_recovery_tasks",
+        "log_background_failure": "_log_background_failure",
+        "track_approval_recovery": "_track_approval_recovery",
+    }
+
+    def __init__(self, owner: Any) -> None:
+        self._owner = owner
+
+    def __getattr__(self, name: str) -> Any:
+        resource_name = self._RESOURCE_NAMES.get(name)
+        if resource_name is None:
+            raise AttributeError(f"recovery port is not allowed: {name}")
+        return getattr(self._owner, resource_name, None)
+
+
 class RecoveryCoordinator:
     """Restart recovery: approved continuations, answered inputs, quarantine."""
 
-    def __init__(self, service: Any) -> None:
-        self._svc = service
+    def __init__(self, service: Any, *, ports: RecoveryPorts | None = None) -> None:
+        self._ports = ports or RecoveryPorts(service)
 
-    async def _recover_approved_continuations(
+    async def recover_approved_continuations(
         self,
         *,
         continuations,
@@ -91,17 +115,17 @@ class RecoveryCoordinator:
                 continue
 
             recovery = asyncio.create_task(kernel.run_task(task_id))
-            self._svc._approval_recovery_tasks.add(recovery)
-            recovery.add_done_callback(self._svc._track_approval_recovery(task_id, recovery))
+            self._ports.approval_recovery_tasks.add(recovery)
+            recovery.add_done_callback(self._ports.track_approval_recovery(task_id, recovery))
 
-    def _track_approval_recovery(self, task_id: str, recovery: asyncio.Task):
+    def track_approval_recovery(self, task_id: str, recovery: asyncio.Task):
         def _done(task: asyncio.Task) -> None:
-            self._svc._approval_recovery_tasks.discard(task)
-            self._svc._log_background_failure(f"approval recovery {task_id}")(task)
+            self._ports.approval_recovery_tasks.discard(task)
+            self._ports.log_background_failure(f"approval recovery {task_id}")(task)
 
         return _done
 
-    async def _recover_answered_input_requests(
+    async def recover_answered_input_requests(
         self,
         *,
         input_requests: InputRequestStore,
@@ -141,12 +165,12 @@ class RecoveryCoordinator:
                 _logger.warning("cannot resume WAITING_INPUT task %s: %s", task_id, exc)
                 continue
             recovery = asyncio.create_task(kernel.run_task(task_id))
-            self._svc._approval_recovery_tasks.add(recovery)
+            self._ports.approval_recovery_tasks.add(recovery)
             recovery.add_done_callback(
-                self._svc._log_background_failure(f"input-recovery {task_id}")
+                self._ports.log_background_failure(f"input-recovery {task_id}")
             )
 
-    async def _quarantine_tasks_for_packs(
+    async def quarantine_tasks_for_packs(
         self,
         *,
         task_store: TaskStore,

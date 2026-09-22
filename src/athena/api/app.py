@@ -164,11 +164,12 @@ def build_agent_request(body: Mapping[str, Any]) -> AgentRequest:
         )
 
     autonomy = body.get("autonomy")
+    autonomy_value: AutonomyLevel | None = None
     if autonomy is not None:
         if not isinstance(autonomy, str):
             raise HTTPError(400, "validation_error", "field 'autonomy' must be a string")
         try:
-            autonomy_value: AutonomyLevel = AutonomyLevel(autonomy)
+            autonomy_value = AutonomyLevel(autonomy)
         except ValueError:
             allowed = ", ".join(a.value for a in AutonomyLevel)
             raise HTTPError(
@@ -176,8 +177,6 @@ def build_agent_request(body: Mapping[str, Any]) -> AgentRequest:
                 "validation_error",
                 f"field 'autonomy' must be one of: {allowed}",
             )
-    else:
-        autonomy_value = AutonomyLevel.SUPERVISED
 
     metadata = body.get("metadata")
     if not isinstance(metadata, Mapping):
@@ -478,7 +477,7 @@ def _voice_turn_handler(service: Any) -> Any:
                 raise HTTPError(400, "validation_error", "session_id must be a string or null")
             if task_id is not None and not isinstance(task_id, str):
                 raise HTTPError(400, "validation_error", "task_id must be a string or null")
-            autonomy = AutonomyLevel.SUPERVISED
+            autonomy: AutonomyLevel | None = None
             if metadata.get("autonomy") is not None:
                 try:
                     autonomy = AutonomyLevel(str(metadata["autonomy"]))

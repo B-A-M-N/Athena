@@ -113,6 +113,9 @@ def _serialize_block(block: ContentBlock) -> dict[str, Any]:
     return {"type": getattr(block, "type", "unknown")}
 
 
+serialize_block = _serialize_block
+
+
 def _deserialize_block(data: dict[str, Any]) -> ContentBlock:
     btype = data.get("type")
     if btype == "text":

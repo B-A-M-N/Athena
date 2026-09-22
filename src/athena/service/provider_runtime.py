@@ -20,18 +20,17 @@ from athena.models.providers.openai_compat import OpenAICompatProvider
 from athena.models.registry import ProviderRegistry
 from athena.policy.credentials import SecretError
 from athena.service.config import ProviderConfig
+from athena.service.provider_runtime_ports import ProviderRuntimePorts
 
 _logger = logging.getLogger("athena.service.provider_runtime")
 
 
 class ProviderRuntime:
-    """Provider registry mechanism bound to one service facade."""
-
-    def __init__(self, service: Any) -> None:
-        self._service = service
+    def __init__(self, service: Any, *, ports: ProviderRuntimePorts | None = None) -> None:
+        self._ports = ports or ProviderRuntimePorts(service)
 
     def register(self, registry: ProviderRegistry) -> None:
-        for config in tuple(self._service.config.providers):
+        for config in tuple(self._ports.config.providers):
             provider: Any = None
             if config.kind == "fake":
                 provider = FakeModelProvider(
@@ -70,7 +69,7 @@ class ProviderRuntime:
                     credential_id: str,
                     provider_config: ProviderConfig = config,
                 ) -> Any:
-                    return self._service._build_provider(provider_config, credential_id)
+                    return self.build(provider_config, credential_id)
 
                 provider = ProviderCredentialPool(
                     config.name,
@@ -83,7 +82,7 @@ class ProviderRuntime:
                     ],
                 )
             else:
-                provider = self._service._build_provider(
+                provider = self.build(
                     config,
                     credential_ids[0] if credential_ids else None,
                 )
@@ -117,7 +116,7 @@ class ProviderRuntime:
                 raise ValueError(f"provider {config.name!r} needs an explicit base_url")
             return OpenAICompatProvider(
                 base_url=profile.base_url,
-                api_key=self._service._resolve_api_key(config, credential_id=credential_id),
+                api_key=self.resolve_api_key(config, credential_id=credential_id),
                 model=profile.model_id or config.model,
                 provider=config.name,
                 headers=config.extra.get("headers"),
@@ -134,7 +133,7 @@ class ProviderRuntime:
             )
         if profile.protocol == "anthropic":
             return AnthropicProvider(
-                api_key=self._service._resolve_api_key(config, credential_id=credential_id) or None,
+                api_key=self.resolve_api_key(config, credential_id=credential_id) or None,
                 base_url=profile.base_url,
                 model=profile.model_id or config.model,
                 provider=config.name,
@@ -156,7 +155,7 @@ class ProviderRuntime:
     ) -> str:
         """Resolve a leased credential at the provider boundary."""
         selected = credential_id or config.credential_id
-        secrets = self._service._secrets
+        secrets = self._ports.secrets
         if selected and secrets is not None:
             try:
                 return secrets.resolve(selected)
@@ -190,4 +189,4 @@ def _model_profile_from_config(model_id: str, raw: Any) -> ModelProfile:
     return ModelProfile(model_pattern=model_id, **dict(raw))
 
 
-__all__ = ["ProviderRuntime"]
+__all__ = ["ProviderRuntime", "ProviderRuntimePorts"]

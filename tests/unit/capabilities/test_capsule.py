@@ -6,12 +6,13 @@ from types import SimpleNamespace
 import pytest
 
 from athena.affordances import CapabilityFabric
-from athena.capabilities.capsule import ProcedureCapsuleCapability
+from athena.capabilities.capsule import ProcedureCapsuleCapability, _with_id
 from athena.capabilities.registry import CapabilityRegistry
 from athena.protocol.capabilities import (
     CapabilityRequest,
     CapabilityResult,
     CapabilityResultStatus,
+    EffectClass,
 )
 from athena.protocol.tasks import WorkspaceSpec
 from athena.synthesis.engine import SynthesisEngine
@@ -161,6 +162,73 @@ async def test_capsule_exports_and_reimports_generated_procedure(tmp_path):
     assert replayed.status is CapabilityResultStatus.OK
     assert workflow_executor.calls[0].capability_id == "workflow"
     assert workflow_executor.calls[0].call_id != "replay"
+
+    local_effects = await source_capsule.resolve_operation_effects(
+        {"operation": "run", "capsule": capsule},
+        workspace=WorkspaceSpec(id="repo", root=str(tmp_path)),
+        task_id="task-source",
+        principal_id=None,
+    )
+    assert set(local_effects) == {
+        # Capsule import persists task-local records before replay.
+        EffectClass.WRITE_LOCAL,
+        EffectClass.READ_LOCAL,
+    }
+    inspect_effects = await source_capsule.resolve_operation_effects(
+        {"operation": "inspect", "capsule": capsule},
+        workspace=WorkspaceSpec(id="repo", root=str(tmp_path)),
+        task_id="task-source",
+        principal_id=None,
+    )
+    assert inspect_effects == (EffectClass.READ_LOCAL,)
+
+
+@pytest.mark.asyncio
+async def test_capsule_effects_include_network_for_reachable_network_step(tmp_path):
+    from athena.protocol.capabilities import CapabilityDescriptor
+
+    class _NetworkFabric:
+        def executor_for(self, capability_id, **kwargs):
+            del kwargs
+            return SimpleNamespace(
+                descriptor=CapabilityDescriptor(
+                    id=capability_id,
+                    description=capability_id,
+                    input_schema={"type": "object"},
+                    effects=frozenset({EffectClass.NETWORK_WRITE}),
+                )
+            )
+
+    network_workflow = Workflow.create(
+        name="network capsule",
+        description="perform a remote write",
+        steps=(WorkflowStep(id="send", capability_id="network", arguments={}),),
+        task_scope="task-network",
+    )
+    capsule = _with_id(
+        {
+            "format": 1,
+            "objective": "network",
+            "root_workflow_id": network_workflow.id,
+            "workflows": [network_workflow.to_record()],
+            "capabilities": [],
+            "environment": {"workspace_id": "repo", "runtime": "python"},
+            "proof": {},
+        }
+    )
+    capability = ProcedureCapsuleCapability(
+        _Workflows(), _NetworkFabric(), SynthesisEngine()
+    )
+
+    effects = await capability.resolve_operation_effects(
+        {"operation": "run", "capsule": capsule},
+        workspace=WorkspaceSpec(id="repo", root=str(tmp_path)),
+        task_id="task-network",
+        principal_id=None,
+    )
+
+    assert EffectClass.NETWORK_WRITE in effects
+    assert EffectClass.WRITE_LOCAL in effects
 
 
 @pytest.mark.asyncio

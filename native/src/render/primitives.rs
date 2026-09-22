@@ -1,4 +1,5 @@
-use super::super::*;
+use crate::platform::*;
+use crate::x11::*;
 
 pub(crate) fn draw_outline_rect(x: f32, y: f32, width: f32, height: f32) {
     unsafe {

@@ -458,7 +458,7 @@ class SelfHostGateBundle:
 
 def _git_output(command: list[str]) -> str:
     try:
-        result = subprocess.run(  # architecture-lint: allow subprocess-outside-approved-backends reason=read-only self-host base identity
+        result = subprocess.run(  # architecture-lint: allow subprocess-outside-approved-backends reason=read-only self-host base identity; architecture-exception: self-host-base-identity
             command,
             check=True,
             capture_output=True,

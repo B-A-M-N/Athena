@@ -16,19 +16,38 @@ All state is durable (mutation ledger + events) so branches are auditable.
 
 from __future__ import annotations
 
-import base64
-import hashlib
 import json
 import logging
 import os
+import shutil
 import stat
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from athena.capabilities.dispatcher import SuspendedCall
-from athena.causal.checkpoint import _run_worker as _run_checkpoint_worker
+from athena.protocol.continuations import SuspendedCall
+from athena.shadow.persistence import (
+    branch_record as _branch_record,
+    commit_plan_digest as _commit_plan_digest,
+    commit_plan_record as _commit_plan_record,
+    environment_fingerprint as _environment_fingerprint,
+    manifest_fingerprint as _manifest_fingerprint,
+    rebase_rules as _rebase_rules,
+    resource_kind as _resource_kind,
+    unsupported_commit_resources as _unsupported_commit_resources,
+    workspace_from_record as _workspace_from_record,
+    environment_record as _environment_record,
+)
+from athena.shadow.commit_mechanisms import (
+    apply_commit_plan,
+    build_commit_plan,
+    detect_stale_base_conflict,
+    rollback_partial_commit,
+    validate_commit_certificate,
+)
+from athena.causal.checkpoint import run_checkpoint_worker
 from athena.protocol.capabilities import (
     CapabilityRequest,
     CapabilityRequestOrigin,
@@ -37,12 +56,14 @@ from athena.protocol.capabilities import (
 )
 from athena.protocol.ids import new_id
 from athena.protocol.messages import utcnow
-from athena.protocol.tasks import MutationMode, NetworkPolicy, PathRule, WorkspaceSpec
-from athena.execution.environment import ProjectEnvironmentFingerprint
-from athena.workspace_manifest import IGNORED_DIRECTORY_NAMES, copy_ignore, copy_workspace_tree
+from athena.protocol.tasks import MutationMode, NetworkPolicy, WorkspaceSpec
+from athena.workspace_manifest import (
+    content_manifest,
+    copy_ignore,
+    copy_workspace_tree,
+)
 from athena.verification.certificate import (
     VerificationCertificate,
-    certificate_digest as _certificate_digest,
 )
 
 __all__ = [
@@ -143,8 +164,9 @@ class ShadowEngine:
     ) -> None:
         self._dispatcher = dispatcher
         self._branches: dict[str, ShadowBranch] = {}
-        self._roots_parent = roots_parent or (
-            os.path.join(state_root, "shadows") if state_root else "/tmp/athena-shadow"
+        self._roots_parent = Path(
+            roots_parent
+            or (os.path.join(state_root, "shadows") if state_root else "/tmp/athena-shadow")
         )
         self._state_root = Path(state_root or self._roots_parent)
         self._branch_state = self._state_root / "branches.json"
@@ -153,8 +175,9 @@ class ShadowEngine:
     def bind(self, dispatcher) -> None:
         self._dispatcher = dispatcher
 
+    dispatcher = property(lambda engine: engine._dispatcher)
+
     def bind_service(self, service) -> None:
-        """Bind the owning service for approval resolution."""
         self._service = service
 
     def get_branch(self, branch_id: str) -> ShadowBranch | None:
@@ -162,7 +185,6 @@ class ShadowEngine:
         return self._branches.get(branch_id)
 
     def list_branches(self) -> list[ShadowBranch]:
-        """Return known branch records in creation order."""
         return list(self._branches.values())
 
     def attach_checkpoint(self, branch: ShadowBranch, checkpoint_id: str | None) -> None:
@@ -238,6 +260,46 @@ class ShadowEngine:
             revision=base.revision,
         )
 
+    async def preflight_clone_transport(self) -> dict[str, str]:
+        """Prove the actual clone path using a disposable probe workspace.
+
+        A manifest scan proves hashing, not copying.  This probe creates a
+        tiny controlled source beneath ``_roots_parent``, invokes the same
+        checkpoint worker clone operation as :meth:`open_branch`, verifies an
+        independent destination, and removes both sides even on failure.
+        """
+        probe_id = f"clone-probe-{uuid.uuid4().hex[:12]}"
+        source = self._roots_parent / f"{probe_id}-source"
+        clone = self._roots_parent / probe_id
+        source.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            (source / "athena-clone-probe.txt").write_text("clone-ready\n", encoding="utf-8")
+            result = await run_checkpoint_worker(
+                "clone",
+                root=str(self._roots_parent),
+                checkpoint_id=probe_id,
+                workspace_root=str(source),
+            )
+            clone_file = clone / "athena-clone-probe.txt"
+            if (
+                not clone_file.is_file()
+                or clone_file.read_text(encoding="utf-8") != "clone-ready\n"
+            ):
+                raise RuntimeError("checkpoint clone did not independently copy probe data")
+            if dict(result.get("base_manifest") or {}).get("athena-clone-probe.txt") is None:
+                raise RuntimeError("checkpoint clone did not produce a base manifest")
+            return {
+                "source_root": str(source),
+                "clone_root": str(clone),
+                "base_manifest_hash": str(result.get("base_manifest", {}).get("hash", "")),
+            }
+        finally:
+            shutil.rmtree(source, ignore_errors=True)
+            if clone.is_symlink():
+                clone.unlink(missing_ok=True)
+            elif clone.exists():
+                shutil.rmtree(clone, ignore_errors=True)
+
     async def open_branch(
         self,
         *,
@@ -253,7 +315,7 @@ class ShadowEngine:
         if self._dispatcher is None:
             raise RuntimeError("ShadowEngine not bound to a dispatcher")
         bid = new_id("branch")
-        worker_result = await _run_checkpoint_worker(
+        worker_result = await run_checkpoint_worker(
             "clone",
             root=str(self._roots_parent),
             checkpoint_id=bid,
@@ -436,6 +498,37 @@ class ShadowEngine:
     # ------------------------------------------------------------------
     # Commit / discard
     # ------------------------------------------------------------------
+    @staticmethod
+    def _commit_plan_record_for(
+        request: CapabilityRequest, *, expected_preimage: str, mode: int | None
+    ) -> dict:
+        return _commit_plan_record(
+            request,
+            expected_preimage=expected_preimage,
+            mode=mode,
+        )
+
+    async def _validate_commit_certificate(
+        self,
+        branch: ShadowBranch,
+    ) -> tuple[dict | None, str]:
+        """Delegate certificate/proof validation to the subordinate mechanism."""
+        return await validate_commit_certificate(self, branch)
+
+    async def _build_commit_plan(
+        self,
+        branch: ShadowBranch,
+        changes: dict,
+        *,
+        approval_id: str | None,
+    ) -> tuple[
+        list[CapabilityRequest],
+        dict[str, DispatchDirectives],
+        list[dict],
+    ]:
+        """Delegate canonical plan construction to the subordinate mechanism."""
+        return await build_commit_plan(self, branch, changes, approval_id=approval_id)
+
     async def commit(
         self,
         branch: ShadowBranch,
@@ -464,42 +557,9 @@ class ShadowEngine:
         if branch.status != BranchStatus.VERIFIED:
             raise RuntimeError(f"cannot commit branch {branch.id} in status {branch.status}")
 
-        certificate = branch.verification_certificate
-        if not certificate:
-            branch.status = BranchStatus.FAILED
-            branch.error = "verification certificate missing"
-            self._persist_branches()
-            await self._cleanup(branch)
-            return {
-                "status": "FAILED",
-                "branch": branch.id,
-                "error": branch.error,
-            }
-        candidate_fingerprint = _manifest_fingerprint(
-            await self._manifest_async(branch.shadow_workspace.root)
-        )
-        environment_fingerprint = _environment_fingerprint(
-            branch.shadow_workspace,
-            branch.policy_profile,
-        )
-        if (
-            certificate.get("certificate_hash") != _certificate_digest(certificate)
-            or certificate.get("base_fingerprint") != _manifest_fingerprint(branch.base_manifest)
-            or certificate.get("candidate_fingerprint") != candidate_fingerprint
-            or certificate.get("environment_fingerprint") != environment_fingerprint
-        ):
-            # A stale proof is not an ordinary failed execution.  Retain the
-            # candidate and its certificate record so an operator or the
-            # revalidation path can inspect the exact invalidated artifact.
-            branch.status = BranchStatus.RECOVERY_REQUIRED
-            branch.commit_state = "STALE_CERTIFICATE"
-            branch.error = "verification certificate stale: candidate or environment changed"
-            self._persist_branches()
-            return {
-                "status": "STALE_CERTIFICATE",
-                "branch": branch.id,
-                "error": branch.error,
-            }
+        validation_failure, candidate_fingerprint = await self._validate_commit_certificate(branch)
+        if validation_failure is not None:
+            return validation_failure
 
         changes = await self._diff_trees_async(branch)
 
@@ -531,141 +591,19 @@ class ShadowEngine:
 
         base_root = branch.base_workspace.root
 
-        requests: list[CapabilityRequest] = []
-        outcomes: list[CapabilityResult | SuspendedCall] = []
-        shadow_root = branch.shadow_workspace.root
-        for rel in changes["modified"] + changes["added"]:
-            try:
-                content_result = await _run_checkpoint_worker(
-                    "read",
-                    root=str(self._roots_parent),
-                    workspace_root=shadow_root,
-                    relative=rel,
-                )
-                content = base64.b64decode(
-                    str(content_result["content_base64"]),
-                    validate=True,
-                )
-            except (OSError, ValueError) as exc:
-                branch.status = BranchStatus.FAILED
-                branch.error = f"cannot create canonical commit plan for {rel}: {exc}"
-                self._persist_branches()
-                await self._cleanup(branch)
-                return {"status": "FAILED", "branch": branch.id, "error": branch.error}
-            requests.append(
-                CapabilityRequest(
-                    capability_id="fs",
-                    arguments={
-                        "operation": "write",
-                        "path": rel,
-                        "content_base64": base64.b64encode(content).decode("ascii"),
-                        "create_dirs": True,
-                    },
-                    task_id=branch.task_id,
-                    call_id=new_id("commit"),
-                    origin=CapabilityRequestOrigin.TRUSTED_ORCHESTRATION,
-                )
-            )
-        for rel in changes["deleted"]:
-            requests.append(
-                CapabilityRequest(
-                    capability_id="fs",
-                    arguments={"operation": "delete", "path": rel},
-                    task_id=branch.task_id,
-                    call_id=new_id("commit"),
-                    origin=CapabilityRequestOrigin.TRUSTED_ORCHESTRATION,
-                )
-            )
-
         # Compare the COMPLETE real workspace against the immutable branch
         # base immediately before the commit intent is persisted.  Checking
         # only resources in the diff would allow an unrelated concurrent edit
         # to invalidate the branch's proof while the candidate was promoted.
-        current_base_manifest = await self._manifest_async(
-            base_root,
-        )
-        expected_base_fingerprint = _manifest_fingerprint(branch.base_manifest)
-        current_base_fingerprint = _manifest_fingerprint(current_base_manifest)
-        if current_base_fingerprint != expected_base_fingerprint:
-            conflicts = _manifest_conflicts(
-                branch.base_manifest,
-                current_base_manifest,
-            )
-            branch.status = BranchStatus.CONFLICTED
-            branch.commit_state = "CONFLICTED"
-            branch.error = "commit CONFLICT: complete base workspace changed since branch creation"
-            branch.commit_outcome = {
-                "status": "conflict",
-                "expected_base_fingerprint": expected_base_fingerprint,
-                "current_base_fingerprint": current_base_fingerprint,
-                "conflicts": conflicts,
-            }
-            self._persist_branches()
-            # Keep the candidate workspace and its durable record.  It is the
-            # evidence needed for rebase/reverification or explicit discard.
-            return {"status": "CONFLICT", "branch": branch.id, "conflicts": conflicts}
+        conflict = await detect_stale_base_conflict(self, branch, base_root)
+        if conflict is not None:
+            return conflict
 
-        # Establish every immutable precondition before requesting approval or
-        # applying anything.  The resulting plan is the exact batch that a
-        # later approval resumes; it is never regenerated by the model.
-        directives_by_call_id: dict[str, DispatchDirectives] = {}
-        commit_plan: list[dict] = []
-        try:
-            for request in requests:
-                raw_path = str(request.arguments["path"])
-                path = raw_path if os.path.isabs(raw_path) else os.path.join(base_root, raw_path)
-                relative = os.path.relpath(
-                    os.path.realpath(path),
-                    os.path.realpath(base_root),
-                ).replace(os.sep, "/")
-                expected = branch.base_preimages.get(relative)
-                if relative in changes["added"]:
-                    expected = "<missing>"
-                if expected is None:
-                    branch.status = BranchStatus.RECOVERY_REQUIRED
-                    branch.commit_state = "RECOVERY_REQUIRED"
-                    branch.error = (
-                        "commit lacks an immutable base preimage for "
-                        f"{relative}; candidate requires revalidation"
-                    )
-                    self._persist_branches()
-                    return {
-                        "status": "RECOVERY_REQUIRED",
-                        "branch": branch.id,
-                        "error": branch.error,
-                    }
-                modes: dict[str, int] = {}
-                mode: int | None = None
-                if request.arguments.get("operation") != "delete":
-                    mode_result = await _run_checkpoint_worker(
-                        "mode",
-                        root=str(self._roots_parent),
-                        workspace_root=branch.shadow_workspace.root,
-                        relative=raw_path,
-                    )
-                    mode = int(mode_result["mode"])
-                    modes[os.path.realpath(path)] = mode
-                directives_by_call_id[request.call_id] = DispatchDirectives(
-                    expected_preimages={os.path.realpath(path): expected},
-                    expected_modes=modes,
-                    transaction_id=branch.id,
-                    approval_id=approval_id,
-                )
-                commit_plan.append(
-                    _commit_plan_record(
-                        request,
-                        expected_preimage=expected,
-                        mode=mode,
-                    )
-                )
-        except (OSError, ValueError) as exc:
-            branch.status = BranchStatus.FAILED
-            branch.commit_state = "FAILED"
-            branch.error = f"cannot establish commit precondition: {exc}"
-            branch.commit_completed_at = utcnow().isoformat()
-            self._persist_branches()
-            await self._cleanup(branch)
-            return {"status": "FAILED", "branch": branch.id, "error": branch.error}
+        requests, directives_by_call_id, commit_plan = await self._build_commit_plan(
+            branch,
+            changes,
+            approval_id=approval_id,
+        )
 
         plan_digest = _commit_plan_digest(commit_plan)
         previous_plan_digest = str(branch.commit_outcome.get("plan_digest") or "")
@@ -730,117 +668,19 @@ class ShadowEngine:
                     "error": branch.error,
                 }
 
-        # Write the batch intent before any real-workspace mutation.  The
-        # content identity, expected preimages, and candidate modes are
-        # durable before the canonical dispatcher can mutate reality.
-        branch.commit_plan = commit_plan
-        branch.commit_outcome = {
-            **branch.commit_outcome,
-            "plan_digest": plan_digest,
-        }
-        branch.commit_state = "PLANNED"
-        branch.status = BranchStatus.COMMITTING
-        branch.commit_started_at = utcnow().isoformat()
-        self._persist_branches()
-
-        applied = {
-            "written": list(changes["modified"] + changes["added"]),
-            "deleted": list(changes["deleted"]),
-            "mutation_results": [],
-        }
-        if requests:
-            if self._dispatcher is None:
-                raise RuntimeError("ShadowEngine not bound to a dispatcher")
-            branch.commit_state = "APPLYING"
-            self._persist_branches()
-            # A verified branch is the trusted commit controller.  Its
-            # canonical fs requests must cross the reality boundary once,
-            # against the real base workspace, rather than opening a fresh
-            # speculative branch because the parent task is speculative.
-            commit_workspace = WorkspaceSpec(
-                id=branch.base_workspace.id,
-                root=branch.base_workspace.root,
-                readable=branch.base_workspace.readable,
-                writable=branch.base_workspace.writable,
-                temp_root=branch.base_workspace.temp_root,
-                execution_backend=branch.base_workspace.execution_backend,
-                network_policy=branch.base_workspace.network_policy,
-                mutation_mode=MutationMode.DIRECT,
-                revision=branch.base_workspace.revision,
-            )
-            outcomes = await self._dispatcher.dispatch_many(
-                requests,
-                workspace=commit_workspace,
-                profile=branch.policy_profile,
-                preflight=True,
-                _directives_by_call_id=directives_by_call_id,
-            )
-            failed = [
-                item
-                for item in outcomes
-                if isinstance(item, CapabilityResult) and item.status.value != "ok"
-            ]
-            suspended = [item for item in outcomes if isinstance(item, SuspendedCall)]
-            if failed or suspended or len(outcomes) != len(requests):
-                branch.commit_state = "FAILED"
-                if failed:
-                    reason = failed[0].error or "capability request failed"
-                elif suspended:
-                    reason = "commit requires approval"
-                else:
-                    reason = "commit dispatch returned incomplete results"
-                rollback = await self._rollback_partial_commit(outcomes)
-                branch.error = f"commit not applied: {reason}"
-                if rollback["errors"]:
-                    branch.error += "; recovery required: " + "; ".join(rollback["errors"])
-                    branch.commit_state = "RECOVERY_REQUIRED"
-                branch.commit_outcome = {
-                    "status": ("recovery_required" if rollback["errors"] else "failed"),
-                    "reason": reason,
-                    "rollback": rollback,
-                }
-                branch.commit_completed_at = utcnow().isoformat()
-                branch.status = (
-                    BranchStatus.RECOVERY_REQUIRED if rollback["errors"] else BranchStatus.FAILED
-                )
-                self._persist_branches()
-                if not rollback["errors"]:
-                    await self._cleanup(branch)
-                return {
-                    "status": ("RECOVERY_REQUIRED" if rollback["errors"] else "FAILED"),
-                    "branch": branch.id,
-                    "error": branch.error,
-                }
-
-            applied["mutation_results"] = [
-                {
-                    "mutation_id": (item.metadata or {}).get("mutation", {}).get("mutation_id"),
-                    "mutation_sequence": (item.metadata or {}).get("mutation_sequence"),
-                    "mutation_event_sequence": (item.metadata or {}).get("mutation_event_sequence"),
-                }
-                for item in outcomes
-                if isinstance(item, CapabilityResult)
-            ]
-        final_manifest = await self._manifest_async(base_root)
-        final_fingerprint = _manifest_fingerprint(final_manifest)
-        if final_fingerprint != candidate_fingerprint:
-            branch.status = BranchStatus.RECOVERY_REQUIRED
-            branch.commit_state = "RECOVERY_REQUIRED"
-            branch.error = (
-                "commit applied but final workspace fingerprint does not match "
-                "the verified candidate"
-            )
-            branch.commit_outcome = {
-                **applied,
-                "status": "recovery_required",
-                "candidate_fingerprint": candidate_fingerprint,
-                "final_fingerprint": final_fingerprint,
-            }
-            branch.commit_completed_at = utcnow().isoformat()
-            self._persist_branches()
-            # The candidate and commit ledger remain available for operator
-            # reconciliation.  Never discard evidence after an unproven write.
-            return {"status": "RECOVERY_REQUIRED", "branch": branch.id, "error": branch.error}
+        applied_result = await apply_commit_plan(
+            self,
+            branch,
+            requests=requests,
+            directives_by_call_id=directives_by_call_id,
+            changes=changes,
+            candidate_fingerprint=candidate_fingerprint,
+        )
+        if "status" in applied_result:
+            # Failure/recovery result from the apply phase.
+            return applied_result
+        applied = applied_result
+        final_fingerprint = str(applied["final_fingerprint"])
         branch.mutations = [
             {"resource": w, "operation": "commit_write"} for w in applied["written"]
         ] + [{"resource": d, "operation": "commit_delete"} for d in applied["deleted"]]
@@ -859,8 +699,8 @@ class ShadowEngine:
         _logger.info(
             "shadow branch %s committed: +%d/-%d files",
             branch.id,
-            len(applied["written"]),
-            len(applied["deleted"]),
+            len(list(applied["written"])),
+            len(list(applied["deleted"])),
         )
         return {
             "status": "committed",
@@ -871,39 +711,8 @@ class ShadowEngine:
         }
 
     async def _rollback_partial_commit(self, outcomes) -> dict[str, list[str]]:
-        """Compensate mutations that completed before a batch failure.
-
-        ``dispatch_many`` is preflight-atomic, not mutation-transactional:
-        individual filesystem calls can finish before another call fails.
-        Every successful call must therefore be undone through the service's
-        auditable rollback path before the branch is reported as failed.
-        """
-        rolled_back: list[str] = []
-        errors: list[str] = []
-        undo = getattr(getattr(self, "_service", None), "undo_mutation", None)
-        for item in reversed(outcomes):
-            if not isinstance(item, CapabilityResult):
-                continue
-            if item.status.value != "ok":
-                continue
-            mutation = (item.metadata or {}).get("mutation")
-            mutation_id = mutation.get("mutation_id") if isinstance(mutation, dict) else None
-            if not mutation_id:
-                errors.append("successful mutation had no durable mutation id")
-                continue
-            if undo is None:
-                errors.append(f"no rollback authority for {mutation_id}")
-                continue
-            try:
-                outcome = await undo(mutation_id)
-            except Exception as exc:  # noqa: BLE001 - preserve recovery state
-                errors.append(f"{mutation_id}: {exc}")
-                continue
-            if outcome.get("status") != "ok":
-                errors.append(f"{mutation_id}: {outcome.get('error', 'rollback failed')}")
-            else:
-                rolled_back.append(mutation_id)
-        return {"rolled_back": rolled_back, "errors": errors}
+        """Delegate the rollback phase to the engine's commit mechanisms."""
+        return await rollback_partial_commit(self, outcomes)
 
     async def discard(self, branch: ShadowBranch, reason: str = "") -> dict:
         decision = self.can_discard(branch)
@@ -963,7 +772,7 @@ class ShadowEngine:
     # ------------------------------------------------------------------
     async def _manifest_async(self, root: str) -> dict[str, str]:
         """Read a workspace manifest through the isolated filesystem worker."""
-        result = await _run_checkpoint_worker(
+        result = await run_checkpoint_worker(
             "manifest",
             root=str(self._roots_parent),
             workspace_root=root,
@@ -1055,49 +864,7 @@ class ShadowEngine:
         same-size replacement or symlink retarget cannot disappear from a
         speculative diff. Directory symlinks are recorded but never followed.
         """
-        import hashlib
-
-        ignore = IGNORED_DIRECTORY_NAMES
-
-        def resource_hash(path: str) -> str:
-            try:
-                if os.path.islink(path):
-                    value = (
-                        "link:"
-                        + os.readlink(path)
-                        + ":mode:"
-                        + str(stat.S_IMODE(os.lstat(path).st_mode))
-                    )
-                    return hashlib.sha256(value.encode()).hexdigest()[:16]
-                if os.path.isdir(path):
-                    return hashlib.sha256(b"directory").hexdigest()[:16]
-                digest = hashlib.sha256()
-                with open(path, "rb") as handle:
-                    for chunk in iter(lambda: handle.read(65536), b""):
-                        digest.update(chunk)
-                digest.update(f":mode:{stat.S_IMODE(os.stat(path).st_mode)}".encode())
-                return digest.hexdigest()[:16]
-            except OSError:
-                return "<unreadable>"
-
-        manifest: dict[str, str] = {}
-        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-            kept_dirs: list[str] = []
-            for name in dirnames:
-                if name in ignore:
-                    continue
-                full = os.path.join(dirpath, name)
-                if os.path.islink(full):
-                    manifest[os.path.relpath(full, root)] = resource_hash(full)
-                else:
-                    kept_dirs.append(name)
-            dirnames[:] = kept_dirs
-            for name in filenames:
-                if name.endswith(".pyc") or name == ".coverage":
-                    continue
-                full = os.path.join(dirpath, name)
-                manifest[os.path.relpath(full, root)] = resource_hash(full)
-        return manifest
+        return content_manifest(root)
 
     async def _cleanup(self, branch: ShadowBranch) -> None:
         # Shadow trees can be arbitrarily large and their deletion may block
@@ -1105,7 +872,7 @@ class ShadowEngine:
         # out of its shared executor, just like checkpoint capture/restore.
         # The worker's delete operation is idempotent and validates the
         # branch id before removing only this exact child of roots_parent.
-        await _run_checkpoint_worker(
+        await run_checkpoint_worker(
             "delete",
             root=str(self._roots_parent),
             checkpoint_id=branch.id,
@@ -1264,216 +1031,3 @@ class ShadowEngine:
             self._branches[branch.id] = branch
         if changed:
             self._persist_branches()
-
-
-def _manifest_conflicts(
-    expected: dict[str, str],
-    current: dict[str, str],
-) -> list[dict[str, str]]:
-    """Describe every resource that differs between two complete manifests."""
-    conflicts: list[dict[str, str]] = []
-    for rel in sorted(set(expected) | set(current)):
-        before = expected.get(rel, "<missing>")
-        after = current.get(rel, "<missing>")
-        if before == after:
-            continue
-        if before == "<missing>":
-            reason = "created_elsewhere"
-        elif after == "<missing>":
-            reason = "deleted_elsewhere"
-        else:
-            reason = "modified_elsewhere"
-        conflicts.append({"resource": rel, "reason": reason})
-    return conflicts
-
-
-def _unsupported_commit_resources(
-    branch: ShadowBranch,
-    changes: Mapping[str, list[str]],
-    *,
-    shadow_root: str,
-) -> list[dict[str, str]]:
-    """Identify changed entries the canonical ``fs`` commit cannot represent."""
-    resources: list[dict[str, str]] = []
-    candidates = list(changes.get("modified", ())) + list(changes.get("added", ()))
-    for relative in candidates:
-        path = os.path.join(shadow_root, relative)
-        kind = _resource_kind(path)
-        if kind != "regular_file":
-            resources.append({"resource": relative, "kind": kind})
-    for relative in changes.get("deleted", ()):
-        path = os.path.join(branch.base_workspace.root, relative)
-        kind = _resource_kind(path)
-        if kind != "regular_file":
-            resources.append({"resource": relative, "kind": kind})
-    return resources
-
-
-def _resource_kind(path: str) -> str:
-    if os.path.islink(path):
-        return "symlink"
-    if os.path.isfile(path):
-        return "regular_file"
-    if os.path.isdir(path):
-        return "directory"
-    return "special"
-
-
-def _full_preimage_hash(path: str, root: str) -> str:
-    """Return the filesystem capability's full-content preimage hash."""
-    real_root = os.path.realpath(os.path.abspath(root))
-    real_path = os.path.realpath(os.path.abspath(path))
-    if real_path != real_root and not real_path.startswith(real_root + os.sep):
-        raise ValueError(f"commit resource escapes workspace: {path}")
-    if not os.path.exists(path):
-        return "<missing>"
-    if os.path.islink(path) or os.path.isdir(path):
-        raise ValueError(f"commit resource is not a regular file: {path}")
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _workspace_record(workspace: WorkspaceSpec) -> dict:
-    return {
-        "id": workspace.id,
-        "root": workspace.root,
-        "readable": [{"path": rule.path, "allow": rule.allow} for rule in workspace.readable],
-        "writable": [{"path": rule.path, "allow": rule.allow} for rule in workspace.writable],
-        "temp_root": workspace.temp_root,
-        "execution_backend": workspace.execution_backend,
-        "network_policy": workspace.network_policy.value,
-        "mutation_mode": workspace.mutation_mode.value,
-        "revision": workspace.revision,
-    }
-
-
-def _workspace_from_record(record: dict) -> WorkspaceSpec:
-    return WorkspaceSpec(
-        id=str(record["id"]),
-        root=str(record["root"]),
-        readable=tuple(PathRule(**dict(rule)) for rule in record.get("readable") or ()),
-        writable=tuple(PathRule(**dict(rule)) for rule in record.get("writable") or ()),
-        temp_root=record.get("temp_root"),
-        execution_backend=str(record.get("execution_backend") or "local"),
-        network_policy=NetworkPolicy(str(record.get("network_policy") or "allow")),
-        mutation_mode=MutationMode(str(record.get("mutation_mode") or MutationMode.DIRECT.value)),
-        revision=record.get("revision"),
-    )
-
-
-def _rebase_rules(
-    rules: tuple[PathRule, ...],
-    base_root: str,
-    shadow_root: str,
-) -> tuple[PathRule, ...]:
-    """Move workspace-local path rules from the base tree to its clone."""
-    base = os.path.realpath(os.path.abspath(base_root))
-    shadow = os.path.realpath(os.path.abspath(shadow_root))
-    rebased: list[PathRule] = []
-    for rule in rules:
-        raw = str(rule.path)
-        if os.path.isabs(raw):
-            normalized = os.path.realpath(os.path.abspath(raw))
-            if normalized == base or normalized.startswith(base + os.sep):
-                raw = shadow + normalized[len(base) :]
-        else:
-            raw = os.path.join(shadow, raw)
-        rebased.append(PathRule(path=raw, allow=rule.allow))
-    return tuple(rebased)
-
-
-def _manifest_fingerprint(manifest: dict[str, str]) -> str:
-    encoded = json.dumps(
-        sorted(manifest.items()),
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _environment_record(
-    workspace: WorkspaceSpec,
-    policy_profile: str | None = None,
-) -> dict[str, Any]:
-    return ProjectEnvironmentFingerprint().describe(
-        workspace,
-        extras={"policy_profile": policy_profile},
-    )
-
-
-def _environment_fingerprint(
-    workspace: WorkspaceSpec,
-    policy_profile: str | None = None,
-) -> str:
-    return ProjectEnvironmentFingerprint().fingerprint(
-        workspace,
-        extras={"policy_profile": policy_profile},
-    )
-
-
-def _branch_record(branch: ShadowBranch) -> dict:
-    return {
-        "id": branch.id,
-        "task_id": branch.task_id,
-        "base_workspace": _workspace_record(branch.base_workspace),
-        "shadow_workspace": _workspace_record(branch.shadow_workspace),
-        "proposal": branch.proposal,
-        "status": branch.status,
-        "verification": branch.verification,
-        "verification_started_at": branch.verification_started_at,
-        "unsupported_resources": branch.unsupported_resources,
-        # ``dict`` also keeps restart compatibility with legacy branches that
-        # were constructed before certificates became immutable mappings.
-        "verification_certificate": dict(branch.verification_certificate),
-        "mutations": branch.mutations,
-        "base_manifest": branch.base_manifest,
-        "base_preimages": branch.base_preimages,
-        "error": branch.error,
-        "commit_plan": branch.commit_plan,
-        "commit_outcome": branch.commit_outcome,
-        "commit_state": branch.commit_state,
-        "commit_started_at": branch.commit_started_at,
-        "commit_completed_at": branch.commit_completed_at,
-        "checkpoint_id": branch.checkpoint_id,
-        "policy_profile": branch.policy_profile,
-        "created_at": branch.created_at,
-    }
-
-
-def _commit_plan_record(
-    request: CapabilityRequest,
-    *,
-    expected_preimage: str,
-    mode: int | None,
-) -> dict:
-    """Serialize one exact, restart-checkable canonical commit operation."""
-    arguments = request.arguments
-    content_base64 = arguments.get("content_base64")
-    content_sha256 = None
-    if content_base64 is not None:
-        try:
-            content_sha256 = hashlib.sha256(
-                base64.b64decode(str(content_base64), validate=True)
-            ).hexdigest()
-        except (ValueError, TypeError):
-            content_sha256 = None
-    return {
-        "call_id": request.call_id,
-        "capability_id": request.capability_id,
-        "operation": arguments.get("operation"),
-        "path": arguments.get("path"),
-        "content_sha256": content_sha256,
-        "expected_preimage": expected_preimage,
-        "mode": mode,
-    }
-
-
-def _commit_plan_digest(plan: list[dict]) -> str:
-    """Digest plan semantics while ignoring regenerated transport call IDs."""
-    stable = [{key: value for key, value in record.items() if key != "call_id"} for record in plan]
-    return hashlib.sha256(
-        json.dumps(stable, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()

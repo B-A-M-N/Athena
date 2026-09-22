@@ -200,7 +200,7 @@ async def test_proven_transaction_stays_frozen_until_task_finalization(tmp_path:
     await gate.note_transaction_progress("task-proven", str(project), mutation=True)
     gate.mark_transaction_proven("task-proven")
 
-    assert gate._transaction_records["task-proven"]["state"] == "COMMIT_PROVEN"
+    assert gate.transaction_record("task-proven")["state"] == "COMMIT_PROVEN"
     with pytest.raises(PermissionError, match="pending durable task finalization"):
         await gate.route(
             CapabilityRequest(
@@ -319,7 +319,7 @@ async def test_transactional_verification_uses_cas_against_verified_revision(
     outcome = await pending
 
     assert outcome.decision.status is TaskStatus.RECOVERY_REQUIRED
-    assert gate._transaction_records[task.id]["state"] == "RECOVERY_REQUIRED"
+    assert gate.transaction_record(task.id)["state"] == "RECOVERY_REQUIRED"
     assert target.read_text(encoding="utf-8") == "external\n"
 
 

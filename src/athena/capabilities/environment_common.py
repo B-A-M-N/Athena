@@ -27,7 +27,7 @@ from athena.network import (  # noqa: F401 (patch seams for family modules)
     pinned_sync_transport,
     resolve_addresses,
 )
-from athena.execution.async_call import run_blocking
+from athena.concurrency import run_blocking
 from athena.protocol.capabilities import (
     CapabilityRequest,
     CapabilityResult,
@@ -212,6 +212,9 @@ async def _run_external_http_request(**kwargs: Any) -> dict[str, Any]:
     if inspect.isawaitable(result):
         return await result
     return result
+
+
+run_external_http_request = _run_external_http_request
 
 
 # ---------------------------------------------------------------------------

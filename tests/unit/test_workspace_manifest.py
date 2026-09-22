@@ -3,7 +3,12 @@ from __future__ import annotations
 import subprocess
 import pytest
 
-from athena.workspace_manifest import copy_ignore, copy_workspace_tree, tree_paths
+from athena.workspace_manifest import (
+    copy_ignore,
+    copy_workspace_tree,
+    copy_workspace_tree_async,
+    tree_paths,
+)
 
 
 def _git_repo(root):
@@ -142,6 +147,26 @@ def test_copy_workspace_tree_rewrites_safe_internal_symlinks(tmp_path):
     assert link.read_text(encoding="utf-8") == "inside\n"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("limit", "message"),
+    [(("max_files", 1), "max_files"), (("max_bytes", 3), "max_bytes")],
+)
+async def test_async_workspace_copy_rejects_oversized_tree_before_staging(
+    tmp_path, limit, message
+):
+    source = tmp_path / "workspace"
+    source.mkdir()
+    (source / "one.txt").write_text("one\n", encoding="utf-8")
+    (source / "two.txt").write_text("two\n", encoding="utf-8")
+    clone = tmp_path / "clone"
+
+    with pytest.raises(ValueError, match=message):
+        await copy_workspace_tree_async(source, clone, **{limit[0]: limit[1]})
+
+    assert not clone.exists()
+
+
 # ---------------------------------------------------------------- #
 # Reflink (copy-on-write) shadow cloning (P1-21): on FICLONE-capable
 # filesystems the clone shares extents until first write; everywhere else
@@ -160,7 +185,7 @@ def _make_pair(tmp_path):
 
 
 async def test_reflink_copy_preserves_bytes_and_isolation(tmp_path):
-    from athena.execution.async_call import run_blocking
+    from athena.concurrency import run_blocking
     from athena.workspace_manifest import _copy_file
 
     source, clone = _make_pair(tmp_path)
@@ -181,7 +206,7 @@ async def test_reflink_copy_preserves_bytes_and_isolation(tmp_path):
 async def test_tree_copy_degrades_cleanly_when_reflink_unavailable(tmp_path, monkeypatch):
     """Forcing the probe to False yields a byte-identical plain copy."""
     import athena.workspace_manifest as wm
-    from athena.execution.async_call import run_blocking
+    from athena.concurrency import run_blocking
 
     monkeypatch.setattr(wm, "_reflink_supported", lambda directory: False)
     source, clone = _make_pair(tmp_path)

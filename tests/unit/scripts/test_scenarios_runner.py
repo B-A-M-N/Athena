@@ -116,3 +116,84 @@ def test_artifact_identity_binds_manifest_and_artifact_hashes(tmp_path, monkeypa
     assert identity["artifacts"] == [
         {"path": "distributions/athena.whl", "sha256": hashlib.sha256(payload).hexdigest()}
     ]
+
+
+def test_required_capability_unavailable_fails_the_gate(tmp_path, monkeypatch):
+    """Required host evidence cannot silently become a green release gate."""
+    runner = _runner_module()
+    runner.SCENARIOS = (
+        runner.Scenario(
+            id="HOST-001",
+            family="HOST",
+            title="host-bound evidence",
+            nodeids=("tests/does-not-exist.py::never_run",),
+            required=True,
+            capabilities=("TCP_LOOPBACK", "NETWORK_EGRESS"),
+        ),
+    )
+    runner.FAMILY_ORDER = ("HOST",)
+    runner.FAMILY_DESCRIPTIONS = {"HOST": "host"}
+    monkeypatch.setattr(
+        runner,
+        "_capability_available",
+        lambda capability: {"TCP_LOOPBACK": False, "NETWORK_EGRESS": True}[capability],
+    )
+    output = tmp_path / "scenarios.json"
+    monkeypatch.chdir(tmp_path)
+
+    assert runner.main(["--output", str(output)]) == 1
+
+    manifest = json.loads(output.read_text(encoding="utf-8"))
+    entry = manifest["scenarios"][0]
+    assert entry["status"] == "environment_unavailable"
+    assert entry["capabilities"] == ["TCP_LOOPBACK", "NETWORK_EGRESS"]
+    assert entry["unavailable_capabilities"] == ["TCP_LOOPBACK"]
+    assert entry["evidence"] == []
+    assert manifest["summary"]["required_environment_unavailable"] == ["HOST-001"]
+    assert manifest["summary"]["required_not_passed"] == ["HOST-001"]
+
+
+def test_capability_unavailable_does_not_execute_evidence(tmp_path, monkeypatch, capsys):
+    runner = _runner_module()
+    executed = []
+
+    def forbidden_pytest(_nodeids):
+        executed.append(_nodeids)
+        raise AssertionError("evidence must not run without its host capability")
+
+    runner.SCENARIOS = (
+        runner.Scenario(
+            id="HOST-002",
+            family="HOST",
+            title="host-bound evidence",
+            nodeids=("tests/does-not-exist.py::never_run",),
+            required=True,
+            capabilities=("DISPLAY",),
+        ),
+    )
+    runner.FAMILY_ORDER = ("HOST",)
+    runner.FAMILY_DESCRIPTIONS = {"HOST": "host"}
+    runner._run_pytest = forbidden_pytest
+    monkeypatch.setattr(runner, "_capability_available", lambda _capability: False)
+    output = tmp_path / "scenarios.json"
+    monkeypatch.chdir(tmp_path)
+
+    assert runner.main(["--output", str(output), "--quiet"]) == 1
+    assert executed == []
+    manifest = json.loads(output.read_text(encoding="utf-8"))
+    assert manifest["scenarios"][0]["status"] == "environment_unavailable"
+
+
+def test_scenario_capability_list_matches_test_markers_for_high_risk_paths():
+    """Registry and pytest declarations stay aligned for environment lanes."""
+    from tests.scenarios.registry import SCENARIOS
+
+    expected = {
+        "FUSE-007": ("NETWORK_EGRESS",),
+        "RESEARCH-001": ("TCP_LOOPBACK",),
+        "PROOF-002": ("NETWORK_EGRESS",),
+    }
+    by_id = {scenario.id: scenario for scenario in SCENARIOS}
+    assert all(scenario_id in by_id for scenario_id in expected)
+    for scenario_id, capabilities in expected.items():
+        assert by_id[scenario_id].capabilities == capabilities

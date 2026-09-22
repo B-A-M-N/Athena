@@ -9,13 +9,17 @@ record. Replay then uses the ordinary workflow dispatcher.
 
 from __future__ import annotations
 
-import hashlib
 import json
-from collections.abc import Mapping
 from typing import Any
 
 from athena.affordances.models import AffordanceScope, GeneratedCapability
+from athena.capabilities.capsule_codec import decode as _decode_capsule
+from athena.capabilities.capsule_codec import with_id as _with_id
+from athena.capabilities.capsule_effects import resolve_capsule_effects
+from athena.capabilities.operations import native_descriptor
 from athena.protocol.capabilities import (
+    CapabilityFailure,
+    CapabilityFailureCode,
     CapabilityDescriptor,
     CapabilityOrigin,
     CapabilityRequest,
@@ -29,7 +33,7 @@ from athena.workflows.validation import WorkflowValidator
 
 
 class ProcedureCapsuleCapability:
-    descriptor = CapabilityDescriptor(
+    descriptor = native_descriptor(
         id="capsule",
         description=(
             "Export, inspect, import, and replay a portable procedure capsule. "
@@ -94,6 +98,25 @@ class ProcedureCapsuleCapability:
         self._workflow = workflow_capability
         self._research = research_store
         self._dispatcher = dispatcher
+
+    async def resolve_operation_effects(
+        self,
+        arguments,
+        *,
+        workspace,
+        task_id: str | None,
+        principal_id: str | None,
+    ) -> tuple[EffectClass, ...]:
+        operation = str((arguments or {}).get("operation") or "")
+        if operation != "run":
+            return tuple(self.descriptor.resolve_effects(arguments or {}))
+        return resolve_capsule_effects(
+            _decode_capsule((arguments or {}).get("capsule")),
+            fabric=self._fabric,
+            workspace=workspace,
+            task_id=task_id,
+            principal_id=principal_id,
+        )
 
     async def invoke(self, request: CapabilityRequest, *, context=None, **kw):
         if request.task_id is None:
@@ -390,38 +413,24 @@ class ProcedureCapsuleCapability:
                     )
 
 
-def _with_id(body: Mapping[str, Any]) -> dict[str, Any]:
-    canonical = json.dumps(dict(body), sort_keys=True, separators=(",", ":"))
-    value = dict(body)
-    value["capsule_id"] = "capsule_" + hashlib.sha256(canonical.encode()).hexdigest()[:24]
-    return value
-
-
-def _decode_capsule(value: Any) -> dict[str, Any]:
-    if isinstance(value, str):
-        value = json.loads(value)
-    if not isinstance(value, Mapping):
-        raise TypeError("capsule must be an object or JSON object string")
-    capsule = dict(value)
-    if capsule.get("format") != 1:
-        raise ValueError("unsupported capsule format")
-    supplied_id = str(capsule.pop("capsule_id", None) or "")
-    if not supplied_id:
-        raise ValueError("capsule_id is required")
-    expected = _with_id(capsule)["capsule_id"]
-    if supplied_id != expected:
-        raise ValueError("capsule content hash does not match capsule_id")
-    capsule["capsule_id"] = supplied_id
-    return capsule
-
-
 def _result(request, *, ok=True, output="", error=None, metadata=None):
-    return CapabilityResult(
-        request.call_id,
-        request.capability_id,
-        CapabilityResultStatus.OK if ok else CapabilityResultStatus.FAILED,
+    if ok:
+        return CapabilityResult(
+            request.call_id,
+            request.capability_id,
+            CapabilityResultStatus.OK,
+            output=output,
+            error=error,
+            metadata=dict(metadata or {}),
+        )
+    return CapabilityResult.failure(
+        request,
+        CapabilityFailure(
+            code=CapabilityFailureCode.DOMAIN_REJECTED,
+            detail=error or "operation failed",
+            stage="invoke",
+        ),
         output=output,
-        error=error,
         metadata=dict(metadata or {}),
     )
 

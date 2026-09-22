@@ -184,7 +184,8 @@ class FakeModelProvider:
         user_messages: list[str] = []
         assistant_messages: list[str] = []
         capability_result_texts: list[str] = []
-        capability_result_ok: bool | None = None
+        last_capability_result_ok: bool | None = None
+        any_capability_ok = False
         for msg in request.messages:
             t = msg.conversation_text() or ""
             if t:
@@ -196,9 +197,12 @@ class FakeModelProvider:
                     assistant_messages.append(t)
             for block in msg.blocks:
                 if isinstance(block, CapabilityResultBlock):
-                    capability_result_ok = block.ok
-                    result_text = block.output or block.error or ""
-                    capability_result_texts.append(str(result_text))
+                    last_capability_result_ok = block.ok
+                    if block.ok:
+                        any_capability_ok = True
+                    result_text = getattr(block, "text", None) or block.output or block.error or ""
+                    if result_text:
+                        capability_result_texts.append(str(result_text))
 
         for script in self._scripts:
             if not isinstance(script, dict):
@@ -213,7 +217,9 @@ class FakeModelProvider:
 
             if user_contains is not None and user_contains not in user_text:
                 continue
-            if cap_ok is not None and capability_result_ok != cap_ok:
+            if cap_ok is not None and not (
+                any_capability_ok if cap_ok else last_capability_result_ok is False
+            ):
                 continue
             if last_user_contains is not None and (
                 not user_messages or last_user_contains not in user_messages[-1]

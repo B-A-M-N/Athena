@@ -11,7 +11,25 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Callable, Sequence
 
-from athena.execution.async_call import run_blocking
+from athena.concurrency import run_blocking
+
+
+class DatabaseRollbackPoisonedError(RuntimeError):
+    """Rollback itself failed; the connection is poisoned and must be reopened.
+
+    ``original`` carries the error that triggered the rollback. ``rollback``
+    carries the error from the rollback attempt. Both are preserved so
+    startup recovery can diagnose the failure without inferring state from a
+    message string.
+    """
+
+    def __init__(self, original: BaseException, rollback: BaseException) -> None:
+        super().__init__(
+            f"transaction rollback failed; connection poisoned: "
+            f"original={original!r} rollback={rollback!r}"
+        )
+        self.original = original
+        self.rollback = rollback
 
 
 class DatabaseRecoveryRequired(RuntimeError):
@@ -148,7 +166,7 @@ class _AsyncSQLiteConnection:
             operation, future = item
             try:
                 value = operation()
-            except BaseException as exc:  # propagate SQLite and callback failures
+            except BaseException as exc:  # rationale: worker must propagate SQLite/callback failure
                 self._publish_future(future, error=exc)
             else:
                 self._publish_future(future, value=value)
@@ -324,6 +342,7 @@ class Database:
         self._startup_fault_injector = startup_fault_injector
         self._conn: _AsyncSQLiteConnection | None = None
         self._closed = False
+        self._poisoned = False
         self._migrated = False
         self._ensure_lock = asyncio.Lock()
         self._lock = asyncio.Lock()
@@ -341,6 +360,11 @@ class Database:
             await self._ensure_ready_unlocked()
 
     async def _ensure_ready_unlocked(self) -> None:
+        if self._poisoned:
+            raise DatabaseRecoveryRequired(
+                "database connection was poisoned by a failed rollback; "
+                "operator recovery must reopen before normal use"
+            )
         if self._conn is None:
             connection = _AsyncSQLiteConnection(
                 self._path,
@@ -387,7 +411,7 @@ class Database:
                 self._inject_startup_fault("lifecycle")
                 await self._mark_started()
                 self._migrated = True
-            except BaseException as exc:
+            except BaseException as exc:  # rationale: startup failure must remain retryable
                 self._startup_diagnostics = {
                     "status": "recovery_required",
                     "error": f"{type(exc).__name__}: {exc}",
@@ -398,7 +422,7 @@ class Database:
                     # failed open/migration/integrity/lifecycle step must
                     # leave the same Database instance retryable.
                     await connection.close(notify_owner=False)
-                except BaseException:
+                except BaseException:  # rationale: cleanup cannot mask startup failure
                     pass
                 self._conn = None
                 self._migrated = False
@@ -446,7 +470,7 @@ class Database:
                     "ALTER TABLE schema_migrations ADD COLUMN sql_sha256 TEXT;\n"
                     "COMMIT;\n"
                 )
-            except BaseException:
+            except BaseException:  # rationale: rollback preserves indivisible migration
                 await self._conn.rollback()
                 raise
 
@@ -504,7 +528,7 @@ class Database:
                     missing_hashes,
                 )
                 await self._conn.commit()
-            except BaseException:
+            except BaseException:  # rationale: rollback preserves indivisible migration
                 await self._conn.rollback()
                 raise
 
@@ -531,7 +555,7 @@ class Database:
             )
             try:
                 await self._conn.executescript(migration_script)
-            except BaseException:
+            except BaseException:  # rationale: rollback preserves indivisible migration
                 await self._conn.rollback()
                 raise
 
@@ -598,6 +622,30 @@ class Database:
         await self._check_integrity()
         return {"status": "ok"}
 
+    async def recover(self) -> dict[str, Any]:
+        """Explicitly reopen a poisoned connection after integrity verification.
+
+        Only this method clears the poison flag; normal ``_ensure_ready()``
+        always raises ``DatabaseRecoveryRequired`` while poisoned. The caller
+        must be startup/operator recovery, not ordinary runtime code.
+        """
+        if not self._poisoned:
+            return {"status": "ok", "reopened": False, "reason": "not poisoned"}
+        self._poisoned = False
+        self._conn = None
+        self._migrated = False
+        self._txn_owner = None
+        try:
+            await self._ensure_ready()
+            await self._check_integrity()
+            return {"status": "ok", "reopened": True}
+        except BaseException as exc:  # rationale: recovery failure must re-poison
+            self._poisoned = True
+            self._conn = None
+            raise DatabaseRecoveryRequired(
+                f"database recovery after rollback poisoning failed: {type(exc).__name__}: {exc}"
+            ) from exc
+
     async def diagnostics(self) -> dict[str, Any]:
         """Return operator-safe DB/WAL/migration health information."""
         result: dict[str, Any] = {
@@ -660,31 +708,40 @@ class Database:
         self._lock.release()
 
     async def execute(self, sql: str, params: Sequence[Any] = ()) -> _AsyncSQLiteCursor:
+        """Execute one statement with autocommit semantics.
+
+        Autocommit happens only when this call itself acquired the standalone
+        serialization lock.  When the current task already owns an open
+        ``transaction()``, the statement joins that transaction and must not
+        commit on its own: a later rollback of the surrounding transaction has
+        to be able to undo it.
+        """
         await self._ensure_ready()
         assert self._conn is not None
-        if await self._acquire():
-            try:
-                cur = await self._conn.execute(sql, params)
+
+        acquired = await self._acquire()
+        try:
+            cursor = await self._conn.execute(sql, params)
+            if acquired:
                 await self._conn.commit()
-                return cur
-            finally:
+            return cursor
+        finally:
+            if acquired:
                 self._release()
-        cur = await self._conn.execute(sql, params)
-        await self._conn.commit()
-        return cur
 
     async def executemany(self, sql: str, seq: Sequence[Sequence[Any]]) -> None:
+        """Execute many rows with autocommit semantics (see :meth:`execute`)."""
         await self._ensure_ready()
         assert self._conn is not None
-        if await self._acquire():
-            try:
-                await self._conn.executemany(sql, seq)
+
+        acquired = await self._acquire()
+        try:
+            await self._conn.executemany(sql, seq)
+            if acquired:
                 await self._conn.commit()
-            finally:
+        finally:
+            if acquired:
                 self._release()
-            return
-        await self._conn.executemany(sql, seq)
-        await self._conn.commit()
 
     async def fetch_one(self, sql: str, params: Sequence[Any] = ()) -> dict | None:
         await self._ensure_ready()
@@ -735,27 +792,21 @@ class Database:
         sql: str,
         params: Sequence[Any] = (),
     ) -> _AsyncSQLiteCursor:
-        """Execute without auto-commit; caller owns the transaction.
+        """Execute without auto-commit inside a ``transaction()`` scope.
 
-        BEGIN/COMMIT/<BIC_SWIFT placeholder> and other transactional control
-        statements hold the serialization lock until the transaction ends so an
-        interleaved coroutine cannot start a transaction within a transaction.
+        Transaction-control SQL (BEGIN/COMMIT/ROLLBACK/END) is prohibited:
+        use :meth:`transaction`, which owns lock acquisition, commit, and
+        rollback without leaking ownership on cancellation or failure.
         """
         await self._ensure_ready()
         assert self._conn is not None
         stripped = sql.strip().upper()
-        task = asyncio.current_task()
         if stripped.startswith(("BEGIN", "COMMIT", "ROLLBACK", "END")):
-            if stripped.startswith("BEGIN"):
-                if await self._acquire():
-                    self._txn_owner = task
-                cur = await self._conn.execute(sql, params)
-            else:
-                cur = await self._conn.execute(sql, params)
-                if task is not None and task is self._txn_owner:
-                    self._txn_owner = None
-                    self._release()
-            return cur
+            raise ValueError(
+                "transaction-control SQL is not allowed through execute_raw(); "
+                "use Database.transaction() instead"
+            )
+        task = asyncio.current_task()
         if task is not None and task is self._txn_owner:
             return await self._conn.execute(sql, params)
         async with self._lock:
@@ -805,23 +856,53 @@ class Database:
         return await self._fetch_all_locked(sql, params)
 
     @asynccontextmanager
-    async def transaction(self) -> AsyncIterator["Database"]:
+    async def transaction(
+        self,
+        *,
+        mode: str = "DEFERRED",
+    ) -> AsyncIterator["Database"]:
+        """Run a transaction with explicit ownership of the serialization lock.
+
+        ``mode`` must be one of ``DEFERRED``, ``IMMEDIATE``, or ``EXCLUSIVE``.
+        The lock is always released and the transaction is always rolled back
+        on failure or cancellation, including if BEGIN itself raises.
+        """
         await self._ensure_ready()
         assert self._conn is not None
+        normalized = mode.strip().upper()
+        if normalized not in {"DEFERRED", "IMMEDIATE", "EXCLUSIVE"}:
+            raise ValueError(
+                f"unsupported transaction mode {mode!r}: expected DEFERRED, IMMEDIATE, or EXCLUSIVE"
+            )
         task = asyncio.current_task()
+        if task is not None and task is self._txn_owner:
+            raise RuntimeError("nested Database.transaction() is not supported")
         await self._lock.acquire()
         self._txn_owner = task
         try:
             try:
-                await self._conn.execute("BEGIN")
+                await self._conn.execute(f"BEGIN {normalized}")
                 yield self
                 await self._conn.commit()
-            except BaseException:
-                await self._conn.rollback()
+            except BaseException as exc:  # broad-exception: rollback/poison preserves boundary
+                try:
+                    await self._conn.rollback()
+                except BaseException as rollback_exc:  # rationale: poison unknown connection state
+                    # Rollback failure leaves connection state unknown. Poison
+                    # the connection so every subsequent use fails loudly and
+                    # startup recovery owns reopening, instead of allowing a
+                    # half-rolled-back transaction to look trustworthy.
+                    self._poisoned = True
+                    try:
+                        await self._conn.close(notify_owner=False)
+                    except BaseException:  # rationale: cleanup cannot mask poisoned connection
+                        pass
+                    self._conn = None
+                    raise DatabaseRollbackPoisonedError(exc, rollback_exc) from rollback_exc
                 raise
         finally:
             self._txn_owner = None
             self._lock.release()
 
 
-__all__ = ["Database", "DatabaseRecoveryRequired"]
+__all__ = ["Database", "DatabaseRecoveryRequired", "DatabaseRollbackPoisonedError"]

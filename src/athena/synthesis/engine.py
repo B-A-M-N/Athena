@@ -22,15 +22,12 @@ import json
 import logging
 import os
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
 
 from athena.affordances.models import (
-    AffordanceScope,
     DependencyRequirement,
     EvidenceDependency,
 )
 from athena.affordances.validation import GeneratedSourceValidator, ValidationTier
-from athena.capabilities.registry import validate_schema
 from athena.execution.process_tree import (  # noqa: F401 (patch seams)
     kill_tree,
     kill_tree_async,
@@ -38,18 +35,29 @@ from athena.execution.process_tree import (  # noqa: F401 (patch seams)
     spawn_owned,
 )
 from athena.protocol.capabilities import (
-    CapabilityDescriptor,
-    CapabilityOrigin,
-    CapabilityResult,
-    CapabilityResultStatus,
     EffectClass,
 )
+from athena.schema import validate_schema
 from athena.protocol.resources import TaskResourceCloseResult
 from athena.protocol.tasks import WorkspaceSpec
+from athena.synthesis.models import (  # noqa: F401 — compatibility re-exports
+    _GENERATED_EFFECTIVE_AUTHORITY,
+    RegressionCase,
+    SyntheticCapability,
+)
 from athena.synthesis.child_runtime import ChildRuntime, _namespace_python_paths  # noqa: F401 (patch-seam re-export)
+from athena.synthesis.helpers import (  # noqa: F401 — compatibility re-exports
+    _candidate_ready,
+    _promotion_proof_error,
+    _risk_tier,
+    _schema_for_values,
+    _service_negative_cases,
+    canonical_generated_identity,
+)
 from athena.synthesis.promotion import Promotion
 from athena.synthesis.validation import Validator
 from athena.synthesis.proof_ledger import ProofLedger
+from athena.synthesis.executor import GeneratedExecutor
 from athena.synthesis.runtime import GeneratedToolHost, PersistentGeneratedSession
 
 __all__ = [
@@ -74,15 +82,6 @@ _UNUSABLE_LIFECYCLE_STATES = frozenset(
 # Generated Python is an untrusted implementation, not an authority
 # declaration.  It may compute over the task workspace inside the restricted
 # runtime, but it cannot acquire process-spawn, write, delete, network, or
-# privileged authority merely by naming those effects in its metadata.  A
-# generated implementation that needs those operations must request the
-# corresponding native capability through the normal dispatcher.
-_GENERATED_EFFECTIVE_AUTHORITY = frozenset(
-    {
-        "READ_LOCAL",
-        "EXECUTE",
-    }
-)
 
 
 def _child_code(cap_code_repr: str, *, persistent: bool = False) -> str:
@@ -111,7 +110,8 @@ def _child_code(cap_code_repr: str, *, persistent: bool = False) -> str:
         else (
             'ARGS = json.loads(sys.stdin.readline() or "{}")\n'
             'result = NS["run"](ARGS)\n'
-            'print("__RESULT__" + json.dumps(result))\n'
+            'sys.stdout.write("__RESULT__" + json.dumps(result) + "\\n")\n'
+            "sys.stdout.flush()\n"
         )
     )
     return (
@@ -132,119 +132,6 @@ def _child_code(cap_code_repr: str, *, persistent: bool = False) -> str:
         "NS['athena'] = _GeneratedHost()\n"
         f"exec({cap_code_repr}, NS)\n" + execution
     )
-
-
-@dataclass
-class SyntheticCapability:
-    """A generated, validated, task-scoped executable capability."""
-
-    id: str
-    name: str
-    description: str
-    code: str  # python source defining `def run(args)`
-    input_schema: dict
-    effects: frozenset  # declared effect envelope
-    task_id: str | None
-    provenance: dict  # originating task/call ids
-    validation: dict  # test results from sandbox run
-    runtime: str = "python"
-    uses: int = 0
-    successes: int = 0
-    failures: int = 0
-    validation_cases: list[dict] | None = None
-    required_dependencies: tuple[DependencyRequirement, ...] = ()
-    required_capabilities: tuple[str, ...] = ()
-    evidence_dependencies: tuple[EvidenceDependency, ...] = ()
-    input_signatures: set[str] = field(default_factory=set)
-    task_context_signatures: set[str] = field(default_factory=set)
-    environment_fingerprints: set[str] = field(default_factory=set)
-    reuse_count: int = 0
-    downstream_verifications: int = 0
-    latency_saved_ms: float = 0.0
-    turns_saved: int = 0
-    # This is calculated by Athena's sandbox contract, not trusted from the
-    # generated source or its declared effects.
-    effective_effects: frozenset[str] = _GENERATED_EFFECTIVE_AUTHORITY
-    output_schema: dict | None = None
-    lifecycle_state: str = "DRAFT"
-    family_id: str = ""
-    revision: int = 1
-    parent_revision: int | None = None
-    active_revision: int | None = None
-    supersedes: tuple[str, ...] = ()
-    superseded_by: str | None = None
-    dependency_lock: dict = field(default_factory=dict)
-    last_used_at: str | None = None
-    id_generated: bool = False
-
-
-@dataclass(frozen=True)
-class RegressionCase:
-    """Durable, revision-aware record of a live generated failure.
-
-    ``args`` remains in the serialized form for replay compatibility, while
-    ``input`` is the canonical audit field.  A repair inherits only cases
-    whose ``resolved_by_revision`` is empty; old records are normalized with
-    the predecessor's identity rather than being silently discarded.
-    """
-
-    id: str
-    capability_family: str
-    revision_first_seen: int
-    source: str
-    input: Mapping[str, object]
-    environment_fingerprint: str | None
-    expected_contract: Mapping[str, object]
-    observed_failure: str
-    failure_class: str
-    resolved_by_revision: int | None = None
-
-    def to_record(self) -> dict[str, object]:
-        return {
-            "id": self.id,
-            "capability_family": self.capability_family,
-            "revision_first_seen": self.revision_first_seen,
-            "source": self.source,
-            "input": dict(self.input),
-            # ``args`` is the stable replay alias used by pre-existing repair
-            # requests and by the validation runner.
-            "args": dict(self.input),
-            "environment_fingerprint": self.environment_fingerprint,
-            "expected_contract": dict(self.expected_contract),
-            "observed_failure": self.observed_failure,
-            "failure_class": self.failure_class,
-            "resolved_by_revision": self.resolved_by_revision,
-        }
-
-    @classmethod
-    def from_record(
-        cls,
-        record: Mapping[str, object],
-        *,
-        capability_family: str,
-        revision: int,
-    ) -> "RegressionCase":
-        raw_input = record.get("input", record.get("args", {}))
-        input_value = dict(raw_input) if isinstance(raw_input, Mapping) else {}
-        raw_revision = record.get("revision_first_seen")
-        raw_resolved = record.get("resolved_by_revision")
-        raw_contract = record.get("expected_contract")
-        return cls(
-            id=str(record.get("id") or ""),
-            capability_family=str(record.get("capability_family") or capability_family),
-            revision_first_seen=(int(str(raw_revision)) if raw_revision is not None else revision),
-            source=str(record.get("source") or "live_failure"),
-            input=input_value,
-            environment_fingerprint=(
-                str(record["environment_fingerprint"])
-                if record.get("environment_fingerprint")
-                else None
-            ),
-            expected_contract=dict(raw_contract) if isinstance(raw_contract, Mapping) else {},
-            observed_failure=str(record.get("observed_failure") or ""),
-            failure_class=str(record.get("failure_class") or "implementation_failure"),
-            resolved_by_revision=(int(str(raw_resolved)) if raw_resolved is not None else None),
-        )
 
 
 def _generated_failure(
@@ -332,136 +219,9 @@ def _remember_live_failure(
             del cases[:-128]
 
 
-def _candidate_ready(cap: SyntheticCapability) -> bool:
-    """Require proof scaled to the capability's actual effect risk."""
-    if cap.validation.get("all_passed") is not True or cap.failures != 0:
-        return False
-    risk_tier = _risk_tier(cap)
-    minimum_uses = {"low": 3, "medium": 4, "high": 5}[risk_tier]
-    minimum_contexts = 2 if risk_tier in {"medium", "high"} else 1
-    return bool(
-        cap.uses >= minimum_uses
-        and cap.successes >= minimum_uses
-        and len(cap.input_signatures) >= (2 if risk_tier != "low" else 1)
-        and len(cap.task_context_signatures) >= minimum_contexts
-    )
-
-
-def canonical_generated_identity(cap: SyntheticCapability) -> str:
-    """Serialize the resolved generated-capability identity canonically.
-
-    This is evaluated after source formatting, schema inference, dependency
-    resolution, effect resolution, and lineage assignment. Request fields are
-    not sufficient identity because repair/merge operations can change the
-    effective contract.
-    """
-    effects = sorted(getattr(effect, "value", str(effect)) for effect in cap.effects)
-    dependencies = [
-        {
-            "name": dependency.name,
-            "manager": dependency.manager,
-            "version": dependency.version,
-            "reason": dependency.reason,
-            "required_for": dependency.required_for,
-        }
-        for dependency in cap.required_dependencies
-    ]
-    evidence = [dependency.to_record() for dependency in cap.evidence_dependencies]
-    dependency_lock = {
-        key: value for key, value in dict(cap.dependency_lock or {}).items() if key != "target"
-    }
-    return json.dumps(
-        {
-            "source": cap.code,
-            "runtime": cap.runtime,
-            "input_schema": cap.input_schema,
-            "output_schema": cap.output_schema or {},
-            "effects": effects,
-            "effective_authority": sorted(cap.effective_effects),
-            "required_capabilities": sorted(cap.required_capabilities),
-            "packages": dependencies,
-            "dependency_lock": dependency_lock,
-            "evidence": evidence,
-            "family_id": cap.family_id,
-            "revision": cap.revision,
-            "parent_revision": cap.parent_revision,
-            "active_revision": cap.active_revision,
-            "supersedes": sorted(cap.supersedes),
-            "superseded_by": cap.superseded_by,
-            "compatibility": cap.provenance.get("compatibility"),
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    )
-
-
-def _risk_tier(cap: SyntheticCapability) -> str:
-    """Classify promotion proof by the capability's declared native effects."""
-    effects = {getattr(effect, "value", str(effect)) for effect in cap.effects}
-    if effects == {"READ_LOCAL"}:
-        return "low"
-    if effects and effects <= {"READ_LOCAL", "EXECUTE"} and "EXECUTE" in effects:
-        return "medium"
-    return "high"
-
-
 def _admit_generated_input(cap: SyntheticCapability, arguments: object) -> list[str]:
     """Apply the same input admission boundary used by live executors."""
     return validate_schema(cap.input_schema, arguments)
-
-
-def _promotion_proof_error(
-    cap: SyntheticCapability,
-    tier: ValidationTier,
-) -> str | None:
-    """Return the missing proof required to widen a capability's lifetime."""
-    risk_tier = _risk_tier(cap)
-    if cap.validation.get("all_passed") is not True:
-        return "target-tier behavioral validation did not pass"
-    if cap.failures:
-        return "unresolved live failures remain"
-    minimum_uses = {"low": 1, "medium": 2, "high": 3}[risk_tier]
-    if cap.uses < minimum_uses or cap.successes < minimum_uses:
-        return f"{risk_tier}-risk promotion requires {minimum_uses} verified uses"
-    minimum_contexts = 2 if risk_tier in {"medium", "high"} else 1
-    if len(cap.task_context_signatures) < minimum_contexts:
-        return f"{risk_tier}-risk promotion requires {minimum_contexts} task contexts"
-    if risk_tier != "low" and len(cap.input_signatures) < 2:
-        return f"{risk_tier}-risk promotion requires two distinct inputs"
-    if cap.validation.get("tier") != tier.value:
-        return f"behavioral validation at {tier.value} tier is required"
-    if cap.validation.get("all_passed") is not True:
-        return "target-tier behavioral validation did not pass"
-    if cap.failures:
-        return "unresolved live failures remain"
-    negative_total = int(cap.validation.get("negative_cases_total") or 0)
-    negative_passed = int(cap.validation.get("negative_cases_passed") or 0)
-    if negative_total < 1 or negative_passed != negative_total:
-        return "service-generated negative input cases are incomplete"
-    minimum_verifications = {"low": 1, "medium": 2, "high": 3}[risk_tier]
-    if cap.downstream_verifications < minimum_verifications:
-        return (
-            f"{risk_tier}-risk promotion requires {minimum_verifications} canonical "
-            "passing VerificationCompleted events"
-        )
-    risk_tier = str(cap.validation.get("risk_tier") or risk_tier)
-    if risk_tier in {"medium", "high"}:
-        invariant_cases = sum(
-            1
-            for case in (cap.validation_cases or [])
-            if case.get("invariants") or case.get("verification_requirements")
-        )
-        if invariant_cases < 1:
-            return f"{risk_tier}-risk promotion requires an invariant verification case"
-    if (
-        tier in {ValidationTier.PROJECT, ValidationTier.USER}
-        and len(cap.task_context_signatures) < 2
-    ):
-        return f"{tier.value} promotion requires two distinct task contexts"
-    if tier is ValidationTier.USER and len(cap.environment_fingerprints) < 2:
-        return "user promotion requires portability across two environments"
-    return None
 
 
 class SynthesisEngine:
@@ -777,353 +537,13 @@ class SynthesisEngine:
             persistent=cap.runtime == "python_persistent",
         )
         runtime_effects = self._runtime_effective_effects(cap)
-
-        class _Executor:
-            def __init__(self, engine_ref, proof_sink_ref, candidate_sink_ref):
-                self.engine = engine_ref
-                self.proof_sink = proof_sink_ref
-                self.candidate_sink = candidate_sink_ref
-
-            descriptor = CapabilityDescriptor(
-                id=cap.id,
-                description=f"[synthetic] {cap.description} "
-                f"(validated {cap.validation.get('cases_passed', 0)}/"
-                f"{cap.validation.get('cases_total', 0)})",
-                input_schema=cap.input_schema,
-                output_schema=cap.output_schema,
-                # The executable is sandboxed with this effective authority;
-                # the generated declaration remains audit metadata only.
-                effects=frozenset(EffectClass(effect) for effect in runtime_effects),
-                # A generated invocation has no operation argument from which
-                # the legacy dispatcher heuristic could recover its full
-                # runtime envelope. Resolve the descriptor to that complete
-                # envelope so mediated host calls inherit READ_LOCAL plus any
-                # explicitly declared native effect ceiling.
-                effect_resolver=lambda _arguments: frozenset(
-                    EffectClass(effect) for effect in runtime_effects
-                ),
-                origin=(
-                    CapabilityOrigin.PROJECT if cap.task_id is None else CapabilityOrigin.GENERATED
-                ),
-                version="0",
-            )
-
-            async def invoke(self, request, output_accumulator=None, context=None):
-                input_errors = _admit_generated_input(cap, request.arguments)
-                if input_errors:
-                    return CapabilityResult(
-                        request.call_id,
-                        request.capability_id,
-                        CapabilityResultStatus.FAILED,
-                        error="generated input rejected at admission: " + "; ".join(input_errors),
-                        metadata={
-                            "admission_rejected": True,
-                            "admission_boundary": "generated_input_schema",
-                        },
-                    )
-                if cap.lifecycle_state in _UNUSABLE_LIFECYCLE_STATES:
-                    return CapabilityResult(
-                        request.call_id,
-                        request.capability_id,
-                        CapabilityResultStatus.FAILED,
-                        error=(
-                            f"synthetic capability {cap.id} requires revalidation "
-                            f"({cap.lifecycle_state.lower()})"
-                        ),
-                        metadata={
-                            "generated_failure": _generated_failure(
-                                cap,
-                                "lifecycle_unavailable",
-                                repairable=False,
-                            )
-                        },
-                    )
-                # P1-18: enforce task scoping — a task-scoped synthetic must
-                # not be callable by another task.
-                if cap.task_id and request.task_id != cap.task_id:
-                    return CapabilityResult(
-                        request.call_id,
-                        request.capability_id,
-                        CapabilityResultStatus.FAILED,
-                        error=f"synthetic capability {cap.id} is scoped to task {cap.task_id}",
-                    )
-                if cap.evidence_dependencies:
-                    evidence = await self.engine.evidence_status(
-                        cap,
-                        self.engine._research_store,
-                    )
-                    if evidence["status"] != "CURRENT":
-                        cap.lifecycle_state = "REVALIDATION_REQUIRED"
-                        cap.validation["evidence"] = evidence
-                        if self.proof_sink is not None:
-                            try:
-                                await self.proof_sink(
-                                    cap.id,
-                                    self.engine._proof_record(cap),
-                                )
-                            except (KeyError, OSError, RuntimeError, TypeError, ValueError):
-                                _logger.warning(
-                                    "could not persist stale evidence status for %s",
-                                    cap.id,
-                                )
-                        return CapabilityResult(
-                            request.call_id,
-                            request.capability_id,
-                            CapabilityResultStatus.FAILED,
-                            error="generated capability evidence is stale",
-                            metadata={
-                                "evidence": evidence,
-                                "generated_failure": _generated_failure(
-                                    cap,
-                                    "provenance_stale",
-                                    repairable=False,
-                                    evidence=evidence,
-                                ),
-                            },
-                        )
-
-                async def _run():
-                    payload = json.dumps(dict(request.arguments or {}))
-                    workspace_root = context.workspace.root if context is not None else None
-                    dependency_paths = self.engine._dependency_paths(
-                        cap.required_dependencies,
-                        workspace_root,
-                        expected_fingerprint=(
-                            cap.dependency_lock.get("environment_fingerprint")
-                            if cap.dependency_lock
-                            else None
-                        ),
-                    )
-                    return await self.engine._run_generated_child(
-                        cap=cap,
-                        child=child,
-                        payload=payload,
-                        timeout=30,
-                        workspace_root=workspace_root,
-                        effects=self.engine._authority_values(cap),
-                        python_paths=dependency_paths,
-                        context=context,
-                        request=request,
-                    )
-
-                try:
-                    stdout, stderr, returncode = await _run()
-                except (OSError, RuntimeError, ValueError) as exc:
-                    failure_class = "environment_changed"
-                    cap.failures += 1
-                    cap.lifecycle_state = _failure_lifecycle_state(failure_class)
-                    environment_signature = self.engine._environment_signature(
-                        context,
-                        cap,
-                    )
-                    cap.environment_fingerprints.add(environment_signature)
-                    from athena.protocol.messages import utcnow
-
-                    cap.last_used_at = utcnow().isoformat()
-                    _remember_live_failure(
-                        cap,
-                        request.arguments,
-                        failure_class=failure_class,
-                        observed_failure=str(exc),
-                        environment_fingerprint=environment_signature,
-                    )
-                    proof_error = None
-                    if self.proof_sink is not None:
-                        try:
-                            await self.proof_sink(cap.id, self.engine._proof_record(cap))
-                        except (
-                            KeyError,
-                            OSError,
-                            RuntimeError,
-                            TypeError,
-                            ValueError,
-                        ) as proof_exc:
-                            _logger.error(
-                                "generated capability proof persistence failed for %s: %s",
-                                cap.id,
-                                proof_exc,
-                            )
-                            proof_error = str(proof_exc)
-                    return CapabilityResult(
-                        request.call_id,
-                        request.capability_id,
-                        CapabilityResultStatus.FAILED,
-                        error=f"generated execution environment unavailable: {exc}",
-                        metadata={
-                            **({"proof_persistence_error": proof_error} if proof_error else {}),
-                            "generated_failure": _generated_failure(
-                                cap,
-                                failure_class,
-                                repairable=False,
-                            ),
-                        },
-                    )
-                ok = returncode == 0 and "__RESULT__" in stdout
-                cap.uses += 1
-                input_signature = _input_signature(request.arguments)
-                repeated_input = input_signature in cap.input_signatures
-                cap.input_signatures.add(input_signature)
-                task_signature = _input_signature(
-                    {
-                        "task_id": request.task_id,
-                        "session_id": getattr(request, "session_id", None),
-                    }
-                )
-                cap.task_context_signatures.add(task_signature)
-                environment_signature = self.engine._environment_signature(
-                    context,
-                    cap,
-                )
-                cap.environment_fingerprints.add(environment_signature)
-                from athena.protocol.messages import utcnow
-
-                cap.last_used_at = utcnow().isoformat()
-
-                async def _persist_proof() -> str | None:
-                    errors: list[str] = []
-                    if self.proof_sink is None:
-                        pass
-                    else:
-                        try:
-                            await self.proof_sink(
-                                cap.id,
-                                self.engine._proof_record(cap),
-                            )
-                        except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
-                            # The execution result remains truthful, but a
-                            # durable proof failure is surfaced in result metadata
-                            # and logs instead of silently degrading auditability.
-                            _logger.error(
-                                "generated capability proof persistence failed for %s: %s",
-                                cap.id,
-                                exc,
-                            )
-                            errors.append(str(exc))
-                    if self.candidate_sink is not None and cap.task_id and _candidate_ready(cap):
-                        cap.lifecycle_state = "CANDIDATE"
-                        try:
-                            await self.candidate_sink(
-                                self.engine._generated_record(
-                                    cap,
-                                    scope=AffordanceScope.CANDIDATE,
-                                )
-                            )
-                        except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
-                            _logger.error(
-                                "generated candidate persistence failed for %s: %s",
-                                cap.id,
-                                exc,
-                            )
-                            errors.append(str(exc))
-                    return "; ".join(errors) or None
-
-                if ok:
-                    try:
-                        value = json.loads(stdout.split("__RESULT__", 1)[1].splitlines()[0])
-                    except (IndexError, json.JSONDecodeError) as exc:
-                        cap.failures += 1
-                        cap.lifecycle_state = _failure_lifecycle_state("implementation_failure")
-                        _remember_live_failure(
-                            cap,
-                            request.arguments,
-                            failure_class="implementation_failure",
-                            observed_failure=str(exc),
-                            environment_fingerprint=environment_signature,
-                        )
-                        proof_error = await _persist_proof()
-                        return CapabilityResult(
-                            request.call_id,
-                            request.capability_id,
-                            CapabilityResultStatus.FAILED,
-                            error=f"synthetic returned invalid JSON: {exc}",
-                            metadata={
-                                **({"proof_persistence_error": proof_error} if proof_error else {}),
-                                "generated_failure": _generated_failure(
-                                    cap,
-                                    "implementation_failure",
-                                    repairable=True,
-                                ),
-                            },
-                        )
-                    if cap.output_schema is not None:
-                        from athena.capabilities.registry import validate_schema
-
-                        errors = validate_schema(cap.output_schema, value)
-                        if errors:
-                            cap.failures += 1
-                            cap.lifecycle_state = _failure_lifecycle_state("contract_mismatch")
-                            _remember_live_failure(
-                                cap,
-                                request.arguments,
-                                failure_class="contract_mismatch",
-                                observed_failure="; ".join(errors),
-                                environment_fingerprint=environment_signature,
-                            )
-                            proof_error = await _persist_proof()
-                            return CapabilityResult(
-                                request.call_id,
-                                request.capability_id,
-                                CapabilityResultStatus.FAILED,
-                                error="generated output validation failed: " + "; ".join(errors),
-                                metadata={
-                                    **(
-                                        {"proof_persistence_error": proof_error}
-                                        if proof_error
-                                        else {}
-                                    ),
-                                    "generated_failure": _generated_failure(
-                                        cap,
-                                        "contract_mismatch",
-                                        repairable=True,
-                                    ),
-                                },
-                            )
-                    cap.successes += 1
-                    if repeated_input:
-                        cap.reuse_count += 1
-                    proof_error = await _persist_proof()
-                    return CapabilityResult(
-                        request.call_id,
-                        request.capability_id,
-                        CapabilityResultStatus.OK,
-                        output=json.dumps(value),
-                        metadata=({"proof_persistence_error": proof_error} if proof_error else {}),
-                    )
-                cap.failures += 1
-                failure_class = (
-                    "governance_failure"
-                    if "host call" in (stderr or "").lower()
-                    else "implementation_failure"
-                )
-                cap.lifecycle_state = _failure_lifecycle_state(failure_class)
-                if failure_class == "implementation_failure":
-                    _remember_live_failure(
-                        cap,
-                        request.arguments,
-                        failure_class=failure_class,
-                        observed_failure=(stderr or "synthetic failed")[-500:],
-                        environment_fingerprint=environment_signature,
-                    )
-                proof_error = await _persist_proof()
-                return CapabilityResult(
-                    request.call_id,
-                    request.capability_id,
-                    CapabilityResultStatus.FAILED,
-                    error=(stderr or "synthetic failed")[-500:],
-                    metadata={
-                        **({"proof_persistence_error": proof_error} if proof_error else {}),
-                        "generated_failure": _generated_failure(
-                            cap,
-                            failure_class,
-                            repairable=failure_class == "implementation_failure",
-                        ),
-                    },
-                )
-
-        return _Executor(
-            engine_ref=self,
-            proof_sink_ref=proof_sink,
-            candidate_sink_ref=candidate_sink,
+        return GeneratedExecutor(
+            self,
+            cap,
+            child=child,
+            runtime_effects=runtime_effects,
+            proof_sink=proof_sink,
+            candidate_sink=candidate_sink,
         )
 
     def _runtime_effective_effects(
@@ -1188,6 +608,16 @@ class SynthesisEngine:
             "fingerprint": hashlib.sha256(encoded).hexdigest(),
         }
 
+    def generated_record(self, cap, *, scope, project_scope=None, user_scope=None):
+        """Public synthesis-domain operation: build the durable capability record."""
+        return self._generated_record(
+            cap, scope=scope, project_scope=project_scope, user_scope=user_scope
+        )
+
+    def build_executor(self, cap, **kwargs):
+        """Public synthesis-domain operation: build an executor for a validated capability."""
+        return self._build_executor(cap, **kwargs)
+
     def _generated_record(self, cap, *, scope, project_scope=None, user_scope=None):
         return Promotion(self)._generated_record(
             cap, scope=scope, project_scope=project_scope, user_scope=user_scope
@@ -1236,133 +666,6 @@ def _input_signature(arguments: object) -> str:
     """Return a stable bounded identity for live-use diversity evidence."""
     encoded = json.dumps(arguments, sort_keys=True, separators=(",", ":"), default=str).encode()
     return hashlib.sha256(encoded).hexdigest()
-
-
-def _service_negative_cases(schema: Mapping[str, object]) -> list[dict[str, object]]:
-    """Generate deterministic contract-negative inputs from JSON Schema.
-
-    These are service-owned checks, not model-authored examples.  They never
-    execute generated code: the admission boundary must prove that malformed
-    input is rejected by the same validator used by the dispatcher.  The
-    root-type mutation gives every object contract at least one negative case;
-    constrained properties add representative required/type/bounds cases.
-    """
-    schema_type = schema.get("type")
-    invalid_root: object | None = None
-    if schema_type == "object":
-        invalid_root = []
-    elif schema_type == "array":
-        invalid_root = {}
-    elif schema_type == "string":
-        invalid_root = 1
-    elif schema_type in {"integer", "number"}:
-        invalid_root = "not-a-number"
-    elif schema_type == "boolean":
-        invalid_root = "not-a-boolean"
-    elif schema_type == "null":
-        invalid_root = {}
-
-    candidates: list[dict[str, object]] = []
-    if invalid_root is not None:
-        candidates.append(
-            {
-                "input": invalid_root,
-                "source": "service_negative",
-                "expect_invalid_input": True,
-            }
-        )
-    if schema_type != "object":
-        return candidates
-
-    properties = schema.get("properties")
-    if not isinstance(properties, Mapping):
-        properties = {}
-    required = schema.get("required")
-    if isinstance(required, Sequence) and not isinstance(required, (str, bytes)):
-        required_names = [str(name) for name in required]
-        if required_names:
-            candidates.append(
-                {
-                    "input": {},
-                    "source": "service_negative",
-                    "expect_invalid_input": True,
-                    "mutator": "remove_required",
-                    "field": required_names[0],
-                }
-            )
-    if schema.get("additionalProperties") is False:
-        candidates.append(
-            {
-                "input": {"__athena_unknown_field__": True},
-                "source": "service_negative",
-                "expect_invalid_input": True,
-                "mutator": "add_unknown_property",
-            }
-        )
-
-    for raw_name, raw_spec in properties.items():
-        name = str(raw_name)
-        if not isinstance(raw_spec, Mapping):
-            continue
-        value: object | None = None
-        has_value = True
-        value_type = raw_spec.get("type")
-        if value_type == "string":
-            value = 1
-            if isinstance(raw_spec.get("minLength"), int) and raw_spec["minLength"] > 0:
-                value = ""
-        elif value_type in {"integer", "number"}:
-            value = "not-a-number"
-        elif value_type == "boolean":
-            value = "not-a-boolean"
-        elif value_type == "array":
-            value = {}
-        elif value_type == "object":
-            value = []
-        elif value_type == "null":
-            value = True
-        elif isinstance(raw_spec.get("enum"), Sequence) and raw_spec["enum"]:
-            value = "__athena_invalid_enum__"
-        else:
-            has_value = False
-        if has_value:
-            candidates.append(
-                {
-                    "input": {name: value},
-                    "source": "service_negative",
-                    "expect_invalid_input": True,
-                    "mutator": "wrong_type_or_enum",
-                    "field": name,
-                }
-            )
-
-    # Schemas expressed through composition (oneOf/anyOf/not/const, or a
-    # schema without an explicit root type) may not expose a property-level
-    # mutation. Probe a small fixed corpus and retain the first value that the
-    # same validator rejects. This keeps negative proof service-owned without
-    # inventing a case that is actually valid for the contract.
-    probe_values: tuple[object, ...] = (None, [], {}, "", 0, False)
-    for value in probe_values:
-        if validate_schema(dict(schema), value):
-            candidates.append(
-                {
-                    "input": value,
-                    "source": "service_negative",
-                    "expect_invalid_input": True,
-                    "mutator": "schema_constraint",
-                }
-            )
-            break
-
-    unique: list[dict[str, object]] = []
-    seen: set[str] = set()
-    for case in candidates:
-        identity = json.dumps(case, sort_keys=True, separators=(",", ":"), default=str)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        unique.append(case)
-    return unique
 
 
 def _apply_workspace_fixture(case: Mapping[str, object], root: str) -> None:
@@ -1548,15 +851,6 @@ async def _check_invariants(
         ):
             return f"invariant {index} output did not contain {contains!r}"
     return None
-
-
-def _schema_for_values(values: list[object]) -> dict:
-    """Infer a conservative JSON Schema from observed JSON results."""
-    schemas = [_schema_for_value(value) for value in values]
-    unique = {json.dumps(schema, sort_keys=True) for schema in schemas}
-    if len(unique) == 1:
-        return schemas[0]
-    return {"anyOf": [schemas[index] for index in _first_schema_indexes(schemas)]}
 
 
 def _first_schema_indexes(schemas: list[dict]) -> list[int]:

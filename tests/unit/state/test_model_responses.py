@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 from decimal import Decimal
 import json
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 
+from athena.protocol.errors import ProviderOutcomeUnknown
 from athena.protocol.messages import TextBlock
 from athena.protocol.models import ModelInfo, ModelResponse, UsageInfo
 from athena.protocol.models import ModelRequest
@@ -17,6 +18,7 @@ from athena.state.database import Database
 from athena.state.model_responses import ModelResponseStore
 from athena.state.provider_usage import ProviderUsageStore
 from athena.state.tasks import TaskStore
+from athena.service.provider_recovery import ProviderOutcomeRecoveryAPI
 from athena.service.service import AthenaService
 from athena.tasks.budgets import BudgetTracker
 from athena.tasks.manager import TaskManager
@@ -64,6 +66,45 @@ async def test_model_response_receipt_is_durable_and_reused():
     assert decoded.request_id == "call-first"
     assert decoded.blocks[0].text == "durable answer"
     assert decoded.usage.input_tokens == 4
+    await db.close()
+
+
+async def test_unmatched_pending_receipt_is_preserved_for_conservative_reconciliation():
+    db = Database(":memory:")
+    await db._ensure_ready()
+    await db.execute(
+        "INSERT INTO tasks(id, status, autonomy, objective, created_at, updated_at) "
+        "VALUES ('task-fingerprint-migration', 'RUNNING', 'supervised', 'objective', "
+        "'2026-01-01', '2026-01-01')"
+    )
+    store = ModelResponseStore(db)
+    legacy = await store.prepare(
+        task_id="task-fingerprint-migration",
+        request_fingerprint="legacy-process-dependent-fingerprint",
+        request_id="call-before-restart",
+        provider="fixture",
+        model="fixture-model",
+    )
+
+    with pytest.raises(ProviderOutcomeUnknown, match="prior fingerprint format"):
+        await store.prepare(
+            task_id="task-fingerprint-migration",
+            request_fingerprint="v2-canonical-fingerprint",
+            request_id="call-after-restart",
+            provider="fixture",
+            model="fixture-model",
+        )
+
+    preserved = await db.fetch_one(
+        "SELECT request_fingerprint, status, attempt_id FROM model_response_receipts "
+        "WHERE task_id = ?",
+        ("task-fingerprint-migration",),
+    )
+    assert preserved == {
+        "request_fingerprint": "legacy-process-dependent-fingerprint",
+        "status": "PENDING",
+        "attempt_id": legacy["attempt_id"],
+    }
     await db.close()
 
 
@@ -558,6 +599,7 @@ async def test_service_reconciliation_releases_confirmed_failed_reservation():
         _store_events=None,
         _task_manager=None,
     )
+    service._provider_recovery_runtime = ProviderOutcomeRecoveryAPI.compose(service)
     resolved = await AthenaService.resolve_provider_outcome(
         service,
         attempt_id,
@@ -594,6 +636,7 @@ async def test_provider_outcome_dispositions_drive_task_and_accounting_state():
         _approval_recovery_tasks=set(),
         _log_background_failure=AthenaService._log_background_failure,
     )
+    service._provider_recovery_runtime = ProviderOutcomeRecoveryAPI.compose(service)
     cases = (
         ("failed", "confirmed_failed", None),
         ("succeeded", "confirmed_succeeded", "0.40"),
@@ -732,14 +775,7 @@ async def test_all_provider_dispositions_replay_task_effects_after_restart(tmp_p
         _approval_recovery_tasks=set(),
         _log_background_failure=AthenaService._log_background_failure,
     )
-    service._release_provider_reservation = MethodType(
-        AthenaService._release_provider_reservation, service
-    )
-    service._launch_provider_retry = MethodType(AthenaService._launch_provider_retry, service)
-    service._finalize_provider_outcome = MethodType(
-        AthenaService._finalize_provider_outcome, service
-    )
-
+    service._provider_recovery_runtime = ProviderOutcomeRecoveryAPI.compose(service)
     replay = await AthenaService.reconcile_provider_outcomes(service)
     assert replay == {"replayed": 4, "failed": 0}
 
@@ -804,6 +840,7 @@ async def test_confirmed_success_rejects_non_finite_actual_cost():
         _store_events=None,
         _task_manager=None,
     )
+    service._provider_recovery_runtime = ProviderOutcomeRecoveryAPI.compose(service)
 
     for invalid in ("NaN", "Infinity", "-0.01"):
         with pytest.raises(ValueError):

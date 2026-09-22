@@ -127,7 +127,7 @@ async def test_completion_requires_a_separate_verifier(mode, hermes_decision, ex
             return [True for _ in criteria]
 
     service._acceptance_verifier = _PerformanceVerifier()  # noqa: SLF001
-    service._self_host_verification_environment = lambda *args, **kwargs: object()  # noqa: SLF001
+    service._self_host._verification_environment = lambda *args, **kwargs: object()  # noqa: SLF001
     service._hermes_referee = HermesReferee(  # noqa: SLF001 - exercise external seam
         lambda _packet: {"decision": hermes_decision, "rationale": "history is covered"}
     )

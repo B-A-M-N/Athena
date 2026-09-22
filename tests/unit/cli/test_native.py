@@ -152,6 +152,69 @@ async def test_native_transcript_does_not_expose_internal_task_id(capsys):
 
 
 @pytest.mark.asyncio
+async def test_native_session_projection_send_accepts_conversation():
+    session = NativeSession(parse_args([]))
+
+    class Writer:
+        def __init__(self):
+            self.data = b""
+
+        def write(self, data):
+            self.data += data
+
+        async def drain(self):
+            return None
+
+    session._writer = Writer()
+    session._conversation.append({"id": 1, "role": "user", "text": "hello"})
+    await session._send_projection()
+
+    import json
+
+    payload = json.loads(session._writer.data.decode("utf-8"))
+    assert payload["conversation"][0] == {"id": 1, "role": "user", "text": "hello"}
+
+
+@pytest.mark.asyncio
+async def test_native_submit_publishes_semantic_transcript(capsys):
+    session = NativeSession(parse_args([]))
+    session._writer = None  # compatibility PTY test; projection writes are disabled
+
+    class Service:
+        async def submit(self, request, wait=False):
+            return SimpleNamespace(id="task-1", session_id="session-1")
+
+        async def stream_events(self, task_id, after_sequence=0):
+            del task_id, after_sequence
+            if False:
+                yield None
+
+        async def get_result(self, task_id):
+            return SimpleNamespace(summary="semantic response")
+
+    session.service = Service()
+    sent = []
+
+    async def flush():
+        sent.append(list(session._conversation))
+        session._projection_dirty = False
+
+    session._flush_projection = flush  # type: ignore[method-assign]
+    await session._submit("inspect workspace")
+
+    assert sent == [
+        [{"id": 1, "role": "user", "text": "inspect workspace"}],
+        [
+            {"id": 1, "role": "user", "text": "inspect workspace"},
+            {"id": 2, "role": "assistant", "text": "semantic response"},
+        ],
+    ]
+    output = capsys.readouterr().out
+    assert "YOU\ninspect workspace" in output
+    assert "ATHENA\nsemantic response" in output
+
+
+@pytest.mark.asyncio
 async def test_native_submissions_reuse_session_until_new_command():
     session = NativeSession(parse_args([]))
     requests = []

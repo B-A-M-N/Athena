@@ -12,13 +12,19 @@ from __future__ import annotations
 import json
 import inspect
 from dataclasses import asdict
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Any, Callable, Mapping
 
 from athena.protocol.models import ModelResponse, UsageInfo
 from athena.protocol.messages import utcnow
 from athena.protocol.ids import new_id
 from athena.state.database import Database
+from athena.state.model_response_reconciliation import (
+    archive_attempt,
+    ensure_attempt_row,
+    reject_unresolved_legacy_receipts,
+    validated_actual_cost,
+)
 from athena.state.sessions import _deserialize_block, _serialize_block
 
 
@@ -64,6 +70,13 @@ class ModelResponseStore:
                 (task_id, request_fingerprint),
             )
             if existing is None:
+                await reject_unresolved_legacy_receipts(
+                    db,
+                    task_id=task_id,
+                    provider=provider,
+                    model=model,
+                    request_fingerprint=request_fingerprint,
+                )
                 attempt_id = new_id("inference")
                 created_at = utcnow().isoformat()
                 await db.execute_raw(
@@ -114,7 +127,7 @@ class ModelResponseStore:
                 if current_attempt_status == "UNKNOWN" and current_outcome != "retry_authorized":
                     return dict(existing)
                 if current_attempt_status not in {"UNKNOWN", "ABANDONED"}:
-                    await self._archive_attempt(existing, db=db)
+                    await archive_attempt(db, existing)
                 attempt_id = new_id("inference")
                 created_at = utcnow().isoformat()
                 await db.execute_raw(
@@ -220,65 +233,12 @@ class ModelResponseStore:
                     "WHERE task_id = ? AND request_fingerprint = ?",
                     (task_id, request_fingerprint),
                 )
-            await self._ensure_attempt_row(
-                existing, db=db, idempotency_semantics=idempotency_semantics
+            await ensure_attempt_row(
+                db,
+                existing,
+                idempotency_semantics=idempotency_semantics,
             )
             return dict(existing or {})
-
-    async def _ensure_attempt_row(
-        self,
-        row: Mapping[str, Any] | None,
-        *,
-        db: Database | None = None,
-        idempotency_semantics: str = "none",
-    ) -> None:
-        if not row or not row.get("attempt_id"):
-            return
-        execute = db.execute_raw if db is not None else self._db.execute
-        await execute(
-            "INSERT OR IGNORE INTO model_response_attempts("
-            "attempt_id, task_id, request_fingerprint, request_id, provider, model, status, "
-            "reservation_amount, reservation_applied_at, provider_usage_id, "
-            "provider_outcome_status, created_at, completed_at, actual_input_tokens, "
-            "actual_output_tokens, actual_cost, response_committed_at, accounting_applied_at, idempotency_key, "
-            "idempotency_semantics, provider_outcome_note, provider_outcome_resolved_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                row["attempt_id"],
-                row["task_id"],
-                row["request_fingerprint"],
-                row["request_id"],
-                row["provider"],
-                row["model"],
-                row.get("status") or "PENDING",
-                row.get("reservation_amount"),
-                row.get("reservation_applied_at"),
-                row.get("provider_usage_id"),
-                row.get("provider_outcome_status"),
-                row.get("created_at") or utcnow().isoformat(),
-                row.get("completed_at"),
-                row.get("actual_input_tokens"),
-                row.get("actual_output_tokens"),
-                row.get("actual_cost"),
-                row.get("response_committed_at"),
-                row.get("accounting_applied_at"),
-                row.get("idempotency_key") or row.get("attempt_id"),
-                row.get("idempotency_semantics") or idempotency_semantics,
-                row.get("provider_outcome_note"),
-                row.get("provider_outcome_resolved_at"),
-            ),
-        )
-
-    async def _archive_attempt(self, row: Mapping[str, Any], *, db: Database | None = None) -> None:
-        await self._ensure_attempt_row(row, db=db)
-        if row.get("attempt_id"):
-            execute = db.execute_raw if db is not None else self._db.execute
-            await execute(
-                "UPDATE model_response_attempts SET status = 'FAILED', "
-                "provider_outcome_status = 'failed', "
-                "completed_at = COALESCE(completed_at, ?) WHERE attempt_id = ?",
-                (row.get("completed_at") or utcnow().isoformat(), row["attempt_id"]),
-            )
 
     async def mark_reservation_applied(self, *, attempt_id: str) -> bool:
         timestamp = utcnow().isoformat()
@@ -530,7 +490,8 @@ class ModelResponseStore:
                 "UPDATE model_response_attempts SET status = 'UNKNOWN', "
                 "provider_outcome_status = 'unknown', "
                 "provider_outcome_unknown_at = COALESCE(provider_outcome_unknown_at, ?) "
-                "WHERE attempt_id = ? AND status IN ('PENDING', 'ACCOUNTED')",
+                "WHERE attempt_id = ? AND (status IN ('PENDING', 'ACCOUNTED') "
+                "OR (status = 'COMPLETED' AND accounting_applied_at IS NULL))",
                 (timestamp, attempt_id),
             )
             if cursor.rowcount != 1:
@@ -539,7 +500,8 @@ class ModelResponseStore:
             await db.execute_raw(
                 "UPDATE model_response_receipts SET provider_outcome_status = 'unknown', "
                 "provider_outcome_unknown_at = COALESCE(provider_outcome_unknown_at, ?) "
-                "WHERE attempt_id = ? AND status = 'PENDING'",
+                "WHERE attempt_id = ? AND (status = 'PENDING' "
+                "OR (status = 'COMPLETED' AND accounting_applied_at IS NULL))",
                 (timestamp, attempt_id),
             )
             return True
@@ -563,7 +525,7 @@ class ModelResponseStore:
         }
         if resolution not in allowed:
             raise ValueError(f"unsupported provider outcome resolution: {resolution}")
-        normalized_cost = _validated_actual_cost(actual_cost)
+        normalized_cost = validated_actual_cost(actual_cost)
         timestamp = utcnow().isoformat()
         terminal_status = {
             "confirmed_failed": "FAILED",
@@ -760,19 +722,6 @@ class ModelResponseStore:
             (task_id, request_fingerprint),
         )
         return dict(row) if row is not None else None
-
-
-def _validated_actual_cost(value: Decimal | str | None) -> Decimal | None:
-    """Normalize operator-supplied cost without allowing non-finite values."""
-    if value is None:
-        return None
-    try:
-        cost = value if isinstance(value, Decimal) else Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError) as exc:
-        raise ValueError("actual_cost must be a finite, non-negative Decimal") from exc
-    if not cost.is_finite() or cost < 0:
-        raise ValueError("actual_cost must be a finite, non-negative Decimal")
-    return cost
 
 
 def _encode_response(response: ModelResponse) -> dict[str, Any]:

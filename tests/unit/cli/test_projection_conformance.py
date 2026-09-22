@@ -9,6 +9,7 @@ from athena.cli.activity import VisualActionKind
 from athena.cli.layout import Rect
 from athena.cli.oi_stream import OIStreamViewer
 from athena.cli.native_bridge import native_projection_frame
+from athena.presentation.schema import NATIVE_BRIDGE_SCHEMA_VERSION
 from athena.cli.projection import ProjectionState
 from athena.cli.render.scene import render_scene_lines
 from athena.cli.scene import build_oi_scene
@@ -224,7 +225,7 @@ def test_native_bridge_uses_the_same_scene_projection_as_hosted_surfaces():
     entity = next(item for item in frame["entities"] if item["id"] == "call-native")
     assert entity["kind"] == "operation"
     assert entity["label"] == "execute"
-    assert frame["schema_version"] == 3
+    assert frame["schema_version"] == NATIVE_BRIDGE_SCHEMA_VERSION
     assert frame["semantic_state"] == "test"
     assert frame["current_action"]["kind"] == "test"
     assert frame["current_action"]["query"] == ""
@@ -305,7 +306,8 @@ def test_code_mutation_content_is_projected_to_ansi_and_native_surfaces():
     assert frame["semantic_state"] == "code"
     assert frame["code_view"]["path"] == "src/repair.py"
     assert "return value.strip()" in frame["code_view"]["text"]
-    assert frame["active_operation"]["mutation_state"] == "applied"
+    assert frame["code_view"]["mutation_state"] == "applied"
+    # Completed operation remains history/context, not live active identity.
 
 
 def test_diagnostics_and_verification_are_first_class_projection_facts():
@@ -337,13 +339,118 @@ def test_diagnostics_and_verification_are_first_class_projection_facts():
     state.reduce("VerificationCompleted", {"call_id": "call-check", "status": "failed"})
 
     scene = build_oi_scene(state, Rect(0, 0, 80, 24))
-    assert scene.mode is VisualActionKind.FAILURE
+    assert scene.mode is VisualActionKind.VERIFY
     assert scene.diagnostics[0]["message"] == "bad value"
     assert scene.verification_checks[0]["criterion"] == "tests"
     assert state.verification_status == "failed"
     frame = native_projection_frame(state, width=80, height=24)
     assert frame["diagnostics"][0]["path"] == "src/a.py"
     assert frame["verification"]["status"] == "failed"
+
+
+def test_model_request_failure_is_attention_and_recovers_on_failover():
+    state = ProjectionState()
+    state.reduce(
+        "ModelRequestStarted",
+        {"provider": "first", "model": "small", "request_id": "req-1"},
+    )
+    state.reduce(
+        "ModelRequestFailed",
+        {
+            "provider": "first",
+            "model": "small",
+            "request_id": "req-1",
+            "error": "rate limited",
+        },
+    )
+
+    assert state.status == "THINKING"
+    assert state.semantic_state == VisualActionKind.THINK.value
+    assert state.attention is True
+    assert build_oi_scene(state, Rect(0, 0, 80, 24)).mode is VisualActionKind.THINK
+
+    state.reduce(
+        "ModelRequestStarted",
+        {"provider": "fallback", "model": "large", "request_id": "req-2"},
+    )
+    assert state.model_request_status == "active"
+    assert state.active_provider == "fallback"
+    assert state.attention is False
+
+
+def test_capability_failure_is_local_and_next_attempt_clears_attention():
+    state = ProjectionState()
+    state.reduce("CapabilityStarted", {"call_id": "call-1", "capability_id": "execute"})
+    state.reduce(
+        "CapabilityFailed",
+        {"call_id": "call-1", "capability_id": "execute", "reason": "runtime exited"},
+    )
+
+    assert state.status == "EXECUTING"
+    assert state.operations["call-1"].state == "failed"
+    assert state.attention is True
+    assert build_oi_scene(state, Rect(0, 0, 80, 24)).mode is VisualActionKind.EXECUTE
+
+    state.reduce("CapabilityStarted", {"call_id": "call-1", "capability_id": "execute"})
+    assert state.operations["call-1"].state == "running"
+    assert state.attention is False
+
+
+def test_child_execution_failure_does_not_replace_task_status():
+    state = ProjectionState()
+    state.reduce(
+        "ExecutionStarted",
+        {"call_id": "call-1", "execution_id": "exec-1", "runtime": "python"},
+    )
+    state.reduce("ExecutionTimedOut", {"execution_id": "exec-1"})
+
+    assert state.status == "EXECUTING"
+    assert state.operations["call-1"].state == "timed out"
+    assert state.attention is True
+
+
+def test_successful_execution_does_not_complete_the_parent_task():
+    state = ProjectionState()
+    state.reduce(
+        "ExecutionStarted",
+        {"call_id": "call-1", "execution_id": "exec-1", "runtime": "python"},
+    )
+    state.reduce("ExecutionExited", {"execution_id": "exec-1", "exit_code": 0})
+
+    assert state.status == "EXECUTING"
+    assert state.operations["call-1"].state == "complete"
+
+    state.reduce("TaskCompleted", {})
+    assert state.status == "SUCCESS"
+
+
+def test_nonfatal_diagnostics_remain_evidence_without_failing_the_task():
+    state = ProjectionState()
+    state.reduce("ExecutionStarted", {"call_id": "call-1", "execution_id": "exec-1"})
+    state.reduce(
+        "DiagnosticsProduced",
+        {
+            "call_id": "call-1",
+            "diagnostics": [{"severity": "warning", "message": "advisory"}],
+        },
+    )
+
+    assert state.status == "EXECUTING"
+    assert state.failure_info.fatal is False
+
+
+def test_fatal_diagnostics_are_explicitly_marked_as_failure():
+    state = ProjectionState()
+    state.reduce(
+        "DiagnosticsProduced",
+        {
+            "diagnostics": [{"severity": "error", "fatal": True, "message": "broken"}],
+        },
+    )
+
+    assert state.status == "FAILURE"
+    assert state.failure_info.kind == "diagnostics"
+    assert state.failure_info.fatal is True
 
 
 def test_live_trace_overflow_cue_renders_at_right_edge_for_long_lines():
@@ -552,6 +659,34 @@ def test_native_projection_frame_custom_character_serializes():
     assert frame["buddy"]["character"] == "cat"
 
 
+def test_native_projection_bridge_carries_bounded_semantic_conversation():
+    state = ProjectionState()
+    frame = native_projection_frame(
+        state,
+        conversation=[
+            {"id": 7, "role": "user", "text": "inspect workspace"},
+            {"id": 8, "role": "assistant", "text": "two rendering problems"},
+        ],
+    )
+    assert frame["schema_version"] == NATIVE_BRIDGE_SCHEMA_VERSION
+    assert frame["conversation"] == [
+        {"id": 7, "role": "user", "text": "inspect workspace"},
+        {"id": 8, "role": "assistant", "text": "two rendering problems"},
+    ]
+
+
+def test_native_projection_bridge_limits_conversation_to_128_messages():
+    state = ProjectionState()
+    messages = [
+        {"id": index, "role": "user" if index % 2 else "assistant", "text": f"m{index}"}
+        for index in range(1, 200)
+    ]
+    frame = native_projection_frame(state, conversation=messages)
+    assert len(frame["conversation"]) == 128
+    assert frame["conversation"][0]["id"] == 72
+    assert frame["conversation"][-1]["id"] == 199
+
+
 def test_native_projection_frame_model_request_fields_present():
     """The model_request section of the frame must contain the expected keys."""
     from athena.cli.native_bridge import native_projection_frame
@@ -570,6 +705,29 @@ def test_native_projection_frame_model_request_fields_present():
     assert "status" in mr
 
 
+def test_native_projection_bridge_emits_one_visual_mode_and_failure_envelope():
+    state = ProjectionState()
+    state.reduce(
+        "TaskFailed",
+        {
+            "reason": "no eligible model for the request",
+            "stage": "model_routing",
+        },
+    )
+
+    frame = native_projection_frame(state)
+
+    assert frame["visual_mode"] == "failure"
+    assert frame["semantic_state"] == frame["visual_mode"]
+    assert frame["failure"] == {
+        "reason": "no eligible model for the request",
+        "stage": "model_routing",
+        "kind": "model_routing",
+        "code": "",
+        "fatal": True,
+    }
+
+
 def test_self_host_phase_is_preserved_as_native_semantic_state():
     state = ProjectionState()
     for phase in ("PLAN", "PATCH", "PROVE", "REVIEW", "REFEREE", "PROMOTION"):
@@ -577,6 +735,27 @@ def test_self_host_phase_is_preserved_as_native_semantic_state():
         frame = native_projection_frame(state)
         assert state.self_host_phase == phase
         assert frame["self_host_phase"] == phase
+
+
+def test_write_native_projection_forwards_conversation():
+    import json
+    from io import StringIO
+
+    from athena.cli.native_bridge import write_native_projection
+
+    output = StringIO()
+    write_native_projection(
+        output,
+        ProjectionState(),
+        conversation=[
+            {"id": 1, "role": "user", "text": "hello"},
+            {"id": 2, "role": "assistant", "text": "hi"},
+        ],
+    )
+    assert json.loads(output.getvalue())["conversation"] == [
+        {"id": 1, "role": "user", "text": "hello"},
+        {"id": 2, "role": "assistant", "text": "hi"},
+    ]
 
 
 def test_write_native_projection_outputs_valid_json_with_owl():
@@ -641,3 +820,38 @@ def test_learning_activity_is_separate_from_recent_task_activity():
         "Skill candidate recorded",
         "Skill activated",
     ]
+
+
+def test_background_and_repair_attention_do_not_create_terminal_task_failure():
+    state = ProjectionState()
+    state.reduce("TaskStarted", {"task_id": "task-1"})
+    state.reduce("BackgroundTaskFailed", {"task_id": "child-1"})
+
+    assert state.status == "THINKING"
+    assert state.attention is True
+    assert state.failure_info.fatal is False
+    assert state.status_message == "Background work failed."
+
+    state.reduce("ModelRequestStarted", {"provider": "fixture", "model": "fixture-model"})
+
+    assert state.status == "THINKING"
+    assert state.attention is False
+    assert state.failure_info.fatal is False
+
+    state = ProjectionState()
+    state.reduce("TaskStarted", {"task_id": "task-2"})
+    state.reduce("CapabilityStarted", {"call_id": "call-2", "capability_id": "fs"})
+
+    assert state.status == "EXECUTING"
+
+    state.reduce("ToolInputCorrectionExhausted", {"call_id": "call-2"})
+
+    assert state.status == "EXECUTING"
+    assert state.attention is True
+    assert state.failure_info.fatal is False
+    assert state.status_message == "Tool repair budget exhausted"
+
+    state.reduce("ModelRequestStarted", {"provider": "fixture", "model": "fixture-model"})
+
+    assert state.status == "THINKING"
+    assert state.attention is False

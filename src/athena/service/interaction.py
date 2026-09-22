@@ -1,23 +1,11 @@
-"""Operator interaction: cancel/interrupt, input, approvals, resume (P1-10).
-
-Mechanism, not a second authority. Cancelling or interrupting a task,
-answering an operator-input request, granting or denying an approval
-(installing scoped grants, rehydrating them across restart), and
-resuming interrupted work are state transitions the kernel and task
-manager already define. Every seam — the task manager, kernel, stores,
-policy engine, cancellation manager, and submission — resolves through
-the :class:`AthenaService` instance this object is constructed with, and
-the service keeps delegate methods, so the public API, event order, and
-instance-attribute patching are unchanged from when these bodies lived
-on the facade.
-"""
+"""Operator cancellation, input, approval, and resume mechanisms."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from athena.kernel.continuations import ContinuationStore
 from athena.protocol.policy import ApprovalScope, Principal
@@ -30,20 +18,56 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger("athena.service")
 
-__all__ = ["OperatorInteractionService"]
+
+class InteractionPorts:
+    """Allowlisted lifecycle resources and application operations."""
+
+    _RESOURCE_NAMES = {
+        "kernel": "_kernel",
+        "task_manager": "_task_manager",
+        "store_tasks": "_store_tasks",
+        "store_approvals": "_store_approvals",
+        "store_input_requests": "_store_input_requests",
+        "store_continuations": "_store_continuations",
+        "sessions": "_sessions",
+        "policy": "_policy",
+        "require_cancellations": "_require_cancellations",
+        "log_background_failure": "_log_background_failure",
+        "approval_recovery_tasks": "_approval_recovery_tasks",
+        "config": "config",
+    }
+    _APPLICATION_OPERATIONS = {
+        "apply_candidate": "apply_candidate",
+        "submit": "submit",
+        "get_task": "get_task",
+    }
+
+    def __init__(self, owner: "AthenaService") -> None:
+        self._owner = owner
+
+    def __getattr__(self, name: str) -> Any:
+        resource_name = self._RESOURCE_NAMES.get(name)
+        if resource_name is None:
+            resource_name = self._APPLICATION_OPERATIONS.get(name)
+        if resource_name is None:
+            raise AttributeError(f"interaction port is not allowed: {name}")
+        return getattr(self._owner, resource_name, None)
 
 
 class OperatorInteractionService:
     """Operator-facing cancel/input/approval/resume mechanism owned by the facade."""
 
-    def __init__(self, service: AthenaService) -> None:
-        self._svc = service
+    def __init__(self, service: AthenaService, *, ports: InteractionPorts | None = None) -> None:
+        self._ports = ports or InteractionPorts(service)
 
     async def cancel(self, task_id: str, reason: str = "cancelled by user") -> TaskStatus:
-        status = await self._svc._require_cancellations().cancel(task_id, reason)
-        if self._svc._kernel is not None:
+        require_cancellations = self._ports.require_cancellations
+        if require_cancellations is None:
+            raise RuntimeError("cancellation manager is unavailable")
+        status = await require_cancellations().cancel(task_id, reason)
+        if self._ports.kernel is not None:
             try:
-                self._svc._kernel.cancel_task(task_id)
+                self._ports.kernel.cancel_task(task_id)
             except Exception as exc:
                 # P1-11: a failed kernel cancel can leave work running after
                 # the operator's cancel call returned success.
@@ -51,7 +75,7 @@ class OperatorInteractionService:
                     "kernel cancel_task failed for %s: %s: %s", task_id, type(exc).__name__, exc
                 )
             try:
-                await self._svc._kernel.notify_approval_resolved(task_id, "denied")
+                await self._ports.kernel.notify_approval_resolved(task_id, "denied")
             except Exception as exc:
                 _logger.warning(
                     "approval denial notification failed for %s: %s: %s",
@@ -62,13 +86,16 @@ class OperatorInteractionService:
         return status
 
     async def interrupt(self, task_id: str, reason: str = "externally interrupted") -> TaskStatus:
-        return await self._svc._require_cancellations().interrupt(task_id, reason)
+        require_cancellations = self._ports.require_cancellations
+        if require_cancellations is None:
+            raise RuntimeError("cancellation manager is unavailable")
+        return await require_cancellations().interrupt(task_id, reason)
 
     async def pending_input(self, task_id: str) -> dict | None:
         """The open clarification request for a task, if any."""
-        if self._svc._store_input_requests is None:
+        if self._ports.store_input_requests is None:
             return None
-        return await self._svc._store_input_requests.pending_for_task(task_id)
+        return await self._ports.store_input_requests.pending_for_task(task_id)
 
     async def provide_input(self, task_id: str, answer: str) -> None:
         """Answer a task's open clarification and resume the SAME task.
@@ -84,15 +111,15 @@ class OperatorInteractionService:
         relaunched loop consumes the durable answer before its first model
         call.
         """
-        if self._svc._store_input_requests is None:
+        if self._ports.store_input_requests is None:
             raise RuntimeError("operator input is unavailable in this deployment")
-        request = await self._svc._store_input_requests.pending_for_task(task_id)
+        request = await self._ports.store_input_requests.pending_for_task(task_id)
         if request is None:
             raise KeyError(f"No pending input request for task: {task_id}")
-        resolved = await self._svc._store_input_requests.resolve(request["id"], str(answer))
+        resolved = await self._ports.store_input_requests.resolve(request["id"], str(answer))
         if resolved is None:
             raise ValueError(f"Input request already resolved: {request['id']}")
-        kernel = self._svc._kernel
+        kernel = self._ports.kernel
         active = bool(kernel is not None and task_id in getattr(kernel, "_runs", {}))
         if active and kernel is not None:
             armed = await kernel.notify_input_provided(task_id, str(answer))
@@ -100,15 +127,15 @@ class OperatorInteractionService:
                 return
             # The run crossed its slot-release boundary while the answer was
             # being committed. Fall through to the durable relaunch check.
-        if kernel is None or self._svc._task_manager is None:
+        if kernel is None or self._ports.task_manager is None:
             return
-        row = await self._svc._store_tasks.get(task_id) if self._svc._store_tasks else None
+        row = await self._ports.store_tasks.get(task_id) if self._ports.store_tasks else None
         if row and row.get("status") == TaskStatus.WAITING_INPUT.value:
-            await self._svc._task_manager.transition(task_id, TaskStatus.RUNNING)
+            await self._ports.task_manager.transition(task_id, TaskStatus.RUNNING)
             relaunch = asyncio.create_task(kernel.run_task(task_id))
-            self._svc._approval_recovery_tasks.add(relaunch)
+            self._ports.approval_recovery_tasks.add(relaunch)
             relaunch.add_done_callback(
-                self._svc._log_background_failure(f"input relaunch {task_id}")
+                self._ports.log_background_failure(f"input relaunch {task_id}")
             )
 
     async def approve(self, approval_id: str, *, granted: bool, scope: str | None = None) -> None:
@@ -120,7 +147,7 @@ class OperatorInteractionService:
         arguments) passes policy on resume; a denied call records the denial and
         wakes the task with no effect (BHV-043).
         """
-        approvals = self._svc._store_approvals
+        approvals = self._ports.store_approvals
         if approvals is None:
             raise RuntimeError("approval persistence is unavailable")
         rec = await approvals.get(approval_id)
@@ -135,7 +162,7 @@ class OperatorInteractionService:
 
         effective_scope: ApprovalScope | None = None
         if granted:
-            effective_scope = self._clamp_approval_scope(scope, metadata)
+            effective_scope = self.clamp_approval_scope(scope, metadata)
             if effective_scope is None:
                 raise ValueError(f"Unsupported approval scope for {approval_id}")
             if (
@@ -169,9 +196,9 @@ class OperatorInteractionService:
         if metadata.get("candidate_apply"):
             if granted and task_id is not None:
                 try:
-                    await self._svc.apply_candidate(task_id, approval_id=approval_id)
+                    await self._ports.apply_candidate(task_id, approval_id=approval_id)
                 except Exception as exc:  # preserve the candidate for recovery
-                    await self._mark_approval_recovery(task_id, approval_id, exc)
+                    await self.mark_approval_recovery(task_id, approval_id, exc)
                     raise
             return
 
@@ -179,7 +206,7 @@ class OperatorInteractionService:
         # consumes it. A live kernel wakes its in-memory wait; after restart,
         # no coroutine exists, so transition the same task back to RUNNING and
         # launch the normal kernel entry point, which claims the stored call.
-        store_cont = getattr(self._svc, "_store_continuations", None)
+        store_cont = self._ports.store_continuations
         if metadata.get("call_id"):
             try:
                 if store_cont is None:
@@ -198,17 +225,17 @@ class OperatorInteractionService:
                         f"and call {metadata.get('call_id')}"
                     )
             except Exception as exc:
-                await self._mark_approval_recovery(task_id, approval_id, exc)
+                await self.mark_approval_recovery(task_id, approval_id, exc)
                 raise
 
         if granted:
             try:
-                self._install_grant(approval_id, task_id, metadata, first=effective_scope)
+                self.install_grant(approval_id, task_id, metadata, first=effective_scope)
             except Exception as exc:
-                await self._mark_approval_recovery(task_id, approval_id, exc)
+                await self.mark_approval_recovery(task_id, approval_id, exc)
                 raise
 
-        kernel = self._svc._kernel
+        kernel = self._ports.kernel
         active = bool(
             task_id is not None and kernel is not None and task_id in getattr(kernel, "_runs", {})
         )
@@ -222,34 +249,36 @@ class OperatorInteractionService:
                 # The live run released its parked slot while the durable
                 # decision was being committed. Fall through to the same-task
                 # relaunch path below.
-            if task_id is not None and kernel is not None and self._svc._task_manager is not None:
-                row = await self._svc._store_tasks.get(task_id) if self._svc._store_tasks else None
+            if task_id is not None and kernel is not None and self._ports.task_manager is not None:
+                row = (
+                    await self._ports.store_tasks.get(task_id) if self._ports.store_tasks else None
+                )
                 if row and row.get("status") == TaskStatus.WAITING_APPROVAL.value:
-                    await self._svc._task_manager.transition(task_id, TaskStatus.RUNNING)
+                    await self._ports.task_manager.transition(task_id, TaskStatus.RUNNING)
                     recovery = asyncio.create_task(kernel.run_task(task_id))
                     recovery.add_done_callback(
-                        self._svc._log_background_failure(f"approval recovery {task_id}")
+                        self._ports.log_background_failure(f"approval recovery {task_id}")
                     )
         except Exception as exc:
-            await self._mark_approval_recovery(task_id, approval_id, exc)
+            await self.mark_approval_recovery(task_id, approval_id, exc)
             raise
 
-    async def _mark_approval_recovery(
+    async def mark_approval_recovery(
         self, task_id: str | None, approval_id: str, error: BaseException
     ) -> None:
         """Make post-persistence approval uncertainty explicit and durable."""
-        if task_id is None or self._svc._task_manager is None:
+        if task_id is None or self._ports.task_manager is None:
             _logger.error("approval %s requires recovery: %s", approval_id, error)
             return
         try:
-            row = await self._svc._store_tasks.get(task_id) if self._svc._store_tasks else None
+            row = await self._ports.store_tasks.get(task_id) if self._ports.store_tasks else None
             current = row.get("status") if row else None
             if current in {
                 TaskStatus.WAITING_APPROVAL.value,
                 TaskStatus.RUNNING.value,
                 TaskStatus.INTERRUPTED.value,
             }:
-                await self._svc._task_manager.transition(
+                await self._ports.task_manager.transition(
                     task_id,
                     TaskStatus.RECOVERY_REQUIRED,
                     reason=f"approval {approval_id} resolution requires recovery: {error}",
@@ -259,7 +288,7 @@ class OperatorInteractionService:
             # recovery transition visible in logs for an operator.
             _logger.error("approval %s recovery transition failed: %s", approval_id, recovery_error)
 
-    def _install_grant(
+    def install_grant(
         self,
         approval_id: str,
         task_id: str | None,
@@ -269,11 +298,11 @@ class OperatorInteractionService:
         expires_at: datetime | None = None,
     ) -> None:
         """Install an exact scoped ApprovalGrant so the approved call passes on resume."""
-        if self._svc._policy is None or getattr(self._svc._policy, "approvals", None) is None:
+        if self._ports.policy is None or getattr(self._ports.policy, "approvals", None) is None:
             raise RuntimeError("runtime approval manager is unavailable")
-        manager = self._svc._policy.approvals
+        manager = self._ports.policy.approvals
         digest = metadata.get("args_digest")
-        scope_choice = first or self._clamp_approval_scope(scope, metadata)
+        scope_choice = first or self.clamp_approval_scope(scope, metadata)
         if scope_choice is None:
             raise ValueError("approval scope is not offered by the request")
         if scope_choice == ApprovalScope.CALL and not digest:
@@ -322,10 +351,10 @@ class OperatorInteractionService:
         doubles used by legacy callers/tests; it is still sourced from the
         canonical config object rather than a subsystem-specific literal.
         """
-        configured = getattr(getattr(self._svc, "config", None), "cache_namespace", None)
+        configured = getattr(self._ports.config, "cache_namespace", None)
         return str(configured or AthenaConfig().cache_namespace)
 
-    async def _rehydrate_approval_grants(
+    async def rehydrate_approval_grants(
         self,
         approvals: ApprovalStore,
         continuations: ContinuationStore,
@@ -338,7 +367,7 @@ class OperatorInteractionService:
         replayable. Broader scopes are restored from their persisted grant
         rows and retain the original expiry boundary.
         """
-        if self._svc._policy is None:
+        if self._ports.policy is None:
             return
         try:
             records = await approvals.list_granted()
@@ -381,7 +410,7 @@ class OperatorInteractionService:
                     expiry = datetime.fromisoformat(str(raw_expiry))
                 except ValueError:
                     _logger.warning("ignoring invalid expiry on approval %s", approval_id)
-            self._install_grant(
+            self.install_grant(
                 approval_id,
                 record.get("task_id"),
                 metadata,
@@ -389,7 +418,7 @@ class OperatorInteractionService:
                 expires_at=expiry,
             )
 
-    def _clamp_approval_scope(self, choice: str | None, metadata: dict) -> ApprovalScope | None:
+    def clamp_approval_scope(self, choice: str | None, metadata: dict) -> ApprovalScope | None:
         """Resolve the effective approval scope.
 
         A caller-provided ``choice`` is clamped to the scopes the approval
@@ -428,10 +457,10 @@ class OperatorInteractionService:
 
     async def pending_approval_id(self, task_id: str) -> str | None:
         """Return the id of the most recent pending approval for a task, if any."""
-        if self._svc._store_approvals is None:
+        if self._ports.store_approvals is None:
             return None
         try:
-            recs = await self._svc._store_approvals.list_for_task(task_id)
+            recs = await self._ports.store_approvals.list_for_task(task_id)
         except Exception:
             return None
         for rec in recs or []:
@@ -440,30 +469,30 @@ class OperatorInteractionService:
         return None
 
     async def list_sessions(self) -> list[dict]:
-        if self._svc._sessions is None:
+        if self._ports.sessions is None:
             return []
-        return await self._svc._sessions.list_all()
+        return await self._ports.sessions.list_all()
 
     async def resume(self, session_id: str, *, prompt: str = "") -> TaskSpec:
         """Create and run a follow-up task in the given session."""
-        if self._svc._sessions is not None:
-            session = await self._svc._sessions.get(session_id)
+        if self._ports.sessions is not None:
+            session = await self._ports.sessions.get(session_id)
             if session is None:
                 raise KeyError(f"session not found: {session_id}")
             metadata = session.get("metadata") or {}
             if isinstance(metadata, dict) and metadata.get("state") == "closed":
                 raise ValueError(f"session {session_id!r} is closed")
-        return await self._svc.submit(
+        return await self._ports.submit(
             AgentRequest(prompt=prompt or "continue", session_id=session_id),
             wait=True,
         )
 
     async def list_interrupted(self) -> list[dict]:
         """Tasks parked by shutdown/crash, still awaiting completion."""
-        if self._svc._store_tasks is None:
+        if self._ports.store_tasks is None:
             return []
         try:
-            rows = await self._svc._store_tasks.list_by_status(TaskStatus.INTERRUPTED)
+            rows = await self._ports.store_tasks.list_by_status(TaskStatus.INTERRUPTED)
         except Exception as exc:
             _logger.warning("interrupted task listing failed: %s", exc)
             return []
@@ -488,15 +517,15 @@ class OperatorInteractionService:
         capability policy, and budget — this is a continuation of the SAME
         durable work, not a new conversation turn.
         """
-        if self._svc._store_tasks is None or self._svc._task_manager is None:
+        if self._ports.store_tasks is None or self._ports.task_manager is None:
             raise RuntimeError("AthenaService not started")
-        row = await self._svc._store_tasks.get(task_id)
+        row = await self._ports.store_tasks.get(task_id)
         if row is None:
             raise KeyError(f"Task not found: {task_id}")
         status = (row.get("status") or "").upper()
         if status == "RUNNING":
             # Already claimed by a live worker.
-            return await self._svc.get_task(task_id)
+            return await self._ports.get_task(task_id)
         if status in {item.value for item in FINAL_STATUSES}:
             raise ValueError(f"task {task_id} is terminal ({status}); cannot resume")
         if status not in {TaskStatus.INTERRUPTED.value, TaskStatus.QUEUED.value}:
@@ -513,12 +542,12 @@ class OperatorInteractionService:
         # states this generic operation owns. Provider/resource recovery has
         # separate explicit operations and must not depend on this method.
         if status == TaskStatus.INTERRUPTED.value:
-            await self._svc._task_manager.enqueue(task_id)
+            await self._ports.task_manager.enqueue(task_id)
         elif status == TaskStatus.QUEUED.value:
             # A queued task is already eligible; wake the worker if present.
-            callback = getattr(self._svc._task_manager, "_wakeup_callback", None)
+            callback = getattr(self._ports.task_manager, "_wakeup_callback", None)
             if callable(callback):
                 outcome = callback()
                 if hasattr(outcome, "__await__"):
                     await outcome
-        return await self._svc.get_task(task_id)
+        return await self._ports.get_task(task_id)

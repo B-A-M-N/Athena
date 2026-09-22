@@ -23,17 +23,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import json
 import logging
 import os
 import tempfile
 from dataclasses import replace
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
-
-import httpx
 
 from athena.artifacts.store import ArtifactStore
 from athena.affordances import (
@@ -41,22 +37,15 @@ from athena.affordances import (
     GeneratedCapabilityStore,
     ScratchManager,
 )
-from athena.capabilities.delegate import DelegateCapability
 from athena.capabilities.dispatcher import CapabilityDispatcher
-from athena.capabilities.execute import ExecuteCapability
-from athena.capabilities.fs import FilesystemCapability
-from athena.capabilities.memory import MemoryCapability
 from athena.capabilities.registry import CapabilityRegistry
-from athena.capabilities.skills import SkillsCapability
 from athena.context.compiler import ContextCompiler
 from athena.execution.manager import ExecutionManager
 from athena.state.external_effects import ExternalEffectStore
 from athena.execution.environment import VerificationEnvironment
 from athena.interpreter import InterpreterExtension
 from athena.hermes import (
-    HermesAgentEvaluator,
     HermesReferee,
-    ReviewPacket,
 )
 from athena.kernel.kernel import AgentKernel
 from athena.kernel.dispatch import CapabilityDispatchShim
@@ -68,8 +57,7 @@ from athena.mcp.supervisor import MCPConnectionSupervisor
 from athena.memory.store import MemoryStore
 from athena.models.registry import ProviderRegistry
 from athena.models.router import ModelRouter
-from athena.network.browser_proxy import BrowserProxyConfig
-from athena.policy.credentials import SecretError, SecretManager
+from athena.policy.credentials import SecretManager
 from athena.policy.engine import PolicyEngine
 from athena.scheduler.scheduler import Scheduler
 from athena.skills.lifecycle import SkillLifecycle, SkillStore
@@ -89,6 +77,7 @@ from athena.state.context_blocks import ContextBlockStore
 from athena.state.self_host import SelfHostMissionStore
 from athena.packs.store import PackStore
 from athena.service.operational_matrix import build_operational_matrix
+from athena.service.health import build_runtime_health
 from athena.self_host.gates import SelfHostGateBundle
 from athena.state.delegate_sessions import DelegateSessionStore
 from athena.project.index.store import ProjectIndexStore
@@ -107,36 +96,35 @@ if TYPE_CHECKING:
     from athena.state.input_requests import InputRequestStore
 
 from athena.protocol.events import Event
-from athena.protocol.ids import new_id
 from athena.protocol.errors import ModelProviderUnconfigured, ProviderError, ServiceNotReady
 from athena.protocol.policy import ApprovalScope
 from athena.protocol.tasks import (
     AgentRequest,
-    AutonomyLevel,
-    CapabilityPolicy,
-    ContextRef,
-    FINAL_STATUSES,
-    ResourceBudget,
-    MutationMode,
-    NetworkPolicy,
     TaskSpec,
+    TrustedTaskMetadata,
     TaskStatus,
     WorkspaceSpec,
 )
 from athena.protocol.task_codec import decode_criteria, encode_criteria
 
 from athena.service.candidates import CandidateService
+from athena.service.direct_execution import DirectExecutionPorts, DirectExecutionService
 from athena.service.interaction import OperatorInteractionService
 from athena.service.task_api import TaskAPI
+from athena.service.task_intake import TaskIntake
 from athena.service.operator_query import OperatorQueryService
+from athena.service.pack_api import PackAPI
 from athena.service.recovery import RecoveryCoordinator
+from athena.service.fusion_composition import FusionComposition
+from athena.service.hermes_runtime import HermesRuntime, HermesRuntimePorts
 from athena.service.lifecycle import ServiceLifecycle
 from athena.service.self_host import SelfHostService
 from athena.service.provider_runtime import ProviderRuntime
+from athena.service.provider_recovery import ProviderOutcomeRecoveryAPI
+from athena.service.readiness import ServiceReadinessAPI
+from athena.service.watchers import ServiceWatchAPI
+from athena.service.watch_ports import WatchPorts
 from athena.service.mcp_runtime import MCPRuntime
-from athena.service.records import (
-    default_model_policy as _default_model_policy,
-)
 from athena.service.config import (
     AthenaConfig,
     HermesSupervisionMode,
@@ -152,58 +140,6 @@ _DEFAULT_ANSWER_SCRIPTS = (
 
 _logger = logging.getLogger("athena.service")
 
-
-def _validated_actual_cost(value: Decimal | str | None) -> Decimal | None:
-    """Validate the operator/API cost at the application boundary."""
-    if value is None:
-        return None
-    try:
-        cost = value if isinstance(value, Decimal) else Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError) as exc:
-        raise ValueError("actual_cost must be a finite, non-negative Decimal") from exc
-    if not cost.is_finite() or cost < 0:
-        raise ValueError("actual_cost must be a finite, non-negative Decimal")
-    return cost
-
-
-_PROVIDER_OUTCOME_CONTRACT: dict[str, dict[str, Any]] = {
-    "confirmed_failed": {
-        "attempt_status": "FAILED",
-        "receipt_status": "FAILED",
-        "reservation": "released",
-        "actual_cost": "not_required",
-        "task_transition": "RECOVERY_REQUIRED -> FAILED",
-        "inference_retry": "no",
-        "operator_revisable": False,
-    },
-    "retry_authorized": {
-        "attempt_status": "UNKNOWN",
-        "receipt_status": "FAILED",
-        "reservation": "released",
-        "actual_cost": "not_required",
-        "task_transition": "RECOVERY_REQUIRED|INTERRUPTED -> RUNNING",
-        "inference_retry": "one replacement attempt",
-        "operator_revisable": False,
-    },
-    "confirmed_succeeded": {
-        "attempt_status": "COMPLETED",
-        "receipt_status": "FAILED",
-        "reservation": "released after actual-cost accounting",
-        "actual_cost": "required finite non-negative Decimal",
-        "task_transition": "RECOVERY_REQUIRED -> FAILED",
-        "inference_retry": "no",
-        "operator_revisable": False,
-    },
-    "abandoned_with_liability": {
-        "attempt_status": "ABANDONED",
-        "receipt_status": "FAILED",
-        "reservation": "retained until manual liability closeout",
-        "actual_cost": "optional/unknown",
-        "task_transition": "RECOVERY_REQUIRED -> FAILED",
-        "inference_retry": "no",
-        "operator_revisable": False,
-    },
-}
 
 _RESERVED_REQUEST_METADATA = frozenset(
     {
@@ -221,12 +157,9 @@ _RESERVED_REQUEST_METADATA = frozenset(
 )
 
 
-class AthenaService:
+class AthenaService(ServiceReadinessAPI, ProviderOutcomeRecoveryAPI, ServiceWatchAPI):
     """The application API — composition root above the core services."""
 
-    # ------------------------------------------------------------------ #
-    # Construction / factories
-    # ------------------------------------------------------------------ #
     def __init__(
         self,
         *,
@@ -234,8 +167,11 @@ class AthenaService:
         device_provider=None,
         hermes_referee: HermesReferee | None = None,
     ) -> None:
+        ServiceReadinessAPI.__init__(self, self)
+        ServiceWatchAPI.__init__(self, WatchPorts(self))
         self.config = config or AthenaConfig()
         self._background_tasks: set[asyncio.Task] = set()
+        self._observation_callbacks: list = []
         # Optional OI/device adapter surface.  Reflection must receive the
         # configured provider at registration time instead of silently
         # reporting "unsupported" for a provider owned by the host.
@@ -261,10 +197,7 @@ class AthenaService:
             "status": "not_started",
             "blocking": False,
         }
-        self._hermes_referee = hermes_referee
-        self._hermes_adapter: HermesAgentEvaluator | None = None
-        self._hermes_referee_owned = False
-        self._hermes_status_error: str | None = None
+        self._provider_recovery_runtime = ProviderOutcomeRecoveryAPI.compose(self)
         self._started = False
         self._recovery_status = "not_started"
         self._recovery_summary: dict[str, int] = {}
@@ -279,6 +212,10 @@ class AthenaService:
             "checks": {},
             "blocking_failures": [],
         }
+        self._hermes_runtime = HermesRuntime(
+            ports=HermesRuntimePorts(self),
+            referee=hermes_referee,
+        )
         cfg_ws = config.workspace_root if config is not None else None
         self._default_workspace: WorkspaceSpec = WorkspaceSpec(
             id="root",
@@ -372,6 +309,18 @@ class AthenaService:
         self._candidates = CandidateService(self)
         self._provider_runtime = ProviderRuntime(self)
         self._mcp_runtime = MCPRuntime(self)
+        # Facades are stable mechanism objects; constructing them per API call
+        # obscures ownership and needlessly recreates the same service binding.
+        self._task_api = TaskAPI(self)
+        self._task_intake = TaskIntake(self)
+        self._direct_execution = DirectExecutionService(ports=DirectExecutionPorts(self))
+        self._interaction = OperatorInteractionService(self)
+        self._operator_query = OperatorQueryService(self)
+        self._recovery = RecoveryCoordinator(self)
+        self._pack_api = PackAPI(
+            manager=lambda: self._pack_manager,
+            workspace_root=lambda: self.config.workspace_root,
+        )
 
         self._mcp_clients: list[MCPClient] = []
         # Injection seam retained for transport fixtures and host adapters;
@@ -424,7 +373,7 @@ class AthenaService:
         task_manager: TaskManager,
         unavailable: set[str],
     ) -> list[str]:
-        return await RecoveryCoordinator(self)._quarantine_tasks_for_packs(
+        return await self._recovery.quarantine_tasks_for_packs(
             task_store=task_store, task_manager=task_manager, unavailable=unavailable
         )
 
@@ -470,66 +419,7 @@ class AthenaService:
 
     def runtime_health(self) -> dict[str, Any]:
         """Return live subsystem health for reflection and operator APIs."""
-        scheduler = getattr(self, "_scheduler", None)
-        watches = getattr(self, "_watch_registry", None)
-        computer = getattr(self, "_computer", None)
-        browser = getattr(self, "_browser", None)
-        memory = getattr(self, "_memory", None)
-        model_registry = getattr(self, "_model_registry", None)
-        model_readiness = (
-            model_registry.readiness()
-            if model_registry is not None and callable(getattr(model_registry, "readiness", None))
-            else {"state": "unconfigured", "providers": {}}
-        )
-        embedding_provider = (
-            getattr(memory, "embedding_provider", None) if memory is not None else None
-        )
-        embedding_health = (
-            embedding_provider.health()
-            if embedding_provider is not None
-            and callable(getattr(embedding_provider, "health", None))
-            else {
-                "configured": False,
-                "available": False,
-                "state": "unconfigured",
-                "reason": "no embedding provider configured",
-            }
-        )
-        mcp = self.mcp_status()
-        capability_profile = self._live_capability_profile_status(mcp)
-        return {
-            "scheduler": scheduler.health() if scheduler is not None else {"health": "stopped"},
-            "watch": watches.health() if watches is not None else {"health": "stopped"},
-            "computer": computer.health() if computer is not None else dict(self._computer_health),
-            "browser": browser.health() if browser is not None else dict(self._browser_health),
-            "memory_embeddings": embedding_health,
-            "model": {
-                "state": model_readiness.get("state", "unknown"),
-                "configured": bool(model_readiness.get("providers")),
-                "providers": model_readiness.get("providers", {}),
-                "reason": (
-                    None if model_readiness.get("state") == "ready" else "no ready model provider"
-                ),
-            },
-            "execution_recovery": {
-                "state": self._recovery_status,
-                "summary": dict(self._recovery_summary),
-                "error": self._recovery_error,
-            },
-            "provider_outcome_recovery": dict(self._provider_recovery_health),
-            "mcp": mcp,
-            "capability_profile": capability_profile,
-            "optional_capabilities": {
-                name: dict(value)
-                for name, value in sorted(self._optional_capability_health.items())
-            },
-            "resources": (
-                self._resource_finalizer.health()
-                if self._resource_finalizer is not None
-                else {"state": "not_started"}
-            ),
-            "shutdown": dict(self._shutdown_status),
-        }
+        return build_runtime_health(self)
 
     def operational_matrix(self) -> dict[str, Any]:
         """Return the concrete backend/runtime readiness matrix for operators."""
@@ -783,79 +673,54 @@ class AthenaService:
         return await self._mcp_runtime.render_prompt(name, arguments, connection_id=connection_id)
 
     @property
+    def _hermes_referee(self) -> HermesReferee | None:
+        """Compatibility projection for the Hermes runtime owner."""
+        return self._hermes_runtime.referee
+
+    @_hermes_referee.setter
+    def _hermes_referee(self, value: HermesReferee | None) -> None:
+        self._hermes_runtime.referee = value
+
+    @property
+    def _hermes_adapter(self) -> Any:
+        """Compatibility projection for the Hermes runtime adapter."""
+        return self._hermes_runtime.adapter
+
+    @_hermes_adapter.setter
+    def _hermes_adapter(self, value: Any) -> None:
+        self._hermes_runtime.adapter = value
+
+    @property
+    def _hermes_referee_owned(self) -> bool:
+        """Compatibility projection for owned-referee lifecycle state."""
+        return self._hermes_runtime.referee_owned
+
+    @_hermes_referee_owned.setter
+    def _hermes_referee_owned(self, value: bool) -> None:
+        self._hermes_runtime.referee_owned = value
+
+    @property
+    def _hermes_status_error(self) -> str | None:
+        """Compatibility projection for Hermes safety error evidence."""
+        return self._hermes_runtime.status_error
+
+    @_hermes_status_error.setter
+    def _hermes_status_error(self, value: str | None) -> None:
+        self._hermes_runtime.status_error = value
+
+    @property
     def _hermes_supervision_mode(self) -> HermesSupervisionMode:
         """Return the explicit operator policy for self-host supervision."""
-        return self.config.hermes_referee.supervision_mode
+        return self._hermes_runtime.supervision_mode
 
     @property
     def _hermes_supervision_active(self) -> bool:
         """Whether Hermes may contribute evidence at self-host checkpoints."""
-        return (
-            self.config.hermes_referee.transport_enabled
-            and self._hermes_supervision_mode is not HermesSupervisionMode.OFF
-            and self._hermes_referee is not None
-        )
+        return self._hermes_runtime.supervision_active
 
     async def hermes_referee_status(self) -> dict[str, Any]:
         """Return operator-safe Hermes configuration and connectivity status."""
-        settings = self.config.hermes_referee
-        if not settings.transport_enabled:
-            return {
-                "enabled": False,
-                "self_host_supervision": settings.supervision_mode.value,
-                "state": "disabled",
-                "profile": settings.profile,
-                "endpoint": settings.endpoint,
-            }
-        if self._hermes_adapter is None:
-            return {
-                "enabled": settings.transport_enabled,
-                "self_host_supervision": settings.supervision_mode.value,
-                "state": (
-                    "configured_unverified"
-                    if self._hermes_referee is not None and self._hermes_status_error is None
-                    else "error"
-                ),
-                "profile": settings.profile,
-                "endpoint": settings.endpoint,
-                "error": self._hermes_status_error,
-            }
-        try:
-            preflight = await self._hermes_adapter.preflight()
-        except httpx.HTTPError as exc:
-            return {
-                "enabled": settings.transport_enabled,
-                "self_host_supervision": settings.supervision_mode.value,
-                "state": "disconnected",
-                "profile": settings.profile,
-                "endpoint": settings.endpoint,
-                "safety_verified": False,
-                "error": str(exc),
-            }
-        except Exception as exc:
-            from athena.hermes.agent_adapter import HermesRefereeSafetyError
-
-            return {
-                "enabled": settings.transport_enabled,
-                "self_host_supervision": settings.supervision_mode.value,
-                "state": ("unsafe" if isinstance(exc, HermesRefereeSafetyError) else "error"),
-                "safety_verified": False,
-                "profile": settings.profile,
-                "endpoint": settings.endpoint,
-                "error": str(exc),
-            }
-        return {
-            "enabled": settings.transport_enabled,
-            "self_host_supervision": settings.supervision_mode.value,
-            "state": "safety_verified",
-            "safety_verified": True,
-            "profile": settings.profile,
-            "endpoint": settings.endpoint,
-            "policy_fingerprint": preflight.policy_fingerprint,
-            "runtime": dict(preflight.capabilities.get("runtime") or {}),
-            "referee": dict(preflight.capabilities.get("referee") or {}),
-            "build": dict(preflight.capabilities.get("build") or {}),
-        }
+        return await self._hermes_runtime.status()
 
     async def _recover_approved_continuations(
         self,
@@ -865,7 +730,7 @@ class AthenaService:
         task_manager: TaskManager,
         kernel: AgentKernel,
     ) -> None:
-        return await RecoveryCoordinator(self)._recover_approved_continuations(
+        return await self._recovery.recover_approved_continuations(
             continuations=continuations,
             task_store=task_store,
             task_manager=task_manager,
@@ -873,7 +738,7 @@ class AthenaService:
         )
 
     def _track_approval_recovery(self, task_id: str, recovery: asyncio.Task):
-        return RecoveryCoordinator(self)._track_approval_recovery(task_id, recovery)
+        return self._recovery.track_approval_recovery(task_id, recovery)
 
     async def _recover_answered_input_requests(
         self,
@@ -883,7 +748,7 @@ class AthenaService:
         task_manager: TaskManager,
         kernel: AgentKernel,
     ) -> None:
-        return await RecoveryCoordinator(self)._recover_answered_input_requests(
+        return await self._recovery.recover_answered_input_requests(
             input_requests=input_requests,
             task_store=task_store,
             task_manager=task_manager,
@@ -894,7 +759,7 @@ class AthenaService:
     # Application API
     # ------------------------------------------------------------------ #
     async def submit(self, request: AgentRequest, *, wait: bool = True) -> TaskSpec:
-        return await TaskAPI(self).submit(request, wait=wait)
+        return await self._task_api.submit(request, wait=wait)
 
     def voice_health(self) -> dict[str, Any]:
         """Return bounded voice readiness without exposing credentials."""
@@ -976,7 +841,7 @@ class AthenaService:
         trusted: bool = False,
         enqueue: bool = True,
     ) -> TaskSpec:
-        return await TaskAPI(self).submit_spec(
+        return await self._task_api.submit_spec(
             spec,
             wait=wait,
             user_request=user_request,
@@ -1007,6 +872,9 @@ class AthenaService:
             _allow_known_dirty=_allow_known_dirty,
         )
 
+    def self_host_preflight(self, *, workspace_root: str | None = None) -> dict[str, Any]:
+        return self._self_host.preflight(workspace_root=workspace_root)
+
     async def _plan_next_self_host_item(
         self,
         mission: Mapping[str, Any],
@@ -1018,7 +886,7 @@ class AthenaService:
         initial: bool = False,
         current_release_evidence: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], str | None]:
-        return await self._self_host._plan_next_self_host_item(
+        return await self._self_host.plan_next_self_host_item(
             mission,
             plan=plan,
             current_index=current_index,
@@ -1034,7 +902,7 @@ class AthenaService:
         bundle: SelfHostGateBundle,
         task_id: str | None,
     ) -> tuple[list[dict[str, Any]], str | None]:
-        return await self._self_host._verify_self_host_performance(
+        return await self._self_host.verify_self_host_performance(
             bundle=bundle,
             task_id=task_id,
         )
@@ -1050,7 +918,7 @@ class AthenaService:
         release_evidence: Mapping[str, Any],
         task_id: str | None,
     ) -> tuple[dict[str, Any] | None, str | None]:
-        return await self._self_host._verify_self_host_completion(
+        return await self._self_host.verify_self_host_completion(
             mission,
             plan=plan,
             current_index=current_index,
@@ -1071,7 +939,7 @@ class AthenaService:
         release_evidence: Mapping[str, Any],
         task_id: str | None,
     ) -> dict[str, Any]:
-        return await self._self_host._run_hermes_mission_referee(
+        return await self._self_host.run_hermes_mission_referee(
             mission,
             plan=plan,
             current_index=current_index,
@@ -1104,12 +972,12 @@ class AthenaService:
         user_request: AgentRequest | None = None,
         enqueue: bool = True,
     ):
-        return await TaskAPI(self)._enqueue_spec(
+        return await self._task_api.enqueue_spec(
             task_manager, spec, wait=wait, user_request=user_request, enqueue=enqueue
         )
 
     async def _reconcile_created_intake(self) -> dict[str, int]:
-        return await TaskAPI(self).reconcile_created_intake()
+        return await self._task_api.reconcile_created_intake()
 
     def _spawn_static_prefetch(self, task: TaskSpec) -> None:
         compiler = self._compiler
@@ -1204,38 +1072,6 @@ class AthenaService:
         else:
             await self._store_messages.append_to_session(task.session_id, message)
 
-    @staticmethod
-    def _self_host_verification_environment(
-        workspace,
-        *,
-        include_project_root: bool = False,
-        include_rust: bool = False,
-        task_id: str | None = None,
-    ) -> VerificationEnvironment:
-        """Validate the only supported self-host target and its proof tools."""
-        if workspace is None:
-            raise ValueError("athena self requires an Athena source checkout")
-        root = Path(workspace.root).resolve()
-        if not (root / "src" / "athena" / "__init__.py").is_file():
-            raise ValueError("athena self must target an Athena source checkout")
-        try:
-            import tomllib
-
-            project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
-        except (OSError, ValueError, KeyError) as exc:
-            raise ValueError("Athena pyproject.toml could not be validated") from exc
-        if project.get("project", {}).get("name") != "athena-agent":
-            raise ValueError("athena self must target the athena-agent checkout")
-        try:
-            return VerificationEnvironment.from_project(
-                str(root),
-                include_project_root=include_project_root,
-                include_rust=include_rust,
-                task_id=task_id,
-            )
-        except ValueError as exc:
-            raise ValueError(f"athena self: {exc}") from exc
-
     def register_external_delegate(self, spec, *, connector=None) -> None:
         """Register a host-configured ACP/A2A/OpenAI delegate.
 
@@ -1277,180 +1113,23 @@ class AthenaService:
         Returns:
             A result dict with ``exit_code``, ``stdout``, ``stderr``, ``status``.
         """
-        from athena.capabilities.dispatcher import SuspendedCall
-        from athena.protocol.capabilities import (
-            CapabilityRequest,
-            CapabilityResult,
-            CapabilityResultStatus,
-            CapabilityRequestOrigin,
-        )
-
-        dispatcher = self._dispatcher
-        if dispatcher is None:
-            raise RuntimeError("AthenaService not started")
-        ws = self._default_workspace
-        request = CapabilityRequest(
-            capability_id="execute",
-            arguments={
-                "language": language,
-                "code": source,
-                **({"cwd": cwd} if cwd is not None else {}),
-            },
-            # Direct escapes have no model task, so the task FK remains NULL;
-            # their session transcript and approval record are still durable.
-            task_id=None,
-            session_id=session_id,
-            origin=CapabilityRequestOrigin.USER_DIRECT,
-        )
-
-        async def _dispatch():
-            return await dispatcher.dispatch(
-                request,
-                workspace=ws,
-                profile=self.config.autonomy_level,
-            )
-
-        result = await _dispatch()
-        if isinstance(result, SuspendedCall):
-            approval_id = result.approval_id
-            scopes = [s.value for s in result.decision.approval_scope_options]
-            if not approval_id:
-                return {
-                    "exit_code": 1,
-                    "stdout": "",
-                    "stderr": "approval required but no approval id was issued",
-                    "status": "failed",
-                }
-            if on_approval is None:
-                return {
-                    "approval_id": approval_id,
-                    "scopes": scopes,
-                    "exit_code": 1,
-                    "stdout": "",
-                    "stderr": "approval required",
-                    "status": "approval_required",
-                }
-            decision = on_approval(approval_id, scopes)
-            if hasattr(decision, "__await__"):
-                decision = await decision
-            granted = bool(getattr(decision, "granted", decision))
-            scope = getattr(decision, "scope", None)
-            await self.approve(approval_id, granted=granted, scope=scope)
-            if not granted:
-                result = CapabilityResult(
-                    request.call_id,
-                    request.capability_id,
-                    CapabilityResultStatus.FAILED,
-                    error="denied: approval not granted",
-                    metadata={"decision": "deny"},
-                )
-            else:
-                # The approval grant is exact and the request object is
-                # unchanged, so the dispatcher re-evaluates the same call.
-                result = await _dispatch()
-
-        if not isinstance(result, CapabilityResult):
-            return {
-                "exit_code": 1,
-                "stdout": "",
-                "stderr": "direct execute returned an invalid capability result",
-                "status": "failed",
-            }
-
-        ok = result.status is CapabilityResultStatus.OK
-        metadata = dict(result.metadata or {})
-        output = result.output or ""
-        error = result.error or ""
-        payload = {
-            "exit_code": metadata.get("exit_code", 0 if ok else 1),
-            "stdout": output if ok else output,
-            "stderr": "" if ok else error,
-            "status": "completed" if ok else "failed",
-            "duration_ms": metadata.get("duration_ms"),
-            "artifact_uri": result.ref_uri,
-            "session_id": session_id,
-        }
-        await self._record_direct_result(
-            session_id=session_id,
-            source=source,
+        return await self._direct_execution.execute_direct(
+            source,
             language=language,
-            result=result,
+            cwd=cwd,
+            session_id=session_id,
             inject_into_context=inject_into_context,
-        )
-        return payload
-
-    async def _record_direct_result(
-        self,
-        *,
-        session_id: str | None,
-        source: str,
-        language: str,
-        result: Any,
-        inject_into_context: bool,
-    ) -> None:
-        """Persist a direct execution as a capability transcript message."""
-        if not session_id or self._store_messages is None:
-            return
-        from athena.protocol.messages import (
-            CapabilityCallBlock,
-            CapabilityResultBlock,
-            Message,
-            Provenance,
-            Role,
-            SourceType,
-            utcnow,
-        )
-
-        if self._sessions is not None and await self._sessions.get(session_id) is None:
-            create_session = self._sessions.create
-            kwargs: dict[str, Any] = {}
-            try:
-                if "principal_id" in inspect.signature(create_session).parameters:
-                    kwargs["principal_id"] = self.config.cache_namespace
-            except (TypeError, ValueError):
-                # A legacy adapter may not expose an inspectable signature;
-                # its positional create(session_id) contract remains valid.
-                pass
-            await create_session(session_id, **kwargs)
-        call_id = getattr(result, "call_id", "") or new_id("call")
-        block_call = CapabilityCallBlock(
-            call_id=call_id,
-            capability_id="execute",
-            arguments={"language": language, "code": source},
-        )
-        block_result = CapabilityResultBlock(
-            call_id=call_id,
-            capability_id="execute",
-            ok=result.status.value == "ok",
-            output=result.output or "",
-            error=result.error,
-            metadata=dict(result.metadata or {}),
-            ref_uri=result.ref_uri,
-        )
-        await self._store_messages.append_to_session(
-            session_id,
-            Message(
-                id=new_id("msg"),
-                role=Role.CAPABILITY,
-                blocks=(block_call, block_result),
-                created_at=utcnow(),
-                provenance=Provenance(source_type=SourceType.CAPABILITY),
-                metadata={
-                    "session_id": session_id,
-                    "direct_execution": True,
-                    "inject_into_context": inject_into_context,
-                },
-            ),
+            on_approval=on_approval,
         )
 
     async def run_task(self, task_id: str) -> TaskSpec:
-        return await TaskAPI(self).run_task(task_id)
+        return await self._task_api.run_task(task_id)
 
     async def wait_for(self, task_id: str, *, timeout: float | None = None) -> TaskSpec:
-        return await TaskAPI(self).wait_for(task_id, timeout=timeout)
+        return await self._task_api.wait_for(task_id, timeout=timeout)
 
     async def get_task(self, task_id: str) -> TaskSpec:
-        return await TaskAPI(self).get_task(task_id)
+        return await self._task_api.get_task(task_id)
 
     async def list_tasks(self, status: TaskStatus | None = None) -> list[dict]:
         """Return durable tasks for operator/CLI inspection."""
@@ -1558,408 +1237,42 @@ class AthenaService:
         )
 
     async def list_packs(self, query: str | None = None) -> list[dict[str, Any]]:
-        """List installed declarative packs and their live health."""
-        manager = self._pack_manager
-        if manager is None:
-            return []
-        rows = list(await manager.list())
-        if query:
-            needle = query.casefold()
-            rows = [
-                row
-                for row in rows
-                if needle in str(row.get("id", "")).casefold()
-                or needle in str(row.get("publisher", "")).casefold()
-            ]
-        for row in rows:
-            state = await manager._store.get(str(row["id"]))
-            if state is not None:
-                row["health_detail"] = manager.health(state)
-        return rows
+        return await self._pack_api.list(query)
 
     async def inspect_pack(self, pack_id: str) -> dict[str, Any] | None:
-        if self._pack_manager is None:
-            return None
-        try:
-            return await self._pack_manager.inspect_installed(pack_id)
-        except KeyError:
-            return None
+        return await self._pack_api.inspect(pack_id)
 
     async def install_pack(self, source_path: str, *, enable: bool = True) -> dict[str, Any]:
-        if self._pack_manager is None:
-            raise RuntimeError("pack manager is unavailable")
-        state = await self._pack_manager.install(
-            source_path,
-            allowed_root=self.config.workspace_root,
-            enable=enable,
-        )
-        return state.to_record()
+        return await self._pack_api.install(source_path, enable=enable)
 
     async def enable_pack(self, pack_id: str) -> dict[str, Any]:
-        if self._pack_manager is None:
-            raise RuntimeError("pack manager is unavailable")
-        return (await self._pack_manager.enable(pack_id)).to_record()
+        return await self._pack_api.enable(pack_id)
 
     async def disable_pack(self, pack_id: str) -> dict[str, Any]:
-        if self._pack_manager is None:
-            raise RuntimeError("pack manager is unavailable")
-        return (await self._pack_manager.disable(pack_id)).to_record()
+        return await self._pack_api.disable(pack_id)
 
     async def remove_pack(self, pack_id: str) -> bool:
-        if self._pack_manager is None:
-            return False
-        return await self._pack_manager.uninstall(pack_id)
+        return await self._pack_api.remove(pack_id)
 
     async def get_result(self, task_id: str):
-        return await TaskAPI(self).get_result(task_id)
-
-    async def list_provider_outcome_recoveries(
-        self, task_id: str | None = None
-    ) -> list[dict[str, Any]]:
-        """List provider attempts that still require operator reconciliation."""
-        store = self._model_response_store
-        if store is None:
-            self._provider_recovery_health.update(
-                {"state": "unavailable", "error": "provider recovery store is unavailable"}
-            )
-            raise RuntimeError("provider outcome recovery store is unavailable")
-        try:
-            rows = await store.list_unresolved_attempts(task_id=task_id)
-        except Exception as exc:
-            self._provider_recovery_health.update({"state": "unavailable", "error": str(exc)})
-            raise RuntimeError("provider outcome recovery store could not be read") from exc
-        self._provider_recovery_health.update(
-            {
-                "state": "degraded" if rows else "ready",
-                "unresolved_count": len(rows),
-                "error": None,
-            }
-        )
-        return rows
-
-    async def get_provider_outcome_recovery(self, attempt_id: str) -> dict[str, Any] | None:
-        """Return one durable provider-outcome recovery record."""
-        store = self._model_response_store
-        if store is None:
-            raise RuntimeError("provider outcome recovery store is unavailable")
-        return await store.get_attempt(str(attempt_id))
-
-    async def resolve_provider_outcome(
-        self,
-        attempt_id: str,
-        *,
-        resolution: str,
-        note: str,
-        provider_response_id: str | None = None,
-        actual_cost: Decimal | str | None = None,
-    ) -> dict[str, Any]:
-        """Apply one explicit provider-outcome disposition and its task effect.
-
-        ``confirmed_failed`` releases the reservation and terminally fails the
-        task. ``retry_authorized`` releases the reservation and starts a new
-        attempt. ``confirmed_succeeded`` records the known charge, releases the
-        reservation, and terminally fails the task because its response body is
-        unavailable. ``abandoned_with_liability`` terminally fails the task but
-        deliberately retains the reservation for manual financial closeout.
-        """
-        resolution = str(resolution).strip().lower()
-        note = str(note).strip()
-        if not note:
-            raise ValueError("provider outcome resolution requires a non-empty note")
-        normalized_cost = _validated_actual_cost(actual_cost)
-        store = self._model_response_store
-        if store is None:
-            raise RuntimeError("provider outcome recovery is unavailable")
-        attempt = await store.get_attempt(str(attempt_id))
-        if attempt is None:
-            raise KeyError(f"unknown inference attempt: {attempt_id}")
-        if resolution == "confirmed_succeeded" and normalized_cost is None:
-            prior_cost = attempt.get("actual_cost")
-            if prior_cost in (None, ""):
-                raise ValueError("confirmed_succeeded requires actual_cost")
-            normalized_cost = _validated_actual_cost(str(prior_cost))
-        resolved = await store.resolve_provider_outcome(
-            attempt_id=str(attempt_id),
-            resolution=resolution,
-            note=note,
-            provider_response_id=provider_response_id,
-            actual_cost=normalized_cost,
-        )
-        task_id = str(resolved.get("task_id") or attempt.get("task_id") or "")
-        amount = _validated_actual_cost(resolved.get("reservation_amount")) or Decimal("0")
-        if resolution in {"confirmed_failed", "retry_authorized"}:
-            await AthenaService._release_provider_reservation(
-                self,
-                store,
-                task_id=task_id,
-                attempt_id=str(attempt_id),
-                amount=amount,
-            )
-        elif resolution == "confirmed_succeeded":
-            budgets = getattr(self, "_budgets", None)
-            if budgets is not None:
-                await budgets.apply_model_accounting(
-                    task_id,
-                    str(attempt_id),
-                    reserved=amount,
-                    input_tokens=int(resolved.get("actual_input_tokens") or 0),
-                    output_tokens=int(resolved.get("actual_output_tokens") or 0),
-                    actual_cost=normalized_cost,
-                    reservation_id=str(attempt_id),
-                )
-                await store.mark_budget_accounted(attempt_id=str(attempt_id))
-            await store.mark_reservation_released(attempt_id=str(attempt_id))
-        if self._store_events is not None:
-            await self._store_events.append_event(
-                "ProviderOutcomeResolved",
-                {
-                    "attempt_id": str(attempt_id),
-                    "task_id": task_id,
-                    "resolution": str(resolution),
-                    "provider": resolved.get("provider"),
-                    "model": resolved.get("model"),
-                    "provider_response_id": resolved.get("provider_response_id"),
-                },
-                task_id=task_id or None,
-            )
-        if resolution == "retry_authorized":
-            await AthenaService._launch_provider_retry(self, task_id)
-        elif resolution in {
-            "confirmed_failed",
-            "confirmed_succeeded",
-            "abandoned_with_liability",
-        }:
-            await AthenaService._finalize_provider_outcome(
-                self,
-                task_id,
-                resolution=resolution,
-                attempt_id=str(attempt_id),
-            )
-        return await AthenaService._provider_resolution_view(self, resolved)
-
-    async def close_provider_liability(self, attempt_id: str, *, note: str) -> dict[str, Any]:
-        """Close the financial reservation for an abandoned provider attempt."""
-        note = str(note).strip()
-        if not note:
-            raise ValueError("provider liability closeout requires a non-empty note")
-        store = self._model_response_store
-        if store is None:
-            raise RuntimeError("provider outcome recovery store is unavailable")
-        attempt = await store.get_attempt(str(attempt_id))
-        if attempt is None:
-            raise KeyError(f"unknown inference attempt: {attempt_id}")
-        if str(attempt.get("provider_outcome_status") or "").lower() != (
-            "abandoned_with_liability"
-        ):
-            raise ValueError("only abandoned provider liabilities can be manually closed")
-        amount = _validated_actual_cost(attempt.get("reservation_amount")) or Decimal("0")
-        budgets = getattr(self, "_budgets", None)
-        if budgets is not None and amount > 0:
-            await budgets.release_model_cost(
-                str(attempt.get("task_id") or ""), amount, reservation_id=str(attempt_id)
-            )
-        closed = await store.close_provider_liability(attempt_id=str(attempt_id), note=note)
-        if self._store_events is not None:
-            await self._store_events.append_event(
-                "ProviderLiabilityClosed",
-                {
-                    "attempt_id": str(attempt_id),
-                    "task_id": closed.get("task_id"),
-                    "note": note,
-                },
-                task_id=str(closed.get("task_id") or "") or None,
-            )
-        view = await AthenaService._provider_resolution_view(self, closed)
-        view["liability_closed"] = True
-        view["next_actions"] = []
-        return view
-
-    async def _release_provider_reservation(
-        self,
-        store: Any,
-        *,
-        task_id: str,
-        attempt_id: str,
-        amount: Decimal,
-    ) -> None:
-        budgets = getattr(self, "_budgets", None)
-        if budgets is not None and amount > 0:
-            await budgets.release_model_cost(task_id, amount, reservation_id=attempt_id)
-        await store.mark_reservation_released(attempt_id=attempt_id)
-
-    async def _finalize_provider_outcome(
-        self,
-        task_id: str,
-        *,
-        resolution: str,
-        attempt_id: str,
-    ) -> None:
-        manager = getattr(self, "_task_manager", None)
-        tasks = getattr(self, "_store_tasks", None)
-        if manager is None or tasks is None or not task_id:
-            return
-        row = await tasks.get(task_id)
-        if row is None:
-            return
-        current = TaskStatus(str(row.get("status") or ""))
-        if current in FINAL_STATUSES:
-            return
-        if current is not TaskStatus.RECOVERY_REQUIRED:
-            await manager.transition(
-                task_id,
-                TaskStatus.RECOVERY_REQUIRED,
-                reason=f"provider outcome {resolution} requires task finalization",
-            )
-        unresolved = (
-            (f"provider_response_unavailable:{attempt_id}",)
-            if resolution == "confirmed_succeeded"
-            else (f"provider_liability:{attempt_id}",)
-            if resolution == "abandoned_with_liability"
-            else ()
-        )
-        await manager.finalize(
-            task_id,
-            status=TaskStatus.FAILED,
-            reason=f"provider outcome resolved as {resolution}",
-            summary=f"Provider outcome resolved as {resolution}; no safe continuation remains.",
-            unresolved=unresolved,
-            _allow_recovery_completion=True,
-        )
-
-    async def _launch_provider_retry(self, task_id: str) -> None:
-        manager = getattr(self, "_task_manager", None)
-        tasks = getattr(self, "_store_tasks", None)
-        kernel = getattr(self, "_kernel", None)
-        if manager is None or tasks is None or kernel is None or not task_id:
-            return
-        row = await tasks.get(task_id)
-        if row is None or str(row.get("status") or "") in {item.value for item in FINAL_STATUSES}:
-            return
-        status = TaskStatus(str(row.get("status") or ""))
-        if status in {TaskStatus.RECOVERY_REQUIRED, TaskStatus.INTERRUPTED}:
-            await manager.transition(
-                task_id,
-                TaskStatus.RUNNING,
-                reason="provider outcome reconciled; retry authorized",
-            )
-        elif status is not TaskStatus.RUNNING:
-            return
-        recovery = asyncio.create_task(kernel.run_task(task_id))
-        registry = getattr(self, "_approval_recovery_tasks", None)
-        if registry is not None:
-            registry.add(recovery)
-        recovery.add_done_callback(
-            self._log_background_failure(f"provider outcome recovery {task_id}")
-        )
-
-    async def _provider_resolution_view(self, resolved: dict[str, Any]) -> dict[str, Any]:
-        """Return the disposition plus operator-relevant consequences."""
-        view = dict(resolved)
-        resolution = str(view.get("provider_outcome_status") or "")
-        if resolution in _PROVIDER_OUTCOME_CONTRACT:
-            view["disposition_contract"] = dict(_PROVIDER_OUTCOME_CONTRACT[resolution])
-        task_id = str(view.get("task_id") or "")
-        tasks = getattr(self, "_store_tasks", None)
-        if tasks is not None and task_id:
-            row = await tasks.get(task_id)
-            view["task_status"] = row.get("status") if row is not None else None
-        store = getattr(self, "_model_response_store", None)
-        if store is not None and task_id:
-            view["liability_open"] = await store.has_unresolved_liability(task_id)
-        view["accounted_amount"] = (
-            view.get("actual_cost")
-            if view.get("provider_outcome_status") == "confirmed_succeeded"
-            else "0"
-        )
-        view["next_actions"] = (
-            ["manually close provider liability"]
-            if view.get("provider_outcome_status") == "abandoned_with_liability"
-            else []
-        )
-        return view
-
-    async def reconcile_provider_outcomes(self) -> dict[str, int]:
-        """Replay resolved provider dispositions after a process restart."""
-        store = self._model_response_store
-        if store is None:
-            return {"replayed": 0, "failed": 0}
-        replayed = 0
-        failed = 0
-        for attempt in await store.list_resolved_attempts():
-            try:
-                resolution = str(attempt.get("provider_outcome_status") or "")
-                task_id = str(attempt.get("task_id") or "")
-                amount = _validated_actual_cost(attempt.get("reservation_amount")) or Decimal("0")
-                attempt_id = str(attempt.get("attempt_id") or "")
-                receipt = await store.get_receipt(
-                    task_id=task_id,
-                    request_fingerprint=str(attempt.get("request_fingerprint") or ""),
-                )
-                if (
-                    resolution == "retry_authorized"
-                    and receipt is not None
-                    and str(receipt.get("attempt_id") or "") != attempt_id
-                ):
-                    # A replacement attempt was already prepared. The old
-                    # authorization is historical and must not launch a second
-                    # retry after restart.
-                    replayed += 1
-                    continue
-                if resolution in {"confirmed_failed", "retry_authorized"} and not attempt.get(
-                    "reservation_released_at"
-                ):
-                    await self._release_provider_reservation(
-                        store, task_id=task_id, attempt_id=attempt_id, amount=amount
-                    )
-                elif resolution == "confirmed_succeeded":
-                    cost = _validated_actual_cost(attempt.get("actual_cost"))
-                    if cost is None:
-                        raise RuntimeError(f"resolved success {attempt_id} has no actual cost")
-                    if not attempt.get("budget_accounted_at") and self._budgets is not None:
-                        await self._budgets.apply_model_accounting(
-                            task_id,
-                            attempt_id,
-                            reserved=amount,
-                            input_tokens=int(attempt.get("actual_input_tokens") or 0),
-                            output_tokens=int(attempt.get("actual_output_tokens") or 0),
-                            actual_cost=cost,
-                            reservation_id=attempt_id,
-                        )
-                        await store.mark_budget_accounted(attempt_id=attempt_id)
-                    if not attempt.get("reservation_released_at"):
-                        await store.mark_reservation_released(attempt_id=attempt_id)
-                if resolution == "retry_authorized":
-                    await self._launch_provider_retry(task_id)
-                elif resolution in {
-                    "confirmed_failed",
-                    "confirmed_succeeded",
-                    "abandoned_with_liability",
-                }:
-                    await self._finalize_provider_outcome(
-                        task_id, resolution=resolution, attempt_id=attempt_id
-                    )
-                replayed += 1
-            except Exception:
-                failed += 1
-                raise
-        return {"replayed": replayed, "failed": failed}
+        return await self._task_api.get_result(task_id)
 
     async def stream_events(self, task_id: str, after_sequence: int = 0):
-        async for ev in TaskAPI(self).stream_events(task_id, after_sequence=after_sequence):
+        async for ev in self._task_api.stream_events(task_id, after_sequence=after_sequence):
             yield ev
 
     async def stream_all(self, after_rowid: int = 0, limit: int = 200):
-        async for ev in TaskAPI(self).stream_all(after_rowid=after_rowid, limit=limit):
+        async for ev in self._task_api.stream_all(after_rowid=after_rowid, limit=limit):
             yield ev
 
     async def get_task_status(self, task_id: str) -> str | None:
-        return await TaskAPI(self).get_task_status(task_id)
+        return await self._task_api.get_task_status(task_id)
 
     async def cancel(self, task_id: str, reason: str = "cancelled by user") -> TaskStatus:
-        return await OperatorInteractionService(self).cancel(task_id, reason)
+        return await self._interaction.cancel(task_id, reason)
 
     async def interrupt(self, task_id: str, reason: str = "externally interrupted") -> TaskStatus:
-        return await OperatorInteractionService(self).interrupt(task_id, reason)
+        return await self._interaction.interrupt(task_id, reason)
 
     async def steer_task(
         self,
@@ -2017,22 +1330,18 @@ class AthenaService:
         return record
 
     async def pending_input(self, task_id: str) -> dict | None:
-        return await OperatorInteractionService(self).pending_input(task_id)
+        return await self._interaction.pending_input(task_id)
 
     async def provide_input(self, task_id: str, answer: str) -> None:
-        return await OperatorInteractionService(self).provide_input(task_id, answer)
+        return await self._interaction.provide_input(task_id, answer)
 
     async def approve(self, approval_id: str, *, granted: bool, scope: str | None = None) -> None:
-        return await OperatorInteractionService(self).approve(
-            approval_id, granted=granted, scope=scope
-        )
+        return await self._interaction.approve(approval_id, granted=granted, scope=scope)
 
     async def _mark_approval_recovery(
         self, task_id: str | None, approval_id: str, error: BaseException
     ) -> None:
-        return await OperatorInteractionService(self)._mark_approval_recovery(
-            task_id, approval_id, error
-        )
+        return await self._interaction.mark_approval_recovery(task_id, approval_id, error)
 
     def _install_grant(
         self,
@@ -2043,7 +1352,7 @@ class AthenaService:
         first: ApprovalScope | None = None,
         expires_at: datetime | None = None,
     ) -> None:
-        return OperatorInteractionService(self)._install_grant(
+        return self._interaction.install_grant(
             approval_id,
             task_id,
             metadata,
@@ -2055,18 +1364,16 @@ class AthenaService:
     async def _rehydrate_approval_grants(
         self, approvals: ApprovalStore, continuations: ContinuationStore
     ) -> None:
-        return await OperatorInteractionService(self)._rehydrate_approval_grants(
-            approvals, continuations
-        )
+        return await self._interaction.rehydrate_approval_grants(approvals, continuations)
 
     def _clamp_approval_scope(self, choice: str | None, metadata: dict) -> ApprovalScope | None:
-        return OperatorInteractionService(self)._clamp_approval_scope(choice, metadata)
+        return self._interaction.clamp_approval_scope(choice, metadata)
 
     async def pending_approval_id(self, task_id: str) -> str | None:
-        return await OperatorInteractionService(self).pending_approval_id(task_id)
+        return await self._interaction.pending_approval_id(task_id)
 
     async def list_sessions(self) -> list[dict]:
-        return await OperatorInteractionService(self).list_sessions()
+        return await self._interaction.list_sessions()
 
     async def close_session(self, session_id: str) -> bool:
         """Close one durable conversation and its session-scoped resources."""
@@ -2090,13 +1397,13 @@ class AthenaService:
         return closed
 
     async def resume(self, session_id: str, *, prompt: str = "") -> TaskSpec:
-        return await OperatorInteractionService(self).resume(session_id, prompt=prompt)
+        return await self._interaction.resume(session_id, prompt=prompt)
 
     async def list_interrupted(self) -> list[dict]:
-        return await OperatorInteractionService(self).list_interrupted()
+        return await self._interaction.list_interrupted()
 
     async def resume_task(self, task_id: str) -> TaskSpec:
-        return await OperatorInteractionService(self).resume_task(task_id)
+        return await self._interaction.resume_task(task_id)
 
     async def inspect(self, task_id: str) -> dict:
         """Return the structured forensic view of one task's lifecycle.
@@ -2154,14 +1461,11 @@ class AthenaService:
         }
 
     # ------------------------------------------------------------------ #
-    # Candidate lifecycle — mechanism lives in
-    # :mod:`athena.service.candidates` (P1-10). The facade keeps the public
-    # entrypoints; durable state, shadow-engine truth, kernel review, and
-    # durable events still resolve through this service instance.
+    # Candidate lifecycle mechanism; the facade keeps compatibility entrypoints.
     # ------------------------------------------------------------------ #
 
     def _candidate_branch(self, task_id: str):
-        return self._candidates._candidate_branch(task_id)
+        return self._candidates.candidate_branch(task_id)
 
     async def operator_candidate(self, task_id: str) -> dict | None:
         return await self._candidates.operator_candidate(task_id)
@@ -2176,7 +1480,7 @@ class AthenaService:
         candidate: Mapping[str, Any],
         review: Mapping[str, Any],
     ) -> dict[str, Any]:
-        return await self._candidates._run_hermes_candidate_referee(
+        return await self._candidates.run_hermes_candidate_referee(
             mission, task_row, candidate, review
         )
 
@@ -2185,10 +1489,10 @@ class AthenaService:
         task_row: Mapping[str, Any],
         candidate: Mapping[str, Any],
     ) -> dict[str, Any]:
-        return await self._candidates._run_self_host_reviewer(task_row, candidate)
+        return await self._candidates.run_self_host_reviewer(task_row, candidate)
 
     async def _candidate_diff_text(self, task_id: str) -> str:
-        return await self._candidates._candidate_diff_text(task_id)
+        return await self._candidates.candidate_diff_text(task_id)
 
     @staticmethod
     def _self_host_risk(changed_resources: list[Any]) -> dict[str, Any]:
@@ -2205,7 +1509,7 @@ class AthenaService:
         )
 
     async def _candidate_apply_approval_matches(self, approval_id: str, branch) -> bool:
-        return await self._candidates._candidate_apply_approval_matches(approval_id, branch)
+        return await self._candidates.candidate_apply_approval_matches(approval_id, branch)
 
     async def apply_candidate(self, task_id: str, approval_id: str | None = None) -> dict:
         return await self._candidates.apply_candidate(task_id, approval_id)
@@ -2216,7 +1520,9 @@ class AthenaService:
     async def _candidate_review_event(
         self, event_key: str, task_id: str, review: Mapping[str, Any], outcome: Mapping[str, Any]
     ) -> None:
-        return await self._candidates._candidate_review_event(event_key, task_id, review, outcome)
+        return await self._candidates.persist_candidate_review_event(
+            event_key, task_id, review, outcome
+        )
 
     # ------------------------------------------------------------------ #
     # Operator projections (stable views over canonical durable state)
@@ -2226,34 +1532,34 @@ class AthenaService:
     # path; the CLI renders them verbatim.
 
     async def operator_permissions(self) -> dict:
-        return await OperatorQueryService(self).operator_permissions()
+        return await self._operator_query.operator_permissions()
 
     async def operator_diff(self, *, limit: int = 25) -> list[dict]:
-        return await OperatorQueryService(self).operator_diff(limit=limit)
+        return await self._operator_query.operator_diff(limit=limit)
 
     async def undo_mutation(self, mutation_id: str) -> dict:
-        return await OperatorQueryService(self).undo_mutation(mutation_id)
+        return await self._operator_query.undo_mutation(mutation_id)
 
     async def operator_context_summary(self, session_id: str | None = None) -> dict:
-        return await OperatorQueryService(self).operator_context_summary(session_id)
+        return await self._operator_query.operator_context_summary(session_id)
 
     async def operator_artifacts(self, *, limit: int = 50) -> list[dict]:
-        return await OperatorQueryService(self).operator_artifacts(limit=limit)
+        return await self._operator_query.operator_artifacts(limit=limit)
 
     async def operator_generated_capabilities(self, task_id: str | None = None) -> list[dict]:
-        return await OperatorQueryService(self).operator_generated_capabilities(task_id)
+        return await self._operator_query.operator_generated_capabilities(task_id)
 
     async def operator_memory_candidates(self, *, limit: int = 100) -> list[dict]:
-        return await OperatorQueryService(self).operator_memory_candidates(limit=limit)
+        return await self._operator_query.operator_memory_candidates(limit=limit)
 
     async def operator_candidates(self, task_id: str | None = None) -> list[dict[str, Any]]:
         """Return the shared operator review queue for learned candidates."""
-        return await OperatorQueryService(self).operator_candidates(task_id)
+        return await self._operator_query.operator_candidates(task_id)
 
     async def operator_candidate_item(
         self, candidate_id: str, task_id: str | None = None
     ) -> dict[str, Any] | None:
-        return await OperatorQueryService(self).operator_candidate_item(candidate_id, task_id)
+        return await self._operator_query.operator_candidate_item(candidate_id, task_id)
 
     async def operator_promote_candidate(
         self,
@@ -2262,7 +1568,7 @@ class AthenaService:
         target_scope: str,
         task_id: str | None = None,
     ) -> dict[str, Any]:
-        return await OperatorQueryService(self).operator_promote_candidate(
+        return await self._operator_query.operator_promote_candidate(
             candidate_id,
             target_scope=target_scope,
             task_id=task_id,
@@ -2271,48 +1577,60 @@ class AthenaService:
     async def operator_deprecate_candidate(
         self, candidate_id: str, *, task_id: str | None = None
     ) -> dict[str, Any]:
-        return await OperatorQueryService(self).operator_deprecate_candidate(
+        return await self._operator_query.operator_deprecate_candidate(
             candidate_id, task_id=task_id
         )
 
     async def operator_memory_candidate(self, memory_id: str) -> dict | None:
-        return await OperatorQueryService(self).operator_memory_candidate(memory_id)
+        return await self._operator_query.operator_memory_candidate(memory_id)
 
     async def operator_promote_memory_candidate(
         self, memory_id: str, scope: str, scope_id: str | None = None
     ) -> dict:
-        return await OperatorQueryService(self).operator_promote_memory_candidate(
+        return await self._operator_query.operator_promote_memory_candidate(
             memory_id, scope, scope_id
         )
 
     async def operator_discard_memory_candidate(self, memory_id: str) -> dict:
-        return await OperatorQueryService(self).operator_discard_memory_candidate(memory_id)
+        return await self._operator_query.operator_discard_memory_candidate(memory_id)
 
     async def operator_generated_capability(
         self, capability_id: str, task_id: str | None = None
     ) -> dict:
-        return await OperatorQueryService(self).operator_generated_capability(
-            capability_id, task_id
-        )
+        return await self._operator_query.operator_generated_capability(capability_id, task_id)
 
     async def operator_promote_generated_capability(
         self, capability_id: str, scope: str, task_id: str | None = None
     ) -> dict:
-        return await OperatorQueryService(self).operator_promote_generated_capability(
+        return await self._operator_query.operator_promote_generated_capability(
             capability_id, scope, task_id
         )
 
     async def operator_deprecate_generated_capability(
         self, capability_id: str, task_id: str | None = None
     ) -> dict:
-        return await OperatorQueryService(self).operator_deprecate_generated_capability(
+        return await self._operator_query.operator_deprecate_generated_capability(
             capability_id, task_id
         )
 
     async def _invoke_synthesis(self, arguments: dict, *, task_id: str | None) -> dict:
-        return await OperatorQueryService(self)._invoke_synthesis(arguments, task_id=task_id)
+        return await self._operator_query.invoke_synthesis(arguments, task_id=task_id)
 
     # ------------------------------------------------------------------ #
+    def normalize_spec(self, spec: TaskSpec, *, trusted: bool = False) -> TaskSpec:
+        """Canonical admission normalization for pre-built protocol tasks."""
+        normalized = self._task_intake.normalize_spec(spec, trusted=trusted)
+        if trusted:
+            return normalized
+        # The classifier just wrote this service-owned authority field. Mark
+        # the derived record as intake-owned so subsequent metadata validation
+        # rejects a caller-owned `_athena_*` key without rejecting the service
+        # normalization itself.
+        return replace(
+            normalized,
+            metadata=TrustedTaskMetadata(dict(normalized.metadata), _intake_owner="athena"),
+        )
+
     def _build_task_spec(
         self,
         request: AgentRequest,
@@ -2324,148 +1642,15 @@ class AthenaService:
         trusted_gate_bundle: Mapping[str, Any] | None = None,
         trusted_mission_plan: Mapping[str, Any] | None = None,
     ) -> TaskSpec:
-        ws = request.workspace or self._default_workspace
-        autonomy = request.autonomy or self.config.autonomy_level
-        self._validate_request_metadata(request.metadata)
-        # Preserve request metadata (autonomy + any caller-supplied fields)
-        meta: dict[str, Any] = {"autonomy": autonomy.value}
-        if request.metadata:
-            meta.update(request.metadata)
-        self_host = trusted_self_host
-        if self_host:
-            # Self-hosting is a service invariant, not a CLI convention. A
-            # caller cannot escape the candidate/review boundary by sending a
-            # direct mutation mode or a permissive network workspace.
-            autonomy = AutonomyLevel.CODING
-            meta["autonomy"] = autonomy.value
-            meta["_athena_self_host"] = True
-            meta["_athena_review_before_commit"] = True
-            if trusted_verification is None:
-                raise ValueError("self-host tasks require a trusted verification environment")
-            if not trusted_gate_criteria:
-                raise ValueError("self-host tasks require service-owned verification gates")
-            meta["_athena_verification_environment"] = trusted_verification.to_record()
-            meta["_athena_required_gates"] = list(trusted_gate_criteria)
-            # The trusted criteria are the task's actual proof contract.  Do
-            # not leave them only in private metadata where the verifier's
-            # acceptance evaluator cannot enforce them.
-            meta["acceptance_criteria"] = list(trusted_gate_criteria)
-            if trusted_gate_bundle is not None:
-                meta["_athena_gate_bundle"] = dict(trusted_gate_bundle)
-            if trusted_mission_plan is not None:
-                meta["_athena_mission_plan"] = dict(trusted_mission_plan)
-            ws = replace(
-                ws,
-                network_policy=NetworkPolicy.DENY,
-                mutation_mode=MutationMode.SPECULATIVE,
-            )
-        legacy_mutation_mode = meta.pop("mutation_mode", None)
-        typed_mutation_mode = request.mutation_mode
-        if typed_mutation_mode is not None and legacy_mutation_mode is not None:
-            try:
-                legacy_value = MutationMode(str(legacy_mutation_mode))
-            except ValueError as exc:
-                raise ValueError("legacy mutation_mode conflicts with typed mutation_mode") from exc
-            if legacy_value is not typed_mutation_mode:
-                raise ValueError("typed mutation_mode conflicts with legacy metadata mutation_mode")
-        raw_mutation_mode = (
-            typed_mutation_mode if typed_mutation_mode is not None else legacy_mutation_mode
+        return self._task_intake.build_spec(
+            request,
+            session_id,
+            trusted_verification=trusted_verification,
+            trusted_self_host=trusted_self_host,
+            trusted_gate_criteria=trusted_gate_criteria,
+            trusted_gate_bundle=trusted_gate_bundle,
+            trusted_mission_plan=trusted_mission_plan,
         )
-        # OFFLINE autonomy is a hard egress boundary (P0): the task's model
-        # routing is narrowed to local-only models, not merely biased toward
-        # them. Model calls do not pass through PolicyEngine; ModelRouter's
-        # privacy gate is the authority that owns this boundary, and it only
-        # enforces what the task's ModelPolicy carries. A network-DENY
-        # workspace pins model egress the same way.
-        model_policy = request.model_policy or _default_model_policy()
-        if autonomy is AutonomyLevel.OFFLINE or (
-            ws.network_policy is not None
-            and ws.network_policy == NetworkPolicy.DENY
-            and model_policy.privacy not in _OFFLINE_MODEL_PRIVACY
-        ):
-            if model_policy.privacy not in _OFFLINE_MODEL_PRIVACY:
-                model_policy = replace(model_policy, privacy="offline")
-                meta["_athena_offline_narrowed"] = True
-        if self_host:
-            # The service-enforced self-host boundary wins over any copied
-            # request metadata, including an explicit direct-mode escape.
-            ws = replace(ws, mutation_mode=MutationMode.SPECULATIVE)
-        elif raw_mutation_mode is not None:
-            try:
-                mutation_mode = (
-                    raw_mutation_mode
-                    if isinstance(raw_mutation_mode, MutationMode)
-                    else MutationMode(str(raw_mutation_mode))
-                )
-            except ValueError as exc:
-                raise ValueError(
-                    "mutation_mode must be one of: "
-                    + ", ".join(mode.value for mode in MutationMode)
-                ) from exc
-            ws = replace(ws, mutation_mode=mutation_mode)
-        elif autonomy is AutonomyLevel.CODING:
-            # Coding tasks are protected by default.  The escape hatch is
-            # explicit metadata (mutation_mode=direct), never a model choice.
-            ws = replace(ws, mutation_mode=MutationMode.SPECULATIVE)
-        # Typed acceptance criteria are authoritative. The legacy metadata
-        # spelling remains a compatibility input, but a request carrying both
-        # forms must agree canonically instead of silently choosing one.
-        raw_criteria = meta.pop("acceptance_criteria", None)
-        legacy_criteria = decode_criteria(raw_criteria) if raw_criteria is not None else ()
-        if self_host:
-            criteria = legacy_criteria
-        else:
-            criteria = self._normalize_agent_request_acceptance(request)
-        # Normalize requested_capabilities into the task's capability policy
-        cap_policy = request.capability_policy
-        if request.requested_capabilities:
-            requested = tuple(sorted(request.requested_capabilities))
-            if cap_policy is not None and set(requested) != set(cap_policy.allow):
-                raise ValueError("requested_capabilities conflicts with capability_policy.allow")
-            cap_policy = cap_policy or CapabilityPolicy(allow=requested)
-        # Persist attachments as context refs so they survive beyond the request
-        context_refs: list[ContextRef] = []
-        for att in request.attachments or []:
-            if isinstance(att, ContextRef):
-                context_refs.append(att)
-            elif hasattr(att, "uri") and hasattr(att, "mime_type"):
-                # ArtifactRef attachments need to survive the request boundary
-                # as canonical context refs, including their media type.
-                context_refs.append(
-                    ContextRef(
-                        kind="artifact",
-                        ref=str(att.uri),
-                        source_id=getattr(att, "id", None),
-                        summary=getattr(att, "producer", None),
-                        mime_type=getattr(att, "mime_type", None),
-                    )
-                )
-            elif isinstance(att, dict):
-                context_refs.append(
-                    ContextRef(
-                        kind=att.get("kind", "artifact"),
-                        ref=str(att.get("ref", att.get("uri", "")) or ""),
-                        source_id=att.get("source_id"),
-                        summary=att.get("summary"),
-                        mime_type=att.get("mime_type"),
-                    )
-                )
-        spec_kwargs: dict = dict(
-            id=request.task_id or new_id("task"),
-            objective=request.prompt,
-            session_id=session_id,
-            workspace=ws,
-            model_policy=model_policy,
-            resource_budget=request.resource_budget or ResourceBudget(),
-            deadline=request.deadline,
-            context_refs=tuple(context_refs),
-            metadata=meta,
-        )
-        if criteria:
-            spec_kwargs["acceptance_criteria"] = tuple(criteria)
-        if cap_policy is not None:
-            spec_kwargs["capability_policy"] = cap_policy
-        return TaskSpec(**spec_kwargs)
 
     @staticmethod
     def _validate_request_metadata(metadata: Mapping[str, Any] | None) -> None:
@@ -2852,566 +2037,18 @@ class AthenaService:
     async def _register_core_capabilities(
         self, *, registry, workspace, execution, memory, skills_store, research_store=None
     ) -> None:
-        from athena.capabilities.artifacts import ArtifactCapability
+        """Compose core capabilities through the extracted registration owner."""
+        from athena.service.core_capabilities import register_core_capabilities
 
-        registry.register(FilesystemCapability(workspace))
-        from athena.capabilities.git import GitCapability
-
-        registry.register(GitCapability(candidate_resolver=self._candidate_git_view))
-        if self._artifacts is not None:
-            registry.register(ArtifactCapability(self._artifacts))
-        registry.register(
-            ExecuteCapability(
-                execution,
-                workspace,
-                artifact_store=self._artifacts,
-                failure_memory=self._failure_memory,
-            )
-        )
-        from athena.capabilities.diagnostics import DiagnosticsCapability
-
-        if self._failure_memory is not None:
-            registry.register(DiagnosticsCapability(self._failure_memory))
-        registry.register(MemoryCapability(memory))
-        registry.register(SkillsCapability(skills_store))
-        from athena.capabilities.session_search import SessionSearchCapability
-
-        registry.register(SessionSearchCapability(self._store_messages))
-        registry.register(DelegateCapability(self._delegation))
-        from athena.capabilities.external_delegate import ExternalDelegateCapability
-        from athena.delegates.sessions import ExternalDelegateManager
-
-        if self._delegate_session_store is not None:
-            self._external_delegate_manager = ExternalDelegateManager(
-                self._delegate_registry,
-                self._delegate_session_store,
-                dispatcher=self._dispatcher,
-            )
-            registry.register(ExternalDelegateCapability(self._external_delegate_manager))
-            self.register_shutdown_hook(
-                "external_delegate_sessions",
-                self._external_delegate_manager.close_all,
-            )
-        from athena.capabilities.context_blocks import ContextBlocksCapability
-
-        if self._context_block_store is not None:
-            registry.register(ContextBlocksCapability(self._context_block_store))
-        from athena.capabilities.packs import PacksCapability
-
-        if self._pack_manager is not None:
-            registry.register(PacksCapability(self._pack_manager))
-        from athena.capabilities.health import CapabilityHealthCapability
-
-        if self._capability_health is not None:
-            registry.register(CapabilityHealthCapability(self._capability_health))
-        # Computational-body capabilities (P0 roadmap).
-        from athena.capabilities.system import MachineCapability, ProcessCapability
-        from athena.capabilities.terminal_session import TerminalSessionCapability
-        from athena.capabilities.dependency import DependencyCapability
-        from athena.capabilities.reflection import CapabilityReflection
-        from athena.capabilities.truth import TruthCapability
-        from athena.capabilities.research import (
-            BraveSearchProvider,
-            HttpDiscoveryProvider,
-            ResearchCapability,
-            TavilySearchProvider,
-        )
-        from athena.capabilities.scratch import ScratchCapability
-        from athena.capabilities.observer import ObserverCapability
-        from athena.capabilities.capsule import ProcedureCapsuleCapability
-        from athena.capabilities.workflow import WorkflowCapability
-        from athena.research.policy import SourcePolicy
-
-        # Scratch and formal synthesis share one engine so a useful one-shot
-        # helper can be promoted without losing source/provenance.
-        if self._synthesis is None:
-            from athena.synthesis.engine import SynthesisEngine
-
-            self._synthesis = SynthesisEngine(
-                dispatcher=self._dispatcher,
-                research_store=self._research_store,
-            )
-        elif self._dispatcher is not None:
-            self._synthesis.bind_dispatcher(self._dispatcher)
-            self._synthesis.bind_research_store(self._research_store)
-        fabric = self._fabric
-        if fabric is None:
-            raise RuntimeError("capability fabric is not constructed")
-        self._synthesis.bind_proof_sink(fabric.update_generated_proof)
-        registry.register(
-            ScratchCapability(
-                self._synthesis,
-                self._scratch,
-                self._fabric,
-            )
-        )
-        registry.register(
-            ObserverCapability(
-                self._synthesis,
-                self._fabric,
-                dispatcher=self._dispatcher,
-            )
-        )
-        self.register_shutdown_hook(
-            "generated_persistent_sessions",
-            self._synthesis.close_persistent_sessions,
-        )
-
-        if TerminalSessionCapability.available():
-            self._terminals = TerminalSessionCapability(
-                event_sink=self._forward_events(self._require_events()),
-            )
-            registry.register(self._terminals)
-            self._optional_capability_health["terminal"] = {
-                "installed": True,
-                "configured": True,
-                "state": "available",
-                "reason": None,
-            }
-        else:
-            self._optional_capability_health["terminal"] = {
-                "installed": False,
-                "configured": True,
-                "state": "unavailable",
-                "reason": "pexpect and pyte are required",
-            }
-            _logger.info("terminal_session capability unavailable: install pexpect and pyte")
-        self._processes = ProcessCapability(execution)
-        registry.register(self._processes)
-        registry.register(MachineCapability())
-        registry.register(
-            CapabilityReflection(
-                self._fabric,
-                workflow_store=self._workflow_store,
-                skills_store=skills_store,
-                execution_manager=execution,
-                device_provider=self._device_provider,
-                policy_engine=self._policy,
-                approval_store=self._store_approvals,
-                health_provider=self._capability_health,
-                runtime_health_provider=self.runtime_health,
-                model_provider=lambda: self._model_registry,
-                mcp_status_provider=self.mcp_status,
-                delegate_provider=lambda: self._delegate_registry,
-            )
-        )
-        registry.register(TruthCapability(self))
-        registry.register(DependencyCapability(execution))
-        if self._store_input_requests is not None:
-            # Descriptor-only registration: the kernel intercepts
-            # request_input calls before any dispatcher runs, so the bound
-            # executor is a truthful fallback that never runs on a healthy
-            # path. The fabric entry makes the affordance discoverable and
-            # compilable into the model's tool surface.
-            from athena.capabilities.input_request import InputRequestCapability
-
-            registry.register(InputRequestCapability())
-        if research_store is not None:
-            research_policy = SourcePolicy(
-                allowed_domains=tuple(self.config.research_allowed_domains),
-                denied_domains=tuple(self.config.research_denied_domains),
-                allow_private_network=self.config.research_allow_private_network,
-            )
-            discovery_endpoints = self.config.research_discovery_endpoints or (
-                (self.config.research_discovery_endpoint,)
-                if self.config.research_discovery_endpoint
-                else ()
-            )
-            discovery_providers: list[Any] = list(
-                HttpDiscoveryProvider(
-                    endpoint,
-                    source_policy=research_policy,
-                    timeout=self.config.research_discovery_timeout,
-                )
-                for endpoint in discovery_endpoints
-            )
-
-            # Resolve API credentials lazily at search time. This keeps raw
-            # keys out of config, capability descriptors, and model context,
-            # while allowing the configured SecretManager source (env,
-            # keyring, 1Password, Bitwarden, or operator resolver) to rotate.
-            def research_credential(name: str):
-                def resolve() -> str | None:
-                    try:
-                        return (
-                            self._secrets.resolve(
-                                name,
-                                owner_task="system",
-                                backend="research",
-                            )
-                            if self._secrets is not None
-                            else None
-                        )
-                    except SecretError:
-                        return None
-
-                return resolve
-
-            if self.config.research_brave_api_key_credential:
-                discovery_providers.append(
-                    BraveSearchProvider(
-                        source_policy=research_policy,
-                        api_key_resolver=research_credential(
-                            self.config.research_brave_api_key_credential
-                        ),
-                        timeout=self.config.research_discovery_timeout,
-                    )
-                )
-            if self.config.research_tavily_api_key_credential:
-                discovery_providers.append(
-                    TavilySearchProvider(
-                        source_policy=research_policy,
-                        api_key_resolver=research_credential(
-                            self.config.research_tavily_api_key_credential
-                        ),
-                        timeout=self.config.research_discovery_timeout,
-                    )
-                )
-            registry.register(
-                ResearchCapability(
-                    research_store,
-                    artifact_store=self._artifacts,
-                    source_policy=research_policy,
-                    discovery_providers=tuple(discovery_providers),
-                )
-            )
-        if self._workflow_store is not None and self._fabric is not None:
-            workflow_capability = WorkflowCapability(
-                self._workflow_store,
-                self._dispatcher,
-                self._fabric,
-                run_store=self._workflow_run_store,
-                external_store=self._external_effect_store,
-                workflow_observer=self._knowledge.observe_workflow_execution,
-            )
-            registry.register(workflow_capability)
-            registry.register(
-                ProcedureCapsuleCapability(
-                    self._workflow_store,
-                    self._fabric,
-                    self._synthesis,
-                    workflow_capability,
-                    research_store=self._research_store,
-                    dispatcher=self._dispatcher,
-                )
-            )
-        try:
-            from athena.capabilities.debugger import DebuggerCapability
-
-            if DebuggerCapability.available():
-                self._debugger = DebuggerCapability(
-                    execution_manager=self._execution,
-                    event_sink=self._forward_events(self._require_events()),
-                )
-                registry.register(self._debugger)
-                self._optional_capability_health["debugger"] = {
-                    "installed": True,
-                    "configured": True,
-                    "state": "available",
-                    "reason": None,
-                }
-            else:
-                self._optional_capability_health["debugger"] = {
-                    "installed": False,
-                    "configured": True,
-                    "state": "unavailable",
-                    "reason": "debugpy is not installed",
-                }
-                _logger.info("debugger capability unavailable: debugpy is not installed")
-        except Exception as exc:  # debugpy optional
-            self._optional_capability_health["debugger"] = {
-                "installed": False,
-                "configured": True,
-                "state": "degraded",
-                "reason": f"{type(exc).__name__}: {exc}",
-            }
-            _logger.info("debugger capability unavailable: %s", exc)
-
-        # Computer + browser interaction (P1-20/P1-28, SPEC 36/65): optional
-        # packs behind the standard governance surface. Both register only
-        # when their driver is importable; operators wire a driver factory
-        # for structured browser control, and computer control stays on the
-        # ask-by-default COMPUTER_INPUT path.
-        try:
-            from athena.capabilities.browser import BrowserCapability
-            from athena.capabilities.computer import ComputerCapability
-
-            self._computer = None
-            self._browser = None
-            if ComputerCapability.available():
-                computer = ComputerCapability(artifact_store=self._artifacts)
-                self._computer_health = await computer.probe_health()
-                self._optional_capability_health["computer"] = {
-                    "installed": True,
-                    "configured": True,
-                    "state": self._computer_health.get("state", "unknown"),
-                    "reason": self._computer_health.get("reason"),
-                }
-                if self._computer_health.get("state") == "ready":
-                    self._computer = computer
-                    registry.register(self._computer)
-                else:
-                    _logger.info(
-                        "computer capability unavailable at runtime: %s",
-                        self._computer_health.get("reason", "display probe failed"),
-                    )
-            else:
-                self._computer_health = {
-                    "state": "unavailable",
-                    "backend": "none",
-                    "reason": "pyautogui is not importable",
-                }
-                self._optional_capability_health["computer"] = {
-                    "installed": False,
-                    "configured": True,
-                    "state": "unavailable",
-                    "reason": self._computer_health["reason"],
-                }
-                _logger.info(
-                    "computer capability unavailable: install the 'computer' extra (pyautogui)"
-                )
-            browser_factory = self.config.browser_driver_factory
-            if browser_factory is None and self.config.browser_enabled:
-                if BrowserCapability.available():
-                    from athena.capabilities.browser import PlaywrightBrowserDriver
-
-                    preflight = await PlaywrightBrowserDriver.preflight(
-                        browser_name=self.config.browser_engine,
-                        executable_path=self.config.browser_executable_path,
-                        channel=self.config.browser_channel,
-                        cdp_endpoint=self.config.browser_cdp_endpoint,
-                    )
-                    if preflight.get("state") in {"available", "configured"}:
-
-                        async def browser_factory():
-                            return await PlaywrightBrowserDriver.launch(
-                                browser_name=self.config.browser_engine,
-                                headless=self.config.browser_headless,
-                                launch_args=self.config.browser_launch_args,
-                                executable_path=self.config.browser_executable_path,
-                                channel=self.config.browser_channel,
-                                cdp_endpoint=self.config.browser_cdp_endpoint,
-                                timeout_ms=self.config.browser_timeout_ms,
-                                viewport=self.config.browser_viewport,
-                                proxy_config=BrowserProxyConfig(
-                                    max_concurrent_tunnels=self.config.browser_proxy_max_connections,
-                                    idle_timeout_seconds=self.config.browser_proxy_idle_timeout_seconds,
-                                    max_tunnel_seconds=self.config.browser_proxy_max_connection_seconds,
-                                ),
-                            )
-                    else:
-                        self._browser_health = {
-                            "state": "unavailable",
-                            "configured": True,
-                            "active_sessions": 0,
-                            "reason": preflight.get("reason") or "browser preflight failed",
-                        }
-                        self._optional_capability_health["browser"] = {
-                            "installed": True,
-                            "configured": True,
-                            "state": "unavailable",
-                            "reason": self._browser_health["reason"],
-                        }
-
-                else:
-                    self._browser_health = {
-                        "state": "unavailable",
-                        "configured": True,
-                        "active_sessions": 0,
-                        "reason": "browser_enabled but Playwright is not installed",
-                    }
-                    self._optional_capability_health["browser"] = {
-                        "installed": False,
-                        "configured": True,
-                        "state": "unavailable",
-                        "reason": self._browser_health["reason"],
-                    }
-            if browser_factory is not None:
-                self._browser = BrowserCapability(
-                    driver_factory=browser_factory,
-                    session_scope=self.config.browser_session_scope,
-                    artifact_store=self._artifacts,
-                    auth_profiles=self.config.browser_auth_profiles,
-                )
-                self._browser_health = self._browser.health()
-                self._optional_capability_health["browser"] = {
-                    "installed": True,
-                    "configured": True,
-                    "state": self._browser_health.get("state", "unknown"),
-                    "reason": self._browser_health.get("reason"),
-                }
-                registry.register(self._browser)
-                self.register_shutdown_hook("browser_sessions", self._browser.close)
-            elif not self.config.browser_enabled:
-                self._browser_health = {
-                    "state": "unavailable",
-                    "configured": False,
-                    "active_sessions": 0,
-                    "reason": "browser_driver_factory is not configured",
-                }
-                self._optional_capability_health["browser"] = {
-                    "installed": BrowserCapability.available(),
-                    "configured": False,
-                    "state": "unavailable",
-                    "reason": self._browser_health["reason"],
-                }
-                _logger.info(
-                    "browser capability not wired: set browser_driver_factory to enable "
-                    "structured browser automation"
-                )
-        except Exception as exc:  # optional interaction packs
-            self._computer_health = {
-                "state": "degraded",
-                "backend": "unknown",
-                "reason": f"computer setup failed: {type(exc).__name__}: {exc}",
-            }
-            self._optional_capability_health["computer"] = {
-                "installed": False,
-                "configured": True,
-                "state": "degraded",
-                "reason": f"{type(exc).__name__}: {exc}",
-            }
-            self._optional_capability_health["browser"] = {
-                "installed": False,
-                "configured": bool(self.config.browser_enabled),
-                "state": "degraded",
-                "reason": f"{type(exc).__name__}: {exc}",
-            }
-            _logger.info("computer/browser capability unavailable: %s", exc)
-
-        # P1/P2 environment families.
-        from athena.capabilities.environment import (
-            DatabaseCapability,
-            NetworkCapability,
-            ServiceCapability,
-            WorkspaceCapability,
-        )
-        from athena.capabilities.watch import WatchCapability, WatchRegistry
-
-        registry.register(
-            ServiceCapability(
-                external_store=self._external_effect_store,
-            )
-        )
-        registry.register(
-            NetworkCapability(
-                external_store=self._external_effect_store,
-            )
-        )
-        self._database = DatabaseCapability(
-            mutation_store=self._store_mutations,
-            artifact_store=self._artifacts,
-            external_store=self._external_effect_store,
-        )
-        registry.register(self._database)
-        if getattr(self, "_watch_registry", None) is None:
-            self._watch_registry = WatchRegistry(
-                observer_runner=self._run_watch_observer,
-            )
-        self._watches = WatchCapability(
-            registry=self._watch_registry,
-            execution_manager=self._execution,
-        )
-        registry.register(self._watches)
-        if self._task_manager is not None:
-            self._task_manager.add_finalize_observer(self._cleanup_task_watches)
-            self._task_manager.add_finalize_observer(self._cleanup_task_affordances)
-        from athena.causal.checkpoint import CheckpointManager
-
-        # Checkpoints are part of Athena's durable recovery state.  They must
-        # survive a service restart and cannot live in the process-global
-        # temporary directory, which may be cleaned independently of the
-        # transaction ledger.
-        checkpoint_root = (
-            os.path.join(
-                self._runtime_state_root,
-                "checkpoints",
-            )
-            if self._runtime_state_root
-            else None
-        )
-        self._checkpoints = CheckpointManager(root=checkpoint_root or "/tmp/athena-checkpoints")
-        if self._resource_finalizer is not None:
-            self._resource_finalizer.bind_checkpoint_manager(self._checkpoints)
-        self._reality_gate.bind_checkpoint_manager(self._checkpoints)
-        registry.register(
-            WorkspaceCapability(
-                checkpoint_manager=self._checkpoints,
-                mutation_store=self._store_mutations,
-                mutation_observer=self._on_mutation_completed,
-                project_index_store=self._project_index_store,
-                project_index_coordinator=self._project_index_coordinator,
-            )
-        )
-        from athena.capabilities.fusion import FusionCapability
-
-        registry.register(FusionCapability(self))
-
-        # Capability-owned resource teardown (P1-32).
-        if self._terminals is not None:
-            self.register_shutdown_hook("terminal_sessions", self._terminals.close_all)
-        if self._debugger is not None:
-            self.register_shutdown_hook("debugger_sessions", self._debugger.close_all)
-        if hasattr(self, "_watch_registry"):
-            self.register_shutdown_hook("watch_registry", self._watch_registry.close)
-
-    async def _run_watch_observer(
-        self,
-        task_id: str | None,
-        observer_id: str,
-        input_value: Mapping[str, Any],
-        workspace,
-        *,
-        profile=None,
-        task_policy=None,
-        task_budget=None,
-    ) -> dict[str, Any]:
-        """Run a generated sensor through the canonical dispatcher.
-
-        Watches are event producers, not a second execution path.  The
-        observer call therefore gets the same capability lookup, policy,
-        budgets, sandbox, and proof handling as a model-requested call.
-        """
-        from athena.protocol.capabilities import (
-            CapabilityRequest,
-            CapabilityRequestOrigin,
-            CapabilityResult,
-            CapabilityResultStatus,
-        )
-
-        if self._dispatcher is None:
-            return {"status": "failed", "error": "dispatcher unavailable"}
-        result = await self._dispatcher.dispatch(
-            CapabilityRequest(
-                capability_id=observer_id,
-                arguments={"input": dict(input_value)},
-                task_id=task_id,
-                call_id=new_id("watch-observer"),
-                origin=CapabilityRequestOrigin.GENERATED,
-            ),
+        await register_core_capabilities(
+            self,
+            registry=registry,
             workspace=workspace,
-            profile=profile,
-            task_policy=task_policy,
-            task_budget=task_budget,
+            execution=execution,
+            memory=memory,
+            skills_store=skills_store,
+            research_store=research_store,
         )
-        if not isinstance(result, CapabilityResult):
-            return {"status": "failed", "error": "observer call suspended"}
-        status = result.status
-        if status is not CapabilityResultStatus.OK:
-            return {
-                "status": getattr(status, "value", "failed"),
-                "error": getattr(result, "error", None) or "observer failed",
-            }
-        try:
-            value = json.loads(result.output or "null")
-        except (TypeError, ValueError):
-            value = result.output
-        return {
-            "status": "ok",
-            "observer_id": observer_id,
-            "value": value,
-            "proof": dict(getattr(result, "metadata", {}) or {}),
-        }
 
     def register_shutdown_hook(self, name: str, hook) -> None:
         """Register a capability-owned resource teardown (P1-32)."""
@@ -3439,88 +2076,6 @@ class AthenaService:
     # ------------------------------------------------------------------ #
     # Fusion engines: shadow execution + execution-grounded world state
     # ------------------------------------------------------------------ #
-    async def _poll_watches(self) -> None:
-        """Background poll of registered watches -> WatchObserved events."""
-        events = None
-        while True:
-            await asyncio.sleep(2.0)
-            registry = getattr(self, "_watch_registry", None)
-            if registry is None or not (registry.file_watches or registry.process_watches):
-                continue
-            if events is None:
-                try:
-                    events = self._require_events()
-                except Exception as exc:
-                    registry.record_poll_error(exc)
-                    continue
-            event_store = events
-
-            async def sink(type_, payload, task_id=None, event_store=event_store):
-                if type_ == "WatchObserved":
-                    # External reality changes are proof invalidators too.
-                    # Apply this before EventStore subscribers wake the
-                    # maintenance task, so its first verification sees stale
-                    # claims rather than a transiently trusted snapshot.
-                    await self._invalidate_watch_claims(payload)
-                await event_store.append_event(type_, payload, task_id=task_id)
-
-            try:
-                await registry.poll_all(sink)
-            except Exception as exc:
-                registry.record_poll_error(exc)
-                _logger.warning("watch poll error: %s", exc)
-            else:
-                if not registry.poll_had_error:
-                    registry.record_poll_success()
-
-    async def _invalidate_watch_claims(self, payload: Mapping[str, Any]) -> None:
-        """Invalidate claims affected by an observed external change."""
-        raw_changes = payload.get("changes")
-        if isinstance(raw_changes, list):
-            changes = [str(item).removesuffix(" (removed)") for item in raw_changes if str(item)]
-        else:
-            changes = []
-        if payload.get("kind") == "process":
-            # A process exit has no file path boundary; claims without an
-            # explicit scope are conservatively invalidated.
-            changes = ["*"]
-        if not changes:
-            return
-        root = os.path.realpath(str(payload.get("root") or ""))
-        workspace_root = os.path.realpath(str(getattr(self._default_workspace, "root", "")))
-        if root and workspace_root and root != workspace_root:
-            if root.startswith(workspace_root + os.sep):
-                prefix = os.path.relpath(root, workspace_root)
-                changes = [os.path.join(prefix, path) for path in changes]
-            else:
-                # A watcher should already be workspace-scoped. Fail closed
-                # if stale metadata says otherwise instead of invalidating
-                # unrelated claim paths.
-                return
-        cache = getattr(self, "_world_states", {})
-        for world_state in list(cache.values()):
-            world_state.claims.invalidate_for_paths(changes)
-        index_coordinator = getattr(self, "_project_index_coordinator", None)
-        if index_coordinator is not None:
-            absolute_changes = [
-                os.path.join(root or workspace_root, path)
-                if path != "*"
-                else (root or workspace_root)
-                for path in changes
-            ]
-            index_coordinator.mark_stale_for_paths(absolute_changes)
-        store = getattr(self, "_world_state_store", None)
-        if store is not None:
-            try:
-                await store.invalidate_for_paths(None, changes)
-            except Exception as exc:
-                _logger.warning("durable watch claim invalidation failed: %s", exc)
-
-    async def _cleanup_task_watches(self, task, result) -> None:
-        registry = getattr(self, "_watch_registry", None)
-        if registry is not None:
-            registry.remove_task(getattr(task, "id", None))
-
     async def _cleanup_task_affordances(self, task, result) -> None:
         task_id = getattr(task, "id", None)
         if task_id and self._fabric is not None:
@@ -3588,7 +2143,7 @@ class AthenaService:
                 roots_parent=roots_parent,
                 state_root=state_root,
             )
-        if self._shadow._dispatcher is None and self._dispatcher is not None:
+        if self._shadow.dispatcher is None and self._dispatcher is not None:
             self._shadow.bind(self._dispatcher)
         self._shadow.bind_service(self)
         return self._shadow
@@ -3615,11 +2170,34 @@ class AthenaService:
         return None
 
     def fusion_orchestrator(self):
-        """Return the service-owned, single-agent fusion orchestrator."""
-        from athena.fusion.orchestrator import FusionOrchestrator
+        """Return the service-owned, single-agent fusion orchestrator.
 
+        Production composition uses typed ports; the whole-service form is
+        only a compatibility path for external construction.
+        """
         if getattr(self, "_fusion", None) is None:
-            self._fusion = FusionOrchestrator(self)
+            shadow = self.shadow_engine()
+            self._fusion = FusionComposition(
+                shadow=shadow,
+                checkpoints=getattr(self, "_checkpoints", None)
+                or getattr(shadow, "_checkpoints", None),
+                task_store=self._store_tasks,
+                event_store=self._store_events,
+                runtime_session_store=self._store_runtime_sessions,
+                context_block_store=self._context_block_store,
+                fabric=self._fabric,
+                workflow_store=self._workflow_store,
+                synthesis=getattr(self, "_synthesis", None),
+                dispatcher=self._dispatcher,
+                world_state_store=getattr(self, "_world_state_store", None),
+                world_state_provider=self.world_state,
+                reality_coordinator=getattr(self, "_reality_coordinator", None),
+                reality_gate=self._reality_gate,
+                task_manager=self._task_manager,
+                session_store=getattr(self, "_sessions", None),
+                message_store=getattr(self, "_store_messages", None),
+                principal_id=getattr(getattr(self, "config", None), "cache_namespace", None),
+            ).build()
         return self._fusion
 
     def world_state(self, task_id: str | None = None):
@@ -3663,204 +2241,23 @@ class AthenaService:
 
     async def _preflight_hermes_referee(self) -> None:
         """Run the optional safety probe without blocking normal startup."""
-        settings = self.config.hermes_referee
-        if not settings.transport_enabled:
-            return
-        evaluator: HermesAgentEvaluator | HermesReferee | None = self._hermes_adapter
-        if evaluator is None:
-            evaluator = self._hermes_referee
-        preflight = getattr(evaluator, "preflight", None)
-        if not callable(preflight):
-            reason = "Hermes referee does not expose a safety preflight"
-            self._hermes_status_error = reason
-            self._startup_health["checks"]["hermes_referee"] = {
-                "status": "degraded",
-                "blocking": False,
-                "state": "injected",
-                "profile": settings.profile,
-                "endpoint": settings.endpoint,
-                "error": reason,
-            }
-            return
-        try:
-            result = preflight()
-            if inspect.isawaitable(result):
-                result = await result
-        except Exception as exc:
-            from athena.hermes.agent_adapter import HermesRefereeSafetyError
-
-            reason = str(exc)
-            self._hermes_status_error = reason
-            self._startup_health["checks"]["hermes_referee"] = {
-                "status": "degraded",
-                "blocking": False,
-                "state": (
-                    "unsafe"
-                    if isinstance(exc, HermesRefereeSafetyError)
-                    else ("disconnected" if isinstance(exc, httpx.HTTPError) else "error")
-                ),
-                "profile": settings.profile,
-                "endpoint": settings.endpoint,
-                "error": reason,
-            }
-            return
-        record = result.to_record() if hasattr(result, "to_record") else {}
-        self._startup_health["checks"]["hermes_referee"] = {
-            "status": "ok",
-            "blocking": False,
-            "state": "safety_verified",
-            "profile": settings.profile,
-            "endpoint": settings.endpoint,
-            "runtime": record.get("runtime", {}),
-            "referee": record.get("referee", {}),
-            "build": record.get("build", {}),
-        }
-        self._hermes_status_error = None
+        await self._hermes_runtime.preflight()
 
     async def _require_verified_hermes_referee(self) -> None:
         """Refuse self-host work only under required Hermes supervision."""
-        settings = self.config.hermes_referee
-        if self._hermes_supervision_mode is not HermesSupervisionMode.REQUIRED:
-            return
-        if self._hermes_adapter is None:
-            reason = self._hermes_status_error or "Hermes referee is not configured"
-            raise RuntimeError(
-                "Self-hosting refused: Hermes referee is configured as required "
-                f"but has not proven its read-only runtime contract ({reason}). "
-                "Run `athena referee repair`."
-            )
-        try:
-            preflight = await self._hermes_adapter.preflight()
-        except Exception as exc:
-            self._hermes_status_error = str(exc)
-            raise RuntimeError(
-                "Self-hosting refused: Hermes referee safety verification failed "
-                f"({exc}). Run `athena referee repair`."
-            ) from exc
-        self._startup_health["checks"]["hermes_referee"] = {
-            "status": "ok",
-            "blocking": False,
-            "state": "safety_verified",
-            "profile": settings.profile,
-            "endpoint": settings.endpoint,
-            "runtime": dict(preflight.capabilities.get("runtime") or {}),
-            "referee": dict(preflight.capabilities.get("referee") or {}),
-            "build": dict(preflight.capabilities.get("build") or {}),
-        }
+        await self._hermes_runtime.require_verified()
 
     def _configure_hermes_referee(self) -> None:
         """Build the optional transport after the secret boundary exists."""
-        settings = self.config.hermes_referee
-        if self._hermes_referee is not None and not self._hermes_referee_owned:
-            self._startup_health["checks"]["hermes_referee"] = {
-                "status": "ok",
-                "blocking": False,
-                "state": "configured_unverified",
-            }
-            return
-        if not settings.transport_enabled:
-            self._startup_health["checks"]["hermes_referee"] = {
-                "status": "ok",
-                "blocking": False,
-                "state": "disabled",
-            }
-            return
-        api_key = ""
-        self._hermes_status_error = None
-        if settings.credential_id:
-            try:
-                if self._secrets is None:
-                    raise RuntimeError("SecretManager is not ready")
-                api_key = self._secrets.resolve(settings.credential_id)
-            except Exception as exc:
-                reason = f"Hermes credential unavailable: {exc}"
-                self._hermes_status_error = reason
+        self._hermes_runtime.configure()
 
-                async def unavailable(_packet: ReviewPacket) -> Mapping[str, Any]:
-                    raise RuntimeError(reason)
-
-                self._hermes_referee = HermesReferee(unavailable)
-                self._hermes_referee_owned = True
-                self._startup_health["checks"]["hermes_referee"] = {
-                    "status": "degraded",
-                    "blocking": False,
-                    "state": "error",
-                    "error": reason,
-                }
-                return
-        try:
-            adapter = HermesAgentEvaluator(
-                endpoint=settings.endpoint,
-                profile=settings.profile,
-                timeout_seconds=settings.timeout_seconds,
-                api_key=api_key,
-                allow_remote=settings.allow_remote,
-                allow_insecure_remote=settings.allow_insecure_remote,
-            )
-        except (TypeError, ValueError) as exc:
-            reason = f"Hermes configuration invalid: {exc}"
-            self._hermes_status_error = reason
-
-            async def unavailable(_packet: ReviewPacket) -> Mapping[str, Any]:
-                raise RuntimeError(reason)
-
-            self._hermes_referee = HermesReferee(unavailable)
-            self._hermes_referee_owned = True
-            self._startup_health["checks"]["hermes_referee"] = {
-                "status": "degraded",
-                "blocking": False,
-                "state": "error",
-                "error": reason,
-            }
-            return
-        self._hermes_adapter = adapter
-        self._hermes_referee = HermesReferee(adapter)
-        self._hermes_referee_owned = True
-        self._startup_health["checks"]["hermes_referee"] = {
-            "status": "ok",
-            "blocking": False,
-            "state": "configured",
-            "profile": settings.profile,
-            "endpoint": settings.endpoint,
-        }
+    async def _close_hermes_referee(self) -> None:
+        """Close Hermes transport resources through their owning runtime."""
+        await self._hermes_runtime.close()
 
     # ------------------------------------------------------------------ #
     # Internal accessors
     # ------------------------------------------------------------------ #
-    async def require_agent_ready(self, request: AgentRequest | None = None) -> None:
-        """Admit model-backed work before any Task or session is created.
-
-        Startup intentionally remains inspectable in a degraded, first-run
-        state when no provider is configured. That state is not an admission
-        state: every caller must pass through this service-owned predicate.
-        """
-        await self._require_provider_ready()
-        await self.require_capability_profile_ready()
-        if request is None:
-            return
-        base_policy = request.model_policy or _default_model_policy()
-        criteria = self._normalize_agent_request_acceptance(request)
-        await self._admit_model_roles(
-            base_policy,
-            self._required_model_roles(base_policy, request.metadata, criteria=criteria),
-        )
-
-    async def require_task_ready(self, spec: TaskSpec) -> None:
-        """Admit every model-backed Task before it enters durable state."""
-        await self._require_provider_ready()
-        await self.require_capability_profile_ready()
-        resources = self.runtime_health().get("resources") or {}
-        if int(resources.get("unresolved_count", 0) or 0) > 0:
-            raise ServiceNotReady(
-                "Task-owned resource cleanup requires recovery before new work is admitted.",
-                missing=["resource_teardown"],
-            )
-        policy = spec.model_policy or _default_model_policy()
-        await self._admit_model_roles(
-            policy,
-            self._required_model_roles(policy, spec.metadata, criteria=spec.acceptance_criteria),
-        )
-
     async def _require_provider_ready(self) -> None:
         registry = self._model_registry
         if registry is None:
@@ -3900,22 +2297,6 @@ class AthenaService:
                     allowed_models=list(policy.allowed or ()),
                     role=role,
                 ) from exc
-
-    async def require_capability_profile_ready(self) -> None:
-        """Reject new work while a configured required surface is unhealthy."""
-        status = await self._validate_required_capabilities()
-        if status.get("status") == "ok":
-            return
-        raise ServiceNotReady(
-            "Required capability profile is not ready; new work is admitted only "
-            "after every required surface is healthy.",
-            profile=status.get("profile"),
-            missing=list(status.get("missing") or ()),
-        )
-
-    async def refresh_capability_profile(self) -> dict[str, Any]:
-        """Refresh async-backed capability health for operator/readiness APIs."""
-        return await self._validate_required_capabilities()
 
     @staticmethod
     def _required_model_roles(

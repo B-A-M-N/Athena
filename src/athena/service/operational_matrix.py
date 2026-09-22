@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from athena.service.operational_matrix_ports import OperationalMatrixPorts
+
 
 def behavioral_proof(passport: Any, runtime: Any) -> dict[str, Any]:
     if not isinstance(passport, dict) or not isinstance(passport.get("cells"), list):
@@ -17,9 +19,9 @@ def behavioral_proof(passport: Any, runtime: Any) -> dict[str, Any]:
             }
     return {"status": "not_run"}
 
-
 def build_operational_matrix(service: Any) -> dict[str, Any]:
-    execution = getattr(service, "_execution", None)
+    ports = OperationalMatrixPorts(service)
+    execution = ports.execution
     backend_rows = execution.backend_status() if execution is not None else []
     cells: list[dict[str, Any]] = []
     for backend in backend_rows:
@@ -63,9 +65,6 @@ def build_operational_matrix(service: Any) -> dict[str, Any]:
             )
     return {
         "execution": cells,
-        "mcp": service.mcp_status(),
-        "memory": service.runtime_health().get("memory_embeddings", {}),
+        "mcp": ports.mcp_status(),
+        "memory": ports.runtime_health().get("memory_embeddings", {}),
     }
-
-
-__all__ = ["behavioral_proof", "build_operational_matrix"]

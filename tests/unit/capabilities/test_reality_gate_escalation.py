@@ -51,6 +51,16 @@ def _request(capability_id: str, arguments: dict, call_id: str):
     )
 
 
+def _model_request(capability_id: str, arguments: dict, call_id: str):
+    return CapabilityRequest(
+        capability_id=capability_id,
+        arguments=arguments,
+        task_id="task-escalation",
+        call_id=call_id,
+        origin=CapabilityRequestOrigin.MODEL,
+    )
+
+
 def _gate(tmp_path: Path, *, with_checkpoints: bool = False):
     registry = CapabilityRegistry()
     registry.register(FilesystemCapability())
@@ -102,7 +112,7 @@ async def test_dispatcher_discards_isolated_write_before_returning(tmp_path):
         ),
         workspace=ws,
         profile="autonomous",
-        _directives=DispatchDirectives(reality_tier="isolated"),
+        directives=DispatchDirectives(reality_tier="isolated"),
     )
 
     assert result.status.value == "ok"
@@ -140,7 +150,7 @@ async def test_transactional_checkpoints_real_workspace_and_compensates(tmp_path
         ),
         workspace=ws,
         profile="autonomous",
-        _directives=DispatchDirectives(reality_tier="transactional"),
+        directives=DispatchDirectives(reality_tier="transactional"),
     )
     assert result.status.value == "ok"
     assert target.read_text(encoding="utf-8") == "changed\n"
@@ -263,3 +273,108 @@ def test_coding_tasks_default_to_speculative_workspace():
     )
     assert spec.workspace is not None
     assert spec.workspace.mutation_mode is MutationMode.SPECULATIVE
+
+
+async def test_runtime_complex_batch_escalation_is_permanent(tmp_path):
+    """A complex direct batch escalates before effects and stays on one candidate."""
+    ws = _ws(tmp_path, mode=MutationMode.DIRECT)
+    dispatcher, engine, gate = _gate(tmp_path)
+
+    first = await dispatcher.dispatch_many(
+        [
+            _model_request(
+                "fs",
+                {"operation": "write", "path": "README.txt", "content": "first\n"},
+                "runtime-write-1",
+            ),
+            _model_request(
+                "fs",
+                {"operation": "write", "path": "second.txt", "content": "second\n"},
+                "runtime-write-2",
+            ),
+        ],
+        workspace=ws,
+        profile="autonomous",
+    )
+    assert [result.status.value for result in first] == ["ok", "ok"]
+
+    branch = gate.active_branch("task-escalation")
+    assert branch is not None
+    candidate_root = branch.shadow_workspace.root
+    assert (Path(candidate_root) / "README.txt").read_text(encoding="utf-8") == "first\n"
+    assert (Path(ws.root) / "README.txt").read_text(encoding="utf-8") == "base\n"
+    assert not (Path(ws.root) / "second.txt").exists()
+
+    # Later calls stay on the same task-local candidate; they do not oscillate
+    # back to direct reality after the complex batch completes.
+    later = await dispatcher.dispatch(
+        _model_request(
+            "fs",
+            {"operation": "write", "path": "third.txt", "content": "third\n"},
+            "runtime-write-3",
+        ),
+        workspace=ws,
+        profile="autonomous",
+    )
+    assert later.status.value == "ok"
+    assert gate.active_branch("task-escalation") is branch
+    assert (Path(candidate_root) / "third.txt").exists()
+    assert not (Path(ws.root) / "third.txt").exists()
+
+    await engine.discard(branch, reason="test cleanup")
+
+
+async def test_complexity_ledger_escalates_across_separate_batches():
+    """One mutation per turn plus a later execute turn is task-history complex."""
+    from athena.capabilities.prepared import PreparedCapabilityCall
+    from athena.capabilities.runtime_escalation import RuntimeEscalation
+    from athena.protocol.capabilities import CapabilityDescriptor, CapabilityRequest, EffectClass
+
+    class Executor:
+        def __init__(self, capability_id: str, effects: set[EffectClass]):
+            self.descriptor = CapabilityDescriptor(
+                id=capability_id,
+                description="ledger probe",
+                input_schema={"type": "object"},
+                effects=frozenset(effects),
+            )
+
+    class Gate:
+        def active_branch(self, task_id):
+            return None
+
+    class Dispatcher:
+        def __init__(self):
+            self._reality_gate = Gate()
+            self._runtime_speculative_tasks = set()
+            self._late_complexity_escalations = set()
+            self._complexity_ledger = {}
+
+    dispatcher = Dispatcher()
+
+    def prepared(executor):
+        return PreparedCapabilityCall(
+            request=CapabilityRequest("probe", {}, task_id="task-history"),
+            workspace=None,
+            executor=executor,
+            effects=tuple(executor.descriptor.effects),
+        )
+
+    escalation = RuntimeEscalation(dispatcher)
+    assert (
+        escalation._escalate_complex_prepared_batch(
+            [prepared(Executor("fs", {EffectClass.WRITE_LOCAL}))]
+        )
+        is False
+    )
+    assert (
+        escalation._escalate_complex_prepared_batch(
+            [prepared(Executor("execute", {EffectClass.EXECUTE}))]
+        )
+        is True
+    )
+    assert "task-history" in dispatcher._runtime_speculative_tasks
+    assert "task-history" in dispatcher._late_complexity_escalations
+    snapshot = dispatcher._complexity_ledger["task-history"].to_record()
+    assert snapshot["mutation_count"] == 1
+    assert snapshot["execute_observed"] is True

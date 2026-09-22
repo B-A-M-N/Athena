@@ -237,6 +237,75 @@ class WorkspaceSpec:
     revision: str | None = None
 
 
+class WorkClass(str, enum.Enum):
+    """Service-derived persistence-safe work classification."""
+
+    NON_CODING = "non_coding"
+    SIMPLE_EDIT = "simple_edit"
+    COMPLEX_CODING = "complex_coding"
+
+
+class SpeculationDepth(str, enum.Enum):
+    """Service-derived candidate isolation depth."""
+
+    NONE = "none"
+    SINGLE_CANDIDATE = "single_candidate"
+    MULTI_CANDIDATE = "multi_candidate"
+
+
+class VerificationStrength(str, enum.Enum):
+    """Independent-proof floor requested for candidate certification."""
+
+    NONE = "none"
+    STANDARD = "standard"
+    STRONG = "strong"
+
+
+@dataclass(frozen=True)
+class TaskExecutionPlan:
+    """Typed service-owned execution authority (review item 4).
+
+    Replaces private metadata strings with a durable, codec-serializable
+    structure so restart, ACP, delegation, and persistence cannot lose the
+    admission decision. External callers cannot grant themselves weaker
+    authority; the service computes this at intake.
+    """
+
+    work_class: WorkClass
+    speculation_depth: SpeculationDepth
+    isolation_floor: MutationMode
+    verification_floor: VerificationStrength
+
+    @classmethod
+    def from_record(cls, raw: Mapping[str, Any]) -> "TaskExecutionPlan":
+        def _enum(enum_type, value, default):
+            try:
+                return enum_type(value)
+            except (TypeError, ValueError):
+                return default
+
+        return cls(
+            work_class=_enum(WorkClass, raw.get("work_class"), WorkClass.NON_CODING),
+            speculation_depth=_enum(
+                SpeculationDepth, raw.get("speculation_depth"), SpeculationDepth.NONE
+            ),
+            isolation_floor=_enum(MutationMode, raw.get("isolation_floor"), MutationMode.DIRECT),
+            verification_floor=_enum(
+                VerificationStrength,
+                raw.get("verification_floor"),
+                VerificationStrength.NONE,
+            ),
+        )
+
+    def to_record(self) -> dict[str, str]:
+        return {
+            "work_class": self.work_class.value,
+            "speculation_depth": self.speculation_depth.value,
+            "isolation_floor": self.isolation_floor.value,
+            "verification_floor": self.verification_floor.value,
+        }
+
+
 @dataclass(frozen=True)
 class ResourceBudget:
     # A bounded default keeps ordinary tasks in the tens; callers with a
@@ -747,6 +816,9 @@ class TaskSpec:
     # Pack failures remain non-blocking globally, but the service quarantines
     # a resumable task that explicitly names an unavailable pack.
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    # Service-owned execution authority computed at admission. None is
+    # tolerated for legacy rows until normalization; transports cannot mint it.
+    execution_plan: TaskExecutionPlan | None = None
 
 
 @dataclass(frozen=True)
@@ -792,7 +864,9 @@ class AgentRequest:
     task_id: str | None = None
     workspace: WorkspaceSpec | None = None
     model_policy: ModelPolicy | None = None
-    autonomy: AutonomyLevel = AutonomyLevel.SUPERVISED
+    # ``None`` means the caller selected no transport-local default; the
+    # service resolves its configured autonomy exactly once at admission.
+    autonomy: AutonomyLevel | None = None
     attachments: tuple[ArtifactRef, ...] = ()
     requested_capabilities: frozenset[str] | None = None
     # Optional full authority controls for interface callers. The legacy
@@ -840,6 +914,10 @@ __all__ = [
     "intersect_model_policies",
     "model_policy_covers",
     "DeliverySpec",
+    "WorkClass",
+    "SpeculationDepth",
+    "VerificationStrength",
+    "TaskExecutionPlan",
     "TaskSpec",
     "TrustedTaskMetadata",
     "UsageSummary",

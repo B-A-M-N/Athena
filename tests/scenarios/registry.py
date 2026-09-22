@@ -27,7 +27,7 @@ Entry shape::
         nodeids=(...),            # pytest node IDs (mutually exclusive-ish
                                   # with `probe`)
         probe=("scripts/render-demo", "capability_fabric"),  # argv, exit 0 = pass
-        required=True,             # required + missing/failed => runner exits 1
+        required=True,             # required + any non-pass => runner exits 1
         status="READY",           # or "MISSING" to declare a known gap
         notes="...",               # free-form audit context
     )
@@ -84,14 +84,42 @@ class Scenario:
     probe: tuple[str, ...] = ()  # argv run from repo root; exit 0 == passed
     required: bool = True
     notes: str = ""
+    # Host capabilities the bound evidence requires; see
+    # docs/scenario-capability-routing.md.  The runner treats a
+    # missing capability as ENVIRONMENT_UNAVAILABLE and records it for
+    # host-capable qualification routing. Required scenarios still fail the
+    # release gate because no evidence was produced.
+    capabilities: tuple[str, ...] = ()
+
+    # Canonical runner capabilities.  A scenario must use these names so CI
+    # can route qualification lanes deterministically.
+    KNOWN_CAPABILITIES = frozenset(
+        {
+            "PURE",
+            "FS",
+            "PROCESS",
+            "LOCAL_SOCKET",
+            "TCP_LOOPBACK",
+            "NETWORK_EGRESS",
+            "DISPLAY",
+        }
+    )
 
     def __post_init__(self) -> None:
+        unknown = set(self.capabilities) - self.KNOWN_CAPABILITIES
+        if unknown:
+            raise ValueError(
+                f"{self.id}: unknown capability(ies) {sorted(unknown)}; "
+                f"expected {sorted(self.KNOWN_CAPABILITIES)}"
+            )
         if self.status == "MISSING":
             # A declared gap must not carry evidence that could fake a pass.
             if self.nodeids or self.probe:
                 raise ValueError(f"{self.id}: MISSING scenarios must not bind evidence")
         elif not self.nodeids and not self.probe:
             raise ValueError(f"{self.id}: READY scenarios need nodeids or probe")
+        if "PURE" in self.capabilities and len(self.capabilities) != 1:
+            raise ValueError(f"{self.id}: PURE cannot be combined with another capability")
 
 
 # ---------------------------------------------------------------------------
@@ -184,10 +212,12 @@ FUSE = (
         nodeids=(
             "tests/e2e/test_release_black_box.py::test_installed_artifacts_cover_application_entry_paths",
         ),
+        capabilities=("NETWORK_EGRESS",),
         notes=(
             "The installed wheel and sdist receive a natural-language request; "
             "the compiled model context exposes fs, the model selects it, the "
-            "dispatcher performs the read, and the result returns to the model."
+            "dispatcher performs the read, and the result returns to the model. "
+            "Installation consumes the locked CLI extra from PyPI/wheelhouse."
         ),
     ),
 )
@@ -517,7 +547,7 @@ CLAIM = (
         family="CLAIM",
         title="Experiment commit binds claims and invalidates stale ones",
         nodeids=(
-            "tests/unit/fusion/test_orchestrator.py::test_experiment_commit_binds_claim_and_invalidates",
+            "tests/unit/fusion/test_orchestrator.py::test_verified_fusion_candidate_awaits_reality_promotion",
         ),
     ),
     Scenario(
@@ -577,8 +607,8 @@ TX = (
         family="TX",
         title="Failed/invalidated experiments are discarded, never committed",
         nodeids=(
-            "tests/unit/fusion/test_orchestrator.py::test_failed_criteria_discards_and_auto_forks",
-            "tests/unit/fusion/test_orchestrator.py::test_invariant_violation_blocks_commit",
+            "tests/unit/fusion/test_orchestrator.py::test_verified_fusion_candidate_awaits_reality_promotion",
+            "tests/unit/fusion/test_orchestrator.py::test_invariant_violation_blocks_commit_after_canonical_proof",
         ),
     ),
     Scenario(
@@ -911,6 +941,7 @@ VHS = (
         title="Demo render publishes a validated gif or a documented failure code",
         probe=("scripts/render-demo", "capability_fabric"),
         required=False,
+        capabilities=("PROCESS",),
         notes=(
             "Probe contract (scripts/render-demo header): 0 success; 2 tool/"
             "argument error (e.g. vhs missing — treated as 'skipped', not a "
@@ -1077,6 +1108,7 @@ RESEARCH = (
         id="RESEARCH-001",
         family="RESEARCH",
         title="Research runs through capture, evidence, verification, and bundle",
+        capabilities=("TCP_LOOPBACK",),
         nodeids=(
             "tests/e2e/test_research_journey.py::test_local_research_discover_capture_evidence_and_contradiction",
             "tests/unit/research/test_research_fabric.py::test_run_composes_objective_capture_search_evidence_and_verification",
@@ -1153,6 +1185,7 @@ MCP = (
         nodeids=(
             "tests/e2e/test_mcp_transport.py::test_mcp_stdio_transport_discovers_calls_and_reconnects",
         ),
+        capabilities=("PROCESS",),
     ),
     Scenario(
         id="MCP-002",
@@ -1263,6 +1296,7 @@ PROOF = (
         family="PROOF",
         title="Real service/runtime/memory/schedule/reality product proof",
         probe=("bash", "scripts/functional-proof"),
+        capabilities=("PROCESS",),
         notes=(
             "Separate from VHS: this drives real Athena paths with deterministic "
             "offline fixtures and no commercial model API."
@@ -1275,6 +1309,7 @@ PROOF = (
         nodeids=(
             "tests/e2e/test_release_black_box.py::test_installed_artifacts_cover_application_entry_paths",
         ),
+        capabilities=("NETWORK_EGRESS",),
         notes="Artifact identity is attached by the release lane when a frozen bundle exists.",
     ),
 )

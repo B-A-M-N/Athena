@@ -9,10 +9,10 @@ importable names.
 
 from athena.models.registry import ProviderRegistry
 from athena.models.router import (
-    ModelRequirements,
     ModelRouter,
     ModelSelection,
 )
+from athena.protocol.models import ModelRequirements
 
 __all__ = [
     "ProviderRegistry",

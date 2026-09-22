@@ -97,6 +97,42 @@ def test_strategy_accepts_typed_affordance_records():
     assert guidance.affordances[0].proof == {"all_passed": True}
 
 
+def test_coding_mutation_defaults_to_fusion_when_speculative_surface_is_visible():
+    guidance = select_strategy(
+        "fix the parser bug in this repository",
+        ("fs", "execute", "fusion"),
+    )
+
+    assert guidance.route == "fusion"
+    assert guidance.route_kind == "fusion_shadow"
+    assert guidance.candidates[0] == "fusion"
+    assert guidance.decision == "act"
+    assert guidance.completion_mode == "observable_work_required"
+
+
+def test_coding_mutation_does_not_invent_a_missing_fusion_capability():
+    guidance = select_strategy(
+        "fix the parser bug in this repository",
+        ("fs", "execute"),
+    )
+
+    assert guidance.route == "direct"
+    assert guidance.decision == "act"
+    assert "fusion" not in guidance.candidates
+
+
+def test_observation_work_does_not_get_the_mutation_fusion_override():
+    guidance = select_strategy(
+        "review the parser bug in this repository",
+        ("fs", "execute", "fusion"),
+    )
+
+    # Fusion may win from evidence, but it must not be the deterministic
+    # mutation-specific override when the turn intent is not a mutation.
+    assert guidance.turn_intent != "mutation"
+    assert guidance.completion_mode == "observable_work_required"
+
+
 def test_structured_tags_and_effects_can_select_a_route_without_keywords():
     guidance = select_strategy(
         "perform the bounded operation",

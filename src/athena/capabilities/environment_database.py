@@ -1,7 +1,7 @@
 """Database capability family: SQL against SQLite/Postgres-compatible
 endpoints (P1-10). Schema introspection; writes are policy-gated WRITE_LOCAL."""
 
-from athena.protocol.capabilities import CapabilityDescriptor
+from athena.capabilities.operations import native_descriptor
 from athena.protocol.capabilities import CapabilityOrigin
 from athena.protocol.capabilities import CapabilityRequest
 from athena.protocol.capabilities import CapabilityResult
@@ -30,7 +30,7 @@ from athena.capabilities.environment_common import _database_effects
 class DatabaseCapability:
     """SQL execution with schema introspection (SQLite built-in)."""
 
-    descriptor = CapabilityDescriptor(
+    descriptor = native_descriptor(
         id="database",
         description=(
             "Database access: connect to a SQLite file, inspect schema/tables, "
@@ -169,11 +169,11 @@ class DatabaseCapability:
         if readonly:
             from urllib.parse import quote
 
-            conn = sqlite3.connect(  # architecture-lint: allow raw-db-outside-state reason=read-only task database view
+            conn = sqlite3.connect(  # architecture-lint: allow raw-db-outside-state reason=read-only task database view; architecture-exception: environment-db-readonly
                 f"file:{quote(path, safe='/')}?mode=ro", uri=True
             )
         else:
-            conn = sqlite3.connect(  # architecture-lint: allow raw-db-outside-state reason=read-only task database view
+            conn = sqlite3.connect(  # architecture-lint: allow raw-db-outside-state reason=read-only task database view; architecture-exception: environment-db-workspace
                 path
             )
         conn.row_factory = sqlite3.Row

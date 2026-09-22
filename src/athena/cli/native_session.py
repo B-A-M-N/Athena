@@ -7,14 +7,15 @@ import asyncio
 import os
 import sys
 import termios
+from collections import deque
 from io import StringIO
 from typing import Any
 
 from athena.cli.app import Options, _autonomy, _model_policy, build_config, workspace_spec
-from athena.cli.native_bridge import write_native_projection
 from athena.cli.operator_commands import OperatorCommandRouter
-from athena.cli.projection import ProjectionState
-from athena.execution.async_call import run_blocking
+from athena.concurrency import run_blocking
+from athena.presentation.native_bridge import write_native_projection
+from athena.presentation.projection import ProjectionState
 from athena.protocol.tasks import AgentRequest
 
 _FORCE_PROJECTION_EVENTS = frozenset(
@@ -54,6 +55,8 @@ class NativeSession:
         self._bridge_state = "disconnected"
         self._bridge_error: str | None = None
         self._navigation: dict[str, Any] | None = None
+        self._conversation: deque[dict[str, int | str]] = deque(maxlen=128)
+        self._conversation_sequence = 0
         self._operator_router = OperatorCommandRouter(
             lambda: self.service,
             emit=print,
@@ -71,8 +74,11 @@ class NativeSession:
         self._model_name = value
 
     def _set_autonomy(self, value: str) -> str:
-        self._autonomy_level = _autonomy(value)
-        return self._autonomy_level.value
+        autonomy = _autonomy(value)
+        if autonomy is None:
+            raise ValueError("native sessions require an explicit autonomy level")
+        self._autonomy_level = autonomy
+        return autonomy.value
 
     def _new_session(self) -> None:
         self.session_id = None
@@ -229,6 +235,7 @@ class NativeSession:
             self.projection,
             character=self.options.mascot or "owl",
             navigation=self._navigation,
+            conversation=list(self._conversation),
         )
         self._writer.write(output.getvalue().encode("utf-8"))
         await self._writer.drain()
@@ -351,8 +358,21 @@ class NativeSession:
             self._foreground_task = None
             self._foreground_task_id = None
 
+    def _append_message(self, role: str, text: str) -> None:
+        self._conversation_sequence += 1
+        self._conversation.append(
+            {
+                "id": self._conversation_sequence,
+                "role": role,
+                "text": text,
+            }
+        )
+        self._projection_dirty = True
+
     async def _submit(self, objective: str) -> None:
+        self._append_message("user", objective)
         print(f"\nYOU\n{objective}")
+        await self._flush_projection()
         request = AgentRequest(
             prompt=objective,
             session_id=self.session_id,
@@ -377,9 +397,11 @@ class NativeSession:
             pass
         result = await self.service.get_result(task_id)
         if result is None:
-            print("\nATHENA\nThe request has no final result yet.")
-            return
-        summary = getattr(result, "summary", "") or "The request finished without a summary."
+            summary = "The request has no final result yet."
+        else:
+            summary = getattr(result, "summary", "") or "The request finished without a summary."
+        self._append_message("assistant", summary)
+        await self._flush_projection()
         print(f"\nATHENA\n{summary}")
 
     async def _dispatch_command(self, line: str) -> bool:
@@ -435,6 +457,8 @@ class NativeSession:
             pass
         result = await self.service.get_result(task_id)
         if result is not None:
+            self._append_message("assistant", getattr(result, "summary", "") or "request finished")
+            await self._flush_projection()
             print(f"\nATHENA\n{getattr(result, 'summary', '') or 'request finished'}")
 
 

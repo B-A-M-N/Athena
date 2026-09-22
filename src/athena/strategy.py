@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dataclasses_replace
 from collections.abc import Iterable, Mapping
 import re
 from typing import Any
@@ -1014,7 +1014,7 @@ def select_strategy(
             discovery_state=str(discovery_state or "resolved"),
             turn_intent=intent.kind,
         )
-    return StrategyGuidance(
+    guidance = StrategyGuidance(
         route,
         rationale,
         candidates,
@@ -1025,6 +1025,29 @@ def select_strategy(
         discovery_state=str(discovery_state or "resolved"),
         turn_intent=intent.kind,
     )
+    if (
+        intent.kind == MUTATION
+        and route != "fusion"
+        and any(_matches(item.id, "fusion") for item in affordances if item.available)
+    ):
+        # Coding/mutation work is high-risk by default. If the bounded
+        # speculative-comparison surface is visible, require it in the
+        # advisory route so direct fs/execute edits do not bypass the
+        # candidate/verification boundary by default.
+        return dataclasses_replace(
+            guidance,
+            route="fusion",
+            candidates=(
+                "fusion",
+                *(candidate for candidate in candidates if candidate != "fusion"),
+            ),
+            route_kind=route_kind_for("fusion"),
+            rationale=(
+                "Complex coding/mutation work must run as bounded speculative "
+                "candidates with verification before any real-workspace commit."
+            ),
+        )
+    return guidance
 
 
 def objective_requires_observable_work(objective: str) -> bool:
