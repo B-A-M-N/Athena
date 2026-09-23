@@ -11,8 +11,8 @@ from functools import lru_cache
 from pathlib import Path
 
 from athena.workspace_copy import (
-    _copy_file,
-    _reflink_supported,
+    _copy_file,  # noqa: F401 - compatibility export for workspace tests
+    _reflink_supported,  # noqa: F401 - compatibility export for workspace tests
     copy_workspace_tree,
     copy_workspace_tree_async,
     rmtree_async,

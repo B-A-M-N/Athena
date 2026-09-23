@@ -20,13 +20,12 @@ from typing import TYPE_CHECKING, Any, Mapping
 from athena.context.compiler import CompiledContext
 from athena.kernel.inference_retry import invoke_with_retries
 from athena.kernel.inference_stream import consume_provider_stream
-from athena.kernel.inference_identity import _request_fingerprint
+from athena.kernel.inference_identity import _request_fingerprint  # noqa: F401
 from athena.kernel.inference_prefix import observe_prefix
 from athena.kernel.route_metadata import inference_metadata, replay_metadata
 from athena.models.tokens import ModelTokenEstimator
 from athena.models.router import ModelSelection
 from athena.protocol.errors import (
-    ProviderOutcomeUnknown,
     TaskBudgetExceeded,
 )
 from athena.protocol.models import ModelRequirements

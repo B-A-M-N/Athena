@@ -39,11 +39,11 @@ def _canonical_fingerprint_value(value: Any, *, path: str = "$") -> Any:
             for index, item in enumerate(value)
         ]
     if isinstance(value, (set, frozenset)):
-        normalized = [
+        normalized_set = [
             _canonical_fingerprint_value(item, path=f"{path}{{item}}") for item in value
         ]
         return sorted(
-            normalized,
+            normalized_set,
             key=lambda item: json.dumps(
                 item,
                 sort_keys=True,

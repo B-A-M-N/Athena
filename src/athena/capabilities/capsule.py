@@ -10,8 +10,6 @@ record. Replay then uses the ordinary workflow dispatcher.
 from __future__ import annotations
 
 import json
-from typing import Any
-
 from athena.affordances.models import AffordanceScope, GeneratedCapability
 from athena.capabilities.capsule_codec import decode as _decode_capsule
 from athena.capabilities.capsule_codec import with_id as _with_id
@@ -20,7 +18,6 @@ from athena.capabilities.operations import native_descriptor
 from athena.protocol.capabilities import (
     CapabilityFailure,
     CapabilityFailureCode,
-    CapabilityDescriptor,
     CapabilityOrigin,
     CapabilityRequest,
     CapabilityResult,
@@ -109,7 +106,7 @@ class ProcedureCapsuleCapability:
     ) -> tuple[EffectClass, ...]:
         operation = str((arguments or {}).get("operation") or "")
         if operation != "run":
-            return tuple(self.descriptor.resolve_effects(arguments or {}))
+            return tuple(self.descriptor.resolve_effects(arguments or {}) or ())
         return resolve_capsule_effects(
             _decode_capsule((arguments or {}).get("capsule")),
             fabric=self._fabric,

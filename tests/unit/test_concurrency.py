@@ -90,13 +90,19 @@ async def test_run_blocking_cancellation_bounds_worker_admission(count: int) -> 
                 active -= 1
 
     tasks = [asyncio.create_task(run_blocking(blocked)) for _ in range(count)]
-    await asyncio.to_thread(started.wait, 1)
+    for _ in range(1000):
+        if started.is_set():
+            break
+        await asyncio.sleep(0)
+    assert started.is_set(), "a bounded worker should start within the admission probe"
     await asyncio.sleep(0.02)
     assert peak <= 16
     for task in tasks[16:]:
         task.cancel()
     release.set()
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    done, pending = await asyncio.wait(tasks, timeout=5)
+    assert not pending, "cancelled waiters and released workers must drain promptly"
+    results = [task.exception() if not task.cancelled() else asyncio.CancelledError() for task in done]
     assert all(isinstance(result, (asyncio.CancelledError, type(None))) for result in results)
 
 

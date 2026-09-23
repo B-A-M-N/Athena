@@ -19,3 +19,9 @@ and interfaces.
 - `pytest tests/unit/test_concurrency.py -q`
 - `pytest tests/performance/test_keyed_state_retention.py -q`
 - `./scripts/architecture-lint --quiet`
+
+## Child DOX Index
+
+| Path | Purpose |
+|------|---------|
+| `blocking_pool.py` | Bounded short/long daemon-worker executor mechanics; no task or capability authority. |

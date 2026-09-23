@@ -11,7 +11,6 @@ from athena.kernel.kernel import AgentKernel, _assistant_message
 from athena.kernel.inference_broker import _request_fingerprint
 from athena.models.providers.anthropic import AnthropicProvider
 from athena.models.providers.openai_compat import OpenAICompatProvider
-from athena.protocol.capabilities import CapabilityDescriptor, EffectClass
 from athena.protocol.messages import (
     CapabilityCallBlock,
     CapabilityResultBlock,

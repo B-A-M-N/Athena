@@ -261,8 +261,8 @@ class ModelProvider(Protocol):
     async def cancel(self, request_id: str) -> None: ...
 
 
-from athena.protocol.response_accumulator import ModelResponseAccumulator
-from athena.protocol.response_limits import StreamOutputLimitExceeded
+from athena.protocol.response_accumulator import ModelResponseAccumulator  # noqa: E402
+from athena.protocol.response_limits import StreamOutputLimitExceeded  # noqa: E402
 
 
 __all__ = [

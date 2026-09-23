@@ -73,6 +73,8 @@ service composition lifecycle.
   lifecycle's stop ordering; it never restarts work or alters admission.
   It consumes the public `LifecyclePorts` names and preserves the façade as
   the sole state owner.
+- `blocking_shutdown.py` drains the shared short/long blocking worker pools
+  after capability teardown; it owns no task or execution state.
 - `resource_finalizer_ports.py` exposes the task-owned resource close facts
   used by `resource_finalizer.py`; finalization remains the sole cleanup owner.
 - `pack_api.py` owns operator-facing pack listing and lifecycle calls through

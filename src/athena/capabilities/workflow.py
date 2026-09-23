@@ -140,7 +140,7 @@ class WorkflowCapability:
     ) -> tuple[EffectClass, ...]:
         operation = str((arguments or {}).get("operation") or "")
         if operation not in {"run", "trial"}:
-            return tuple(self.descriptor.resolve_effects(arguments or {}))
+            return tuple(self.descriptor.resolve_effects(arguments or {}) or ())
         return await resolve_workflow_effects(
             arguments,
             store=self._store,

@@ -19,6 +19,7 @@ from athena.protocol.capabilities import (
     CapabilityRequest,
     CapabilityResult,
     CapabilityResultStatus,
+    DispatchDirectives,
     EffectClass,
 )
 from athena.protocol.tasks import WorkspaceSpec
@@ -187,6 +188,38 @@ def test_execution_concurrency_serializes_through_order_lane():
     # Opaque execute calls serialize through the batch order lane — max 1
     # active at a time because the batch_order_lock is acquired first.
     assert ex.max_active == 1
+
+
+def test_explicitly_isolated_execution_uses_independent_ordering_domain():
+    ex = _OrderedExecutor(
+        CapabilityDescriptor(
+            id="isolated-exec",
+            description="isolated execution capability",
+            input_schema={"allow_extra": True},
+            effects=frozenset({EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS}),
+        ),
+        delay_ms=40,
+    )
+    d = _dispatcher(ex, profile="autonomous")
+    ws = WorkspaceSpec(id="w1", root="/tmp/ws")
+
+    async def run():
+        return await asyncio.gather(
+            d.dispatch(
+                _req("isolated-exec", tag="a"),
+                workspace=ws,
+                directives=DispatchDirectives(reality_tier="isolated"),
+            ),
+            d.dispatch(
+                _req("isolated-exec", tag="b"),
+                workspace=ws,
+                directives=DispatchDirectives(reality_tier="isolated"),
+            ),
+        )
+
+    results = _run(run())
+    assert all(result.status == CapabilityResultStatus.OK for result in results)
+    assert ex.max_active == 2
 
 
 def test_write_then_execute_serializes():

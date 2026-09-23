@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import TypeVar
 
 from athena.protocol.messages import (
     CapabilityCallBlock,
@@ -10,6 +11,8 @@ from athena.protocol.messages import (
     ReasoningBlock,
     TextBlock,
 )
+
+_TextualBlock = TypeVar("_TextualBlock", TextBlock, ReasoningBlock)
 
 
 class StreamOutputLimitExceeded(ValueError):
@@ -24,26 +27,55 @@ class StreamOutputLimitExceeded(ValueError):
 
 
 def merge_streamed_content(
-    blocks: list[ContentBlock], streamed: str, block_type: type[ContentBlock]
+    blocks: list[ContentBlock],
+    streamed: str,
+    block_type: type[_TextualBlock],
+    *,
+    streamed_parts: tuple[str, ...] | list[str] = (),
 ) -> list[ContentBlock]:
-    """Merge deltas without flattening independently ordered final blocks."""
+    """Merge deltas without flattening independently ordered final blocks.
+
+    Terminal provider responses can split one logical text stream around tool
+    calls, while some adapters return one terminal text block.  Exact
+    concatenation is the strongest duplicate proof; otherwise match streamed
+    chunks by exact block content and insert only unmatched chunks.  This
+    keeps independent terminal blocks and their ordering intact.
+    """
     if not streamed:
         return blocks
     final_text = "".join(block.text for block in blocks if isinstance(block, block_type))
     if final_text == streamed:
         return blocks
-    replacement = block_type(text=streamed)
-    for index, block in enumerate(blocks):
-        if isinstance(block, block_type):
-            if sum(isinstance(item, block_type) for item in blocks) == 1:
-                blocks[index] = replacement
-            return blocks
-    insert_at = next(
-        (index for index, block in enumerate(blocks) if isinstance(block, CapabilityCallBlock)),
-        len(blocks),
-    )
-    blocks.insert(insert_at, replacement)
-    return blocks
+    parts = [part for part in streamed_parts if part] or [streamed]
+    cursor = 0
+    merged: list[ContentBlock] = []
+    saw_terminal_block = False
+    for block in blocks:
+        if not isinstance(block, block_type):
+            merged.append(block)
+            continue
+        saw_terminal_block = True
+        match = next(
+            (index for index in range(cursor, len(parts)) if parts[index] == block.text),
+            None,
+        )
+        if match is not None:
+            merged.extend(block_type(text=part) for part in parts[cursor:match])
+            cursor = match + 1
+        merged.append(block)
+    if not saw_terminal_block:
+        insert_at = next(
+            (
+                index
+                for index, block in enumerate(merged)
+                if isinstance(block, CapabilityCallBlock)
+            ),
+            len(merged),
+        )
+        merged[insert_at:insert_at] = [block_type(text=part) for part in parts]
+        return merged
+    merged.extend(block_type(text=part) for part in parts[cursor:])
+    return merged
 
 
 def block_payload(block: ContentBlock) -> str:

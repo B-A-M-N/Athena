@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from athena.protocol.messages import ContentBlock, ReasoningBlock, TextBlock
+from athena.protocol.messages import CapabilityCallBlock, ContentBlock, ReasoningBlock, TextBlock
 from athena.protocol.models import (
     IncompleteModelResponse,
     ModelDelta,
@@ -60,8 +60,7 @@ class ModelResponseAccumulator:
             if event.delta.block is not None:
                 self._blocks.append(event.delta.block)
         if event.type is ModelEventType.DONE and event.response is not None:
-            if not self.has_partial_output:
-                self._account_response(event.response)
+            self._account_terminal_additions(event.response)
             self._response = event.response
             self._terminal_event_seen = True
 
@@ -75,8 +74,44 @@ class ModelResponseAccumulator:
             payloads.append(block_payload(delta.block))
         self._account_payload("".join(payloads))
 
-    def _account_response(self, response: ModelResponse) -> None:
-        self._account_payload("".join(block_payload(block) for block in response.blocks))
+    def _account_terminal_additions(self, response: ModelResponse) -> None:
+        """Account terminal payload not already observed in stream deltas.
+
+        Providers commonly repeat the streamed text, reasoning, and tool-call
+        blocks in their terminal response.  Counting those duplicates would
+        reject valid responses at the local limit, while ignoring genuinely
+        new terminal blocks would allow an oversized response through.
+        """
+        for block_type, parts in (
+            (TextBlock, list(self._text)),
+            (ReasoningBlock, list(self._reasoning)),
+        ):
+            terminal = [block for block in response.blocks if isinstance(block, block_type)]
+            if not terminal:
+                continue
+            if "".join(block.text for block in terminal) == "".join(parts):
+                continue
+            remaining = list(parts)
+            for block in terminal:
+                try:
+                    remaining.remove(block.text)
+                except ValueError:
+                    self._account_payload(block.text)
+
+        streamed_calls = {
+            content_identity(block)
+            for block in self._blocks
+            if isinstance(block, CapabilityCallBlock)
+        }
+        for terminal_block in response.blocks:
+            if isinstance(terminal_block, (TextBlock, ReasoningBlock)):
+                continue
+            if (
+                isinstance(terminal_block, CapabilityCallBlock)
+                and content_identity(terminal_block) in streamed_calls
+            ):
+                continue
+            self._account_payload(block_payload(terminal_block))
 
     def _account_payload(self, payload: str) -> None:
         raw_bytes = len(payload.encode("utf-8", errors="replace"))
@@ -138,8 +173,18 @@ class ModelResponseAccumulator:
         streamed_text = "".join(self._text)
         streamed_reasoning = "".join(self._reasoning)
         base = list(response.blocks)
-        base = merge_streamed_content(base, streamed_reasoning, ReasoningBlock)
-        base = merge_streamed_content(base, streamed_text, TextBlock)
+        base = merge_streamed_content(
+            base,
+            streamed_reasoning,
+            ReasoningBlock,
+            streamed_parts=tuple(self._reasoning),
+        )
+        base = merge_streamed_content(
+            base,
+            streamed_text,
+            TextBlock,
+            streamed_parts=tuple(self._text),
+        )
         identities = {content_identity(block) for block in base}
         for block in self._blocks:
             if content_identity(block) not in identities:

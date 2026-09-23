@@ -94,6 +94,8 @@ class DispatchOrdering(_Mechanism):
         workspace: WorkspaceSpec,
         effects: tuple[EffectClass, ...],
         batch_order_lock: asyncio.Lock | None,
+        *,
+        directives: DispatchDirectives | None = None,
     ) -> list[tuple[asyncio.Lock, ReferenceCountedKeyedLocks]]:
         """Ordering for one call, or [] when it may parallelize.
 
@@ -109,6 +111,12 @@ class DispatchOrdering(_Mechanism):
         operation lane across that await is not reentrant.
         """
         if not _is_ordering_sensitive(effects):
+            return []
+        # A trusted reality route has already selected an isolated execution
+        # domain.  Keeping it on the workspace-wide ambient lane would erase
+        # that isolation's concurrency benefit and recreate head-of-line
+        # blocking between unrelated operations.
+        if directives is not None and directives.reality_tier == "isolated":
             return []
         if self.resource_keys_for(request, workspace, effects):
             return []
@@ -191,6 +199,12 @@ class DispatchOrdering(_Mechanism):
             request = prepared.request
             effects = prepared.effects
 
+        effective_directives = (
+            prepared.directives
+            if isinstance(prepared, PreparedCapabilityCall) and prepared.directives is not None
+            else directives
+        )
+
         # asyncio.Lock is not reentrant: a mediated nested dispatch would
         # deadlock against its own outer lock, so track ownership per task and
         # skip locks this task already holds.
@@ -213,7 +227,13 @@ class DispatchOrdering(_Mechanism):
             for lock in all_locks:
                 if lock in held:
                     self._d._resource_locks.release_reference(lock)
-            order = self._d._batch_order(request, workspace, effects, batch_order_lock)
+            order = self._d._batch_order(
+                request,
+                workspace,
+                effects,
+                batch_order_lock,
+                directives=effective_directives,
+            )
             # Reservation is the ownership boundary, not lock state.  Acquire
             # all ambient and resource locks as one transaction so cancellation
             # cannot strand the ordering lane or a half-acquired resource set.

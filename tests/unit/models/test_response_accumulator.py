@@ -135,6 +135,40 @@ def test_accumulator_preserves_ordered_mixed_terminal_blocks():
     ]
 
 
+def test_accumulator_preserves_unmatched_stream_text_without_duplicate_terminal_text():
+    request = _request()
+    accumulator = ModelResponseAccumulator(request)
+    call = CapabilityCallBlock(call_id="call-mixed", capability_id="files.read")
+    for text in ("A", "B"):
+        accumulator.ingest(
+            ModelEvent(
+                type=ModelEventType.DELTA,
+                request_id=request.request_id,
+                delta=ModelDelta(request_id=request.request_id, text=text),
+            )
+        )
+    accumulator.ingest(
+        ModelEvent(
+            type=ModelEventType.DONE,
+            request_id=request.request_id,
+            response=ModelResponse(
+                request_id=request.request_id,
+                model=request.model,
+                provider=request.provider,
+                blocks=(TextBlock(text="A"), call, TextBlock(text="C")),
+            ),
+        )
+    )
+
+    response = accumulator.finish()
+    assert [(type(block), getattr(block, "text", None)) for block in response.blocks] == [
+        (TextBlock, "A"),
+        (CapabilityCallBlock, None),
+        (TextBlock, "C"),
+        (TextBlock, "B"),
+    ]
+
+
 def test_repeated_terminal_events_do_not_replace_the_first_response():
     request = _request()
     accumulator = ModelResponseAccumulator(request)
@@ -152,6 +186,31 @@ def test_repeated_terminal_events_do_not_replace_the_first_response():
             )
         )
     assert accumulator.finish().blocks == (TextBlock(text="first"),)
+
+
+def test_accumulator_limits_new_terminal_payload_after_streamed_prefix():
+    accumulator = ModelResponseAccumulator(_limited_request(2))
+    accumulator.ingest(
+        ModelEvent(
+            type=ModelEventType.DELTA,
+            request_id="request",
+            delta=ModelDelta(request_id="request", text="ok"),
+        )
+    )
+
+    with pytest.raises(ValueError, match="provider stream exceeded"):
+        accumulator.ingest(
+            ModelEvent(
+                type=ModelEventType.DONE,
+                request_id="request",
+                response=ModelResponse(
+                    request_id="request",
+                    model="model",
+                    provider="provider",
+                    blocks=(TextBlock(text="ok"), TextBlock(text="x" * 20)),
+                ),
+            )
+        )
 
 
 class _StreamKernel:

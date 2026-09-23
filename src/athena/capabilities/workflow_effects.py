@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from athena.protocol.capabilities import EffectClass
 from athena.workflows.validation import WorkflowValidator
 

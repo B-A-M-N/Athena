@@ -48,7 +48,6 @@ from athena.capabilities.dispatch_mechanisms import _wrap_exception
 from athena.capabilities.dispatch_retry import invoke_with_retry
 from athena.capabilities.dispatch_helpers import (
     ReferenceCountedKeyedLocks,
-    _cache_ttl,
     _health_state_changed,
     _result_cache_key,
     redact_event_payload as _redact_event_payload,
@@ -892,8 +891,14 @@ class CapabilityDispatcher:
             directives=directives,
         )
 
-    def _batch_order(self, request, workspace, effects, batch_order_lock):
-        return DispatchOrdering(self)._batch_order(request, workspace, effects, batch_order_lock)
+    def _batch_order(self, request, workspace, effects, batch_order_lock, *, directives=None):
+        return DispatchOrdering(self)._batch_order(
+            request,
+            workspace,
+            effects,
+            batch_order_lock,
+            directives=directives,
+        )
 
     async def _dispatch_with_controls(self, prepared, **kwargs):
         return await DispatchOrdering(self)._dispatch_with_controls(prepared, **kwargs)

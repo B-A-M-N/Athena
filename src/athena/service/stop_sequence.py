@@ -13,9 +13,9 @@ from typing import Any
 
 from athena.protocol.events import EV, make_event
 from athena.protocol.tasks import TaskStatus
+from athena.service.blocking_shutdown import shutdown_blocking_workers
 
 _logger = logging.getLogger("athena.service")
-
 
 async def stop(ports: Any) -> None:
     if not ports.started and ports.db is None:
@@ -32,7 +32,6 @@ async def stop(ports: Any) -> None:
         except Exception as exc:
             _logger.warning("worker task teardown failed: %s", exc)
         ports.worker_task = None
-
     recovery_tasks = list(getattr(ports, "approval_recovery_tasks", ()))
     for recovery in recovery_tasks:
         recovery.cancel()
@@ -52,7 +51,6 @@ async def stop(ports: Any) -> None:
     if ports.store_events is not None and ports.synthesis_event_observer is not None:
         ports.store_events.unsubscribe(ports.synthesis_event_observer)
         ports.synthesis_event_observer = None
-
     for callback in getattr(ports, "observation_callbacks", None) or []:
         if ports.store_events is not None:
             ports.store_events.unsubscribe(callback)
@@ -156,6 +154,8 @@ async def stop(ports: Any) -> None:
                 ports.execution.live_resource_count(),
             )
         ports.execution = None
+
+    await shutdown_blocking_workers()
 
     shutdown_clean = not (
         hook_outcome.get("failures")
