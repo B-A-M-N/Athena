@@ -30,12 +30,14 @@ class LocalBackend(ExecutionBackend):
             persistent_runtime_state=True,
             reattach=False,
             filesystem_persistence=True,
-            network_modes=("allow", "deny", "restricted"),
+            network_modes=("allow", "deny"),
+            network_policy_effects={"allow": "allow", "deny": "deny", "restricted": "deny"},
             resource_limits=True,
             secret_materialization=True,
             interactive_stdin=True,
             process_signals=True,
             dependency_installation=("python", "node"),
+            runtime_lifetime="athena_process",
             runtime_capabilities={
                 runtime: {
                     "filesystem_containment": True,

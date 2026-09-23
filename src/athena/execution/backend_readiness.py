@@ -53,10 +53,14 @@ class BackendReadiness:
             local_backend=self._local_backend(),
             available_runtimes=self._available_runtimes(),
         )
+        local_row = next((item for item in result if item.get("id") == "local"), None)
+        if local_row is not None and "capabilities" not in local_row:
+            local_row["capabilities"] = self.backend_capabilities("local")
         for alias in self._BUILTIN_ALIASES:
             if alias == "local":
                 continue
             status = self._builtin_status(alias)
+            status["capabilities"] = self.backend_capabilities(alias)
             status["id"] = alias
             result.append(status)
         return result
@@ -73,6 +77,14 @@ class BackendReadiness:
                 "physical_backend": status["physical_backend"],
                 "isolation_required": status["isolation_required"],
                 "isolation_verified": status["isolation_verified"],
+                "network_modes": ("allow", "deny"),
+                "network_policy_effects": {
+                    "allow": "allow",
+                    "deny": "deny",
+                    "restricted": "deny",
+                },
+                "runtime_lifetime": status["runtime_lifetime"],
+                "reattach": False,
                 "dependency_installation": tuple(
                     manager
                     for manager, runtime in (("python", "python"), ("node", "node"))
@@ -117,6 +129,14 @@ class BackendReadiness:
             "proof_status": "unverified",
             "isolation_required": isolated,
             "isolation_verified": bool(available and isolated),
+            "network_modes": ["allow", "deny"],
+            "network_policy_effects": {
+                "allow": "allow",
+                "deny": "deny",
+                "restricted": "deny",
+            },
+            "runtime_lifetime": "athena_process",
+            "reattach": False,
             "runtimes": list(runtimes),
             **({"error": reason} if reason else {}),
         }

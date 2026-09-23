@@ -15,10 +15,12 @@ def ssh_capabilities() -> BackendCapabilities:
         reattach=True,
         filesystem_persistence=True,
         network_modes=("allow",),
+        network_policy_effects={"allow": "allow"},
         secret_materialization=True,
         interactive_stdin=True,
         process_signals=True,
         dependency_installation=("python", "node"),
+        runtime_lifetime="remote_supervisor",
         runtime_capabilities={
             runtime: {
                 "persistent_sessions": True,

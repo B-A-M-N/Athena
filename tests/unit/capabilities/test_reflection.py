@@ -565,5 +565,7 @@ def test_execution_manager_reports_runtime_health_and_aliases():
             "active_sessions": 0,
             "active_executions": 0,
             "implementation": "_Runtime",
+            "runtime_lifetime": "athena_process",
+            "reattach": False,
         }
     ]

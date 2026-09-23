@@ -90,6 +90,14 @@ class BackendCatalog:
                 "recognized": True,
                 "available": local_available,
                 "healthy": local_available,
+                "runtime_lifetime": "athena_process",
+                "reattach": False,
+                "network_modes": ["allow", "deny"],
+                "network_policy_effects": {
+                    "allow": "allow",
+                    "deny": "deny",
+                    "restricted": "deny",
+                },
                 "runtimes": list(runtimes),
                 **self._proof_fields(
                     getattr(local_backend, "name", "local")
@@ -112,6 +120,18 @@ class BackendCatalog:
                 result[0]["passport"] = dict(passport)
             try:
                 value = local_backend.capabilities()
+                result[0].update(
+                    {
+                        "runtime_lifetime": getattr(
+                            value, "runtime_lifetime", "athena_process"
+                        ),
+                        "reattach": bool(getattr(value, "reattach", False)),
+                        "network_modes": list(getattr(value, "network_modes", ()) or ()),
+                        "network_policy_effects": dict(
+                            getattr(value, "network_policy_effects", {}) or {}
+                        ),
+                    }
+                )
                 result[0]["capabilities"] = {
                     key: list(item) if isinstance(item, tuple) else item
                     for key, item in vars(value).items()

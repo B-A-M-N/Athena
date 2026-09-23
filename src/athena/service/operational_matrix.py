@@ -61,6 +61,12 @@ def build_operational_matrix(service: Any) -> dict[str, Any]:
                         capabilities.get("dependency_installation") or ()
                     ),
                     "network_modes": list(capabilities.get("network_modes") or ()),
+                    "network_policy_effects": dict(
+                        capabilities.get("network_policy_effects") or {}
+                    ),
+                    "runtime_lifetime": capabilities.get(
+                        "runtime_lifetime", "athena_process"
+                    ),
                     "filesystem_containment": bool(
                         cell.get(
                             "filesystem_containment", capabilities.get("filesystem_containment")

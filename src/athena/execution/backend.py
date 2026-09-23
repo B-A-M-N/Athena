@@ -48,13 +48,22 @@ class BackendCapabilities:
     reattach: bool = False
     filesystem_persistence: bool = False
     filesystem_containment: bool = False
+    # ``network_modes`` are the effective modes enforced by the backend.  A
+    # policy input may be accepted while mapping to a stricter effective mode;
+    # that mapping is recorded explicitly below instead of overstating
+    # selective networking support.
     network_modes: tuple[str, ...] = ()
+    network_policy_effects: Mapping[str, str] = field(default_factory=dict)
     network_containment: bool = False
     resource_limits: bool = False
     secret_materialization: bool = False
     interactive_stdin: bool = False
     process_signals: bool = False
     dependency_installation: tuple[str, ...] = ()
+    # The lifetime is part of the public contract: persistent state inside an
+    # Athena process is not the same claim as state surviving an Athena
+    # restart through an external supervisor or remote backend.
+    runtime_lifetime: str = "athena_process"
     runtime_capabilities: Mapping[str, RuntimeCapabilities | Mapping[str, object]] = field(
         default_factory=dict
     )

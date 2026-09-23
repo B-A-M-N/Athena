@@ -174,7 +174,21 @@ class ExecutionManager:
         return self._runtime_readiness.available_runtimes()
 
     def runtime_status(self) -> list[dict[str, Any]]:
-        return self._runtime_readiness.status()
+        status = self._runtime_readiness.status()
+        backend = self._routing.local_backend
+        lifetime = "athena_process"
+        reattach = False
+        if backend is not None:
+            try:
+                capabilities = backend.capabilities()
+                lifetime = str(capabilities.runtime_lifetime)
+                reattach = bool(capabilities.reattach)
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                lifetime = "unknown"
+        for entry in status:
+            entry["runtime_lifetime"] = lifetime
+            entry["reattach"] = reattach
+        return status
 
     def has_runtime(self, name: str) -> bool:
         return self._runtime_readiness.has_runtime(name)

@@ -5,6 +5,8 @@ from __future__ import annotations
 import pytest
 
 from athena.execution.backend import BackendCapabilities
+from athena.execution.container import ContainerBackend
+from athena.execution.local import LocalBackend
 from athena.execution.manager import ExecutionManager
 from athena.protocol.execution import ExecutionLimits, ExecutionRequest
 
@@ -50,6 +52,29 @@ def test_builtin_aliases_expose_their_physical_boundary():
         assert statuses[alias]["physical_backend"] == "local-runtime-manager"
         assert statuses[alias]["recognized"] is True
         assert statuses[alias]["proof_status"] == "unverified"
+
+
+def test_network_contract_exposes_restricted_as_deny_only():
+    for capabilities in (LocalBackend().capabilities(), ContainerBackend().capabilities()):
+        assert capabilities.network_modes == ("allow", "deny")
+        assert capabilities.network_policy_effects["restricted"] == "deny"
+
+    manager = ExecutionManager()
+    capabilities = manager.backend_capabilities("local")
+    assert capabilities["network_modes"] == ("allow", "deny")
+    assert capabilities["network_policy_effects"]["restricted"] == "deny"
+
+
+def test_runtime_inventory_reports_process_lifetime_by_default():
+    manager = ExecutionManager()
+
+    class Runtime:
+        name = "fixture"
+
+    manager.register_runtime(Runtime())
+    row = manager.runtime_status()[0]
+    assert row["runtime_lifetime"] == "athena_process"
+    assert row["reattach"] is False
 
 
 def test_unknown_backend_fails_closed_with_catalog():

@@ -102,11 +102,13 @@ class ContainerBackend(ExecutionBackend):
             persistent_runtime_state=True,
             reattach=True,
             filesystem_persistence=True,
-            network_modes=("allow", "deny", "restricted"),
+            network_modes=("allow", "deny"),
+            network_policy_effects={"allow": "allow", "deny": "deny", "restricted": "deny"},
             secret_materialization=True,
             interactive_stdin=True,
             process_signals=True,
             dependency_installation=("python", "node"),
+            runtime_lifetime="container",
             runtime_capabilities={
                 runtime: {
                     "filesystem_containment": True,
