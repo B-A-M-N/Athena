@@ -13,17 +13,75 @@ from athena.kernel.inference_replay import replay_cached_attempt
 from athena.kernel.tokens import is_retryable as _is_retryable
 from athena.models.router import ModelSelection
 from athena.protocol.errors import (
+    ContextOverflow,
     ModelUnavailable,
     ProviderError,
     ProviderOutcomeUnknown,
     RequestCancelled,
 )
+from athena.models.request_bounds import provider_request_upper_bound
 from athena.protocol.ids import new_id
 from athena.protocol.models import ModelResponse
 from athena.protocol.tasks import TaskSpec
 
 if TYPE_CHECKING:
     from athena.kernel.kernel import RunState
+
+
+def _check_provider_input_allowance(
+    provider: Any,
+    request,
+    selection: ModelSelection,
+    compiled: CompiledContext,
+    *,
+    token_upper_bound_per_byte: int | None,
+) -> None:
+    """Reject adapter-expanded input before creating a durable attempt."""
+    context_limit = selection.info.context_limit
+    if context_limit is None:
+        return
+    wire_bound = provider_request_upper_bound(
+        provider,
+        request,
+        token_upper_bound_per_byte=token_upper_bound_per_byte,
+    )
+    if wire_bound is None:
+        return
+    requested_output = getattr(compiled.requirements, "requested_output_tokens", None) or 0
+    output_reserve = max(int(request.max_tokens or 0), int(requested_output))
+    input_allowance = max(0, int(context_limit) - output_reserve)
+    if wire_bound > input_allowance:
+        raise ContextOverflow(
+            "provider-formatted model request exceeds the selected model input allowance: "
+            f"{wire_bound} > {input_allowance} tokens"
+        )
+
+
+async def _preflight_request(
+    broker: Any,
+    task: TaskSpec,
+    request,
+    selection: ModelSelection,
+    estimator,
+    effective_policy,
+    provider: Any,
+    compiled: CompiledContext,
+):
+    request, worst_cost, remaining = await broker._budget_preflight(
+        task,
+        request,
+        selection=selection,
+        estimator=estimator,
+        effective_policy=effective_policy,
+    )
+    _check_provider_input_allowance(
+        provider,
+        request,
+        selection,
+        compiled,
+        token_upper_bound_per_byte=estimator.token_upper_bound_per_byte,
+    )
+    return request, worst_cost, remaining
 
 
 async def invoke_with_retries(
@@ -80,13 +138,21 @@ async def invoke_with_retries(
         from athena.models.tokens import ModelTokenEstimator
 
         token_estimator = ModelTokenEstimator.from_profile(model_profile)
-        request, worst_cost, _remaining = await broker._budget_preflight(
-            task,
-            request,
-            selection=selection_for_attempt,
-            estimator=token_estimator,
-            effective_policy=effective_policy,
-        )
+        try:
+            request, worst_cost, _remaining = await _preflight_request(
+                broker, task, request, selection_for_attempt, token_estimator,
+                effective_policy, provider, compiled_for_attempt
+            )
+        except ContextOverflow as exc:
+            last_err = exc
+            if attempt >= max_attempts - 1:
+                raise
+            attempted.add(pair)
+            selection_for_attempt, compiled_for_attempt = await prepare_fallback(
+                broker._k, task, compiled_for_attempt,
+                attempted=frozenset(attempted), error=exc
+            )
+            continue
         from athena.kernel.inference_broker import _request_fingerprint
 
         request_fingerprint = _request_fingerprint(

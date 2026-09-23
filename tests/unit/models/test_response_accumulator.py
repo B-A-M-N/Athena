@@ -2,7 +2,7 @@ from athena.models.registry import _collect_response
 import pytest
 from athena.kernel.inference_stream import consume_provider_stream
 from athena.protocol.errors import ModelUnavailable, ProviderError, ProviderOutcomeUnknown
-from athena.protocol.messages import CapabilityCallBlock, TextBlock
+from athena.protocol.messages import CapabilityCallBlock, ReasoningBlock, TextBlock
 from athena.protocol.models import (
     IncompleteModelResponse,
     ModelDelta,
@@ -133,6 +133,46 @@ def test_accumulator_preserves_ordered_mixed_terminal_blocks():
         (CapabilityCallBlock, None),
         (TextBlock, "B"),
     ]
+
+
+def test_accumulator_deduplicates_repeated_reasoning_and_text_around_tool_calls():
+    request = _request()
+    accumulator = ModelResponseAccumulator(request)
+    call = CapabilityCallBlock(call_id="call-reasoning", capability_id="files.read")
+    for delta in (
+        ModelDelta(request_id=request.request_id, reasoning="inspect"),
+        ModelDelta(request_id=request.request_id, text="A"),
+        ModelDelta(request_id=request.request_id, block=call),
+        ModelDelta(request_id=request.request_id, text="B"),
+    ):
+        accumulator.ingest(
+            ModelEvent(type=ModelEventType.DELTA, request_id=request.request_id, delta=delta)
+        )
+    accumulator.ingest(
+        ModelEvent(
+            type=ModelEventType.DONE,
+            request_id=request.request_id,
+            response=ModelResponse(
+                request_id=request.request_id,
+                model=request.model,
+                provider=request.provider,
+                blocks=(
+                    ReasoningBlock(text="inspect"),
+                    TextBlock(text="A"),
+                    call,
+                    TextBlock(text="B"),
+                ),
+            ),
+        )
+    )
+
+    response = accumulator.finish()
+    assert response.blocks == (
+        ReasoningBlock(text="inspect"),
+        TextBlock(text="A"),
+        call,
+        TextBlock(text="B"),
+    )
 
 
 def test_accumulator_preserves_unmatched_stream_text_without_duplicate_terminal_text():

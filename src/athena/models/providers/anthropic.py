@@ -22,6 +22,7 @@ from typing import Any
 import httpx
 
 from athena.models.compat.candidates import ToolCallCandidate, record_raw_candidate
+from athena.models.request_bounds import WireRequestBounds
 from athena.models.media import image_data_path
 from athena.protocol.errors import (
     ContextOverflow,
@@ -201,9 +202,8 @@ def _done_event(
     )
 
 
-class AnthropicProvider:
+class AnthropicProvider(WireRequestBounds):
     """ModelProvider adapter for the Anthropic Messages API."""
-
     def __init__(
         self,
         *,

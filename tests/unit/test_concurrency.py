@@ -106,6 +106,43 @@ async def test_run_blocking_cancellation_bounds_worker_admission(count: int) -> 
     assert all(isinstance(result, (asyncio.CancelledError, type(None))) for result in results)
 
 
+@pytest.mark.asyncio
+async def test_run_blocking_keeps_long_waiters_from_exhausting_short_capacity() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    active = 0
+    state_lock = threading.Lock()
+
+    def long_blocked() -> None:
+        nonlocal active
+        with state_lock:
+            active += 1
+            if active == 8:
+                started.set()
+        try:
+            release.wait(2)
+        finally:
+            with state_lock:
+                active -= 1
+
+    long_tasks = [
+        asyncio.create_task(run_blocking(long_blocked, _pool="long")) for _ in range(10)
+    ]
+    for _ in range(1000):
+        if started.is_set():
+            break
+        await asyncio.sleep(0)
+    assert started.is_set(), "all long-pool workers should admit before the probe"
+
+    assert await asyncio.wait_for(run_blocking(lambda: "short"), timeout=1) == "short"
+
+    for task in long_tasks[8:]:
+        task.cancel()
+    release.set()
+    results = await asyncio.gather(*long_tasks, return_exceptions=True)
+    assert all(isinstance(result, (asyncio.CancelledError, type(None))) for result in results)
+
+
 def test_run_blocking_completes_when_default_executor_wakeup_is_unobserved():
     class Loop(asyncio.SelectorEventLoop):
         def call_soon_threadsafe(self, callback, *args, context=None):

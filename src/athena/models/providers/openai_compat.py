@@ -21,6 +21,7 @@ import httpx
 
 from athena.models.compat.candidates import ToolCallCandidate, record_raw_candidate
 from athena.models.media import image_data_path
+from athena.models.request_bounds import WireRequestBounds
 from athena.protocol.errors import (
     ContextOverflow,
     ModelUnavailable,
@@ -194,9 +195,8 @@ def _response_metadata(
     return result
 
 
-class OpenAICompatProvider:
+class OpenAICompatProvider(WireRequestBounds):
     """ModelProvider adapter against the OpenAI chat/completions wire format."""
-
     def __init__(
         self,
         *,

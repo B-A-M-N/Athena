@@ -8,6 +8,7 @@ from athena.protocol.artifacts import ArtifactRef
 from athena.protocol.messages import (
     ArtifactRefBlock,
     AudioBlock,
+    CapabilityCallBlock,
     CapabilityResultBlock,
     ImageBlock,
     Message,
@@ -15,7 +16,7 @@ from athena.protocol.messages import (
     Role,
     TextBlock,
 )
-from athena.protocol.models import ModelEventType, ModelRequest
+from athena.protocol.models import ModelEventType, ModelRequest, ModelResponseAccumulator
 
 
 class _FakeSSEResponse:
@@ -124,6 +125,32 @@ def test_openai_compatible_hosted_profile_emits_prompt_cache_key():
     payload = provider._build_request(request)
 
     assert payload["prompt_cache_key"] == "session:hosted:model-a"
+
+
+def test_openai_request_bound_uses_provider_wire_shape():
+    provider = _provider()
+    request = ModelRequest(
+        messages=_user_request().messages,
+        model="gpt-test",
+        provider="fake-openai",
+        request_id="req-wire-bound",
+        system="system policy",
+        capabilities=(),
+        max_tokens=128,
+    )
+
+    bound = provider.request_token_upper_bound(request)
+    payload_bytes = len(
+        json.dumps(
+            provider._build_request(request),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(", ", ": "),
+        ).encode("ascii")
+    )
+
+    assert bound is not None
+    assert bound >= payload_bytes + 256
 
 
 def test_openai_compatible_local_profile_does_not_emit_prompt_cache_key():
@@ -314,6 +341,72 @@ def test_nonstream_response_keeps_reasoning_content():
     assert isinstance(event.response.blocks[0], ReasoningBlock)
     assert event.response.blocks[0].text == "inspect first"
     assert event.response.blocks[1].text == "I will inspect it."
+
+
+async def test_openai_stream_matches_canonical_mixed_reasoning_and_tool_shape():
+    provider = _provider()
+    request = _user_request()
+    sse = [
+        "data: "
+        + json.dumps({"choices": [{"delta": {"reasoning_content": "inspect first"}}]}),
+        "data: " + json.dumps({"choices": [{"delta": {"content": "A"}}]}),
+        "data: " + json.dumps({"choices": [{"delta": {"content": "B"}}]}),
+        "data: "
+        + json.dumps(
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "tool-1",
+                                    "function": {
+                                        "name": "fs.read",
+                                        "arguments": '{"path":',
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        ),
+        "data: "
+        + json.dumps(
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "function": {"arguments": '"README.md"}'},
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        ),
+        "data: [DONE]",
+    ]
+
+    events = [e async for e in provider._stream_events(request, _FakeSSEResponse(sse))]
+    accumulator = ModelResponseAccumulator(request)
+    for event in events:
+        accumulator.ingest(event)
+
+    response = accumulator.finish()
+    assert [type(block) for block in response.blocks] == [
+        ReasoningBlock,
+        TextBlock,
+        CapabilityCallBlock,
+    ]
+    assert response.blocks[0].text == "inspect first"
+    assert response.blocks[1].text == "AB"
+    assert response.blocks[2].call_id == "tool-1"
+    assert response.blocks[2].arguments == {"path": "README.md"}
 
 
 def test_translate_multimodal_blocks_without_dropping_them():

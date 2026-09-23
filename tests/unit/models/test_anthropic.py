@@ -142,6 +142,31 @@ def test_anthropic_cache_breakpoint_covers_stable_context_before_task():
     assert "cache_control" not in payload["messages"][1]["content"][-1]
 
 
+def test_anthropic_request_bound_uses_provider_wire_shape():
+    provider = AnthropicProvider(api_key="key", use_sdk=False)
+    request = ModelRequest(
+        messages=(),
+        model="claude-test",
+        provider="anthropic",
+        request_id="request-wire-bound",
+        system="system policy",
+        max_tokens=128,
+    )
+
+    bound = provider.request_token_upper_bound(request)
+    payload_bytes = len(
+        json.dumps(
+            provider._build_kwargs(request, stream=True),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(", ", ": "),
+        ).encode("ascii")
+    )
+
+    assert bound is not None
+    assert bound >= payload_bytes + 256
+
+
 @pytest.mark.asyncio
 async def test_anthropic_stream_accumulates_reasoning_text_and_tool_call():
     provider = AnthropicProvider(api_key="key", use_sdk=False)

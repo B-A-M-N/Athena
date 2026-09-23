@@ -35,3 +35,4 @@ Run model, provider compatibility, routing, and admission tests.
 | `admission.py` | Hard model policy, capability, capacity, and privacy gates |
 | `ranking.py` | Preference and reliability ordering after admission |
 | `response_collection.py` | Direct provider-stream collection, local output limits, cancellation, and incomplete-outcome classification |
+| `request_bounds.py` | Neutral provider-wire request sizing before model admission and durable attempt creation |

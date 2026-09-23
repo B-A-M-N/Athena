@@ -10,20 +10,58 @@ from athena.capabilities.browser import BrowserProxyConfig
 _logger = logging.getLogger("athena.service")
 
 
-async def register_interaction_capabilities(ports: Any, registry: Any) -> None:
+def _assert_optional_consistency(
+    registry: Any,
+    capability_id: str,
+    instance: Any,
+    health: dict[str, Any],
+) -> None:
+    registered = any(
+        getattr(getattr(executor, "descriptor", None), "id", None) == capability_id
+        and executor is instance
+        for executor in registry.iter_executors()
+    )
+    state = str(health.get("state") or "unknown")
+    if registered != (instance is not None):
+        raise RuntimeError(
+            f"{capability_id} registry/instance mismatch: registered={registered}"
+        )
+    if registered and state not in {"ready", "available", "configured"}:
+        raise RuntimeError(f"{capability_id} registered with non-ready health: {state}")
+
+
+async def register_interaction_capabilities(
+    ports: Any,
+    registry: Any,
+    *,
+    computer_type: Any = None,
+    browser_type: Any = None,
+    browser_driver_type: Any = None,
+) -> None:
     """Register computer and browser independently through the core registry.
 
     Each optional driver has its own exception boundary and health projection.
     A failure in one pack must not alter the registration or health evidence of
     its sibling.
     """
-    from athena.capabilities.computer import ComputerCapability
+    if computer_type is None:
+        from athena.capabilities.computer import ComputerCapability
+
+        computer_type = ComputerCapability
+    if browser_type is None:
+        from athena.capabilities.browser import BrowserCapability
+
+        browser_type = BrowserCapability
+    if browser_driver_type is None:
+        from athena.capabilities.browser import PlaywrightBrowserDriver
+
+        browser_driver_type = PlaywrightBrowserDriver
 
     ports.computer = None
     ports.browser = None
     try:
-        if ComputerCapability.available():
-            computer = ComputerCapability(artifact_store=ports.artifacts)
+        if computer_type.available():
+            computer = computer_type(artifact_store=ports.artifacts)
             ports.computer_health = await computer.probe_health()
             ports.optional_capability_health["computer"] = {
                 "installed": True,
@@ -70,14 +108,10 @@ async def register_interaction_capabilities(ports: Any, registry: Any) -> None:
         _logger.info("computer capability unavailable: %s", exc)
 
     try:
-        from athena.capabilities.browser import BrowserCapability
-
         browser_factory = ports.config.browser_driver_factory
         if browser_factory is None and ports.config.browser_enabled:
-            if BrowserCapability.available():
-                from athena.capabilities.browser import PlaywrightBrowserDriver
-
-                preflight = await PlaywrightBrowserDriver.preflight(
+            if browser_type.available():
+                preflight = await browser_driver_type.preflight(
                     browser_name=ports.config.browser_engine,
                     executable_path=ports.config.browser_executable_path,
                     channel=ports.config.browser_channel,
@@ -86,7 +120,7 @@ async def register_interaction_capabilities(ports: Any, registry: Any) -> None:
                 if preflight.get("state") in {"available", "configured"}:
 
                     async def browser_factory():
-                        return await PlaywrightBrowserDriver.launch(
+                        return await browser_driver_type.launch(
                             browser_name=ports.config.browser_engine,
                             headless=ports.config.browser_headless,
                             launch_args=ports.config.browser_launch_args,
@@ -128,7 +162,7 @@ async def register_interaction_capabilities(ports: Any, registry: Any) -> None:
                     "reason": ports.browser_health["reason"],
                 }
         if browser_factory is not None:
-            ports.browser = BrowserCapability(
+            ports.browser = browser_type(
                 driver_factory=browser_factory,
                 session_scope=ports.config.browser_session_scope,
                 artifact_store=ports.artifacts,
@@ -151,7 +185,7 @@ async def register_interaction_capabilities(ports: Any, registry: Any) -> None:
                 "reason": "browser_driver_factory is not configured",
             }
             ports.optional_capability_health["browser"] = {
-                "installed": BrowserCapability.available(),
+                "installed": browser_type.available(),
                 "configured": False,
                 "state": "unavailable",
                 "reason": ports.browser_health["reason"],
@@ -175,6 +209,11 @@ async def register_interaction_capabilities(ports: Any, registry: Any) -> None:
             "reason": ports.browser_health["reason"],
         }
         _logger.info("browser capability unavailable: %s", exc)
+
+    _assert_optional_consistency(
+        registry, "computer", ports.computer, ports.computer_health
+    )
+    _assert_optional_consistency(registry, "browser", ports.browser, ports.browser_health)
 
 
 __all__ = ["register_interaction_capabilities"]
