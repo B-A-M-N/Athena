@@ -47,7 +47,7 @@ while True:
         length = int(length_line.strip())
         payload = sys.stdin.read(length)
         msg = json.loads(payload)
-    except Exception:
+    except Exception:  # rationale: optional worker bootstrap probe fails closed
         sys.stdout.write(json.dumps({"type":"fatal","data":"bad stdin"})+"\n")
         sys.stdout.flush()
         break
@@ -194,7 +194,7 @@ class _PythonSession:
                         self.process.stdout.close()
                     if self.process.stderr:
                         self.process.stderr.close()
-                except Exception:
+                except Exception:  # rationale: closing a dead process stream is best effort
                     pass
                 self.process = None
 
@@ -235,7 +235,7 @@ class _PythonSession:
             process.stdin.write(f"{len(message)}\n")
             process.stdin.write(message)
             process.stdin.flush()
-        except Exception:
+        except Exception:  # rationale: worker I/O loss is converted to an observable execution event
             yield ExecutionEvent(
                 type=ExecutionEventType.STDERR,
                 execution_id=execution_id,

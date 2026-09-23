@@ -139,7 +139,7 @@ class _PSSession:
                     self.process.stdin.close()
                 if self.process.stdout is not None:
                     self.process.stdout.close()
-            except Exception:
+            except Exception:  # rationale: closing a dead process stream is best effort
                 pass
             self.process = None
 
@@ -198,7 +198,7 @@ class _PSSession:
                 raise BrokenPipeError("PowerShell stdin is unavailable")
             process.stdin.write(wrapped + "\n")
             process.stdin.flush()
-        except Exception:
+        except Exception:  # rationale: worker I/O loss is converted to an observable execution event
             yield ExecutionEvent(
                 type=ExecutionEventType.STDERR,
                 execution_id=execution_id,

@@ -176,7 +176,7 @@ class _NodeSession:
                 try:
                     if self.process.stdin is not None:
                         self.process.stdin.close()
-                except Exception:
+                except Exception:  # rationale: cleanup of a dead worker must not mask its exit
                     pass
                 self.process = None
 
@@ -216,7 +216,7 @@ class _NodeSession:
                 raise BrokenPipeError("node worker stdin is unavailable")
             process.stdin.write(f"{len(message)}\n{message}")
             process.stdin.flush()
-        except Exception:
+        except Exception:  # rationale: worker I/O loss is converted to an observable execution event
             yield ExecutionEvent(
                 type=ExecutionEventType.STDERR,
                 execution_id=current,

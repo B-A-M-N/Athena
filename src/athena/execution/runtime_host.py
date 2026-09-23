@@ -128,11 +128,11 @@ class _RuntimeHost:
                     await writer.drain()
         except (asyncio.IncompleteReadError, ConnectionError):
             return
-        except Exception as exc:  # protocol errors are scoped to one client
+        except Exception as exc:  # rationale: protocol errors are scoped to one client
             try:
                 writer.write((json.dumps({"kind": "error", "error": str(exc)}) + "\n").encode())
                 await writer.drain()
-            except Exception:
+            except Exception:  # rationale: a disconnected client cannot receive protocol error output
                 pass
         finally:
             writer.close()

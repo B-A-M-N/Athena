@@ -51,3 +51,5 @@ Run execution unit tests, security tests, and relevant crash tests.
 | `session_lifecycle.py` | Runtime/backend session creation, identity reattachment, late adoption, and cleanup after durable-start failure; uses `CancellationRegistry` indexes and has no execution authority. |
 | `streaming.py` | Backend/runtime event normalization, session adoption, execution receipts, and stream observability; subordinate to `ExecutionManager`, with no routing or execution authority. |
 | `shutdown.py` | Bounded shutdown of task sessions, runtimes, and backends through the manager's canonical cancellation callback; no routing or cancellation-state authority. |
+| `process_ownership.py` | PID/start-identity, process-group, and optional cgroup ownership proof; no spawning or signaling authority. |
+| `sandbox.py` | Bubblewrap namespace and mount command construction; no process lifecycle or task authority. |

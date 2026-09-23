@@ -157,7 +157,7 @@ class _SubprocessSession:
                     self.process.stdout.close()
                 if self.process.stderr is not None:
                     self.process.stderr.close()
-            except Exception:
+            except Exception:  # rationale: closing a dead process stream is best effort
                 pass
             self.process = None
 
@@ -212,7 +212,7 @@ class _SubprocessSession:
                 raise BrokenPipeError("shell stdin is unavailable")
             process.stdin.write(code_processed + "\n")
             process.stdin.flush()
-        except Exception:
+        except Exception:  # rationale: worker I/O loss is converted to an observable execution event
             yield ExecutionEvent(
                 type=ExecutionEventType.STDERR,
                 execution_id=execution_id,
