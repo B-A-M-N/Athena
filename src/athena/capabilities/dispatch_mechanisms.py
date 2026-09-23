@@ -39,6 +39,7 @@ from athena.protocol.capabilities import (
 from athena.protocol.errors import CapabilityUnavailable, PersistenceError
 from athena.protocol.ids import new_id
 from athena.protocol.events import EV
+from athena.protocol.reality import ExecutionDisposition
 from athena.protocol.policy import (
     ApprovalScope,
     PolicyDecision,
@@ -96,6 +97,7 @@ class DispatchOrdering(_Mechanism):
         batch_order_lock: asyncio.Lock | None,
         *,
         directives: DispatchDirectives | None = None,
+        descriptor: Any | None = None,
     ) -> list[tuple[asyncio.Lock, ReferenceCountedKeyedLocks]]:
         """Ordering for one call, or [] when it may parallelize.
 
@@ -118,6 +120,27 @@ class DispatchOrdering(_Mechanism):
         # blocking between unrelated operations.
         if directives is not None and directives.reality_tier == "isolated":
             return []
+        reality_gate = self._d._reality_gate
+        if (
+            reality_gate is not None
+            and descriptor is not None
+            and not (
+                request.task_id
+                and (
+                    reality_gate.active_branch(request.task_id) is not None
+                    or reality_gate.checkpoint_id(request.task_id) is not None
+                )
+            )
+        ):
+            classification = reality_gate.classify(
+                request,
+                directives.reality_tier if directives is not None else None,
+                effects,
+                descriptor,
+                workspace=workspace,
+            )
+            if classification.disposition is ExecutionDisposition.ISOLATED:
+                return []
         if self.resource_keys_for(request, workspace, effects):
             return []
         boundary = workspace.id or workspace.root
@@ -204,6 +227,11 @@ class DispatchOrdering(_Mechanism):
             if isinstance(prepared, PreparedCapabilityCall) and prepared.directives is not None
             else directives
         )
+        descriptor = (
+            prepared.descriptor
+            if isinstance(prepared, PreparedCapabilityCall)
+            else getattr(prepared.executor, "descriptor", None)
+        )
 
         # asyncio.Lock is not reentrant: a mediated nested dispatch would
         # deadlock against its own outer lock, so track ownership per task and
@@ -233,6 +261,7 @@ class DispatchOrdering(_Mechanism):
                 effects,
                 batch_order_lock,
                 directives=effective_directives,
+                descriptor=descriptor,
             )
             # Reservation is the ownership boundary, not lock state.  Acquire
             # all ambient and resource locks as one transaction so cancellation

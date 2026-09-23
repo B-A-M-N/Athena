@@ -891,13 +891,9 @@ class CapabilityDispatcher:
             directives=directives,
         )
 
-    def _batch_order(self, request, workspace, effects, batch_order_lock, *, directives=None):
+    def _batch_order(self, request, workspace, effects, batch_order_lock, **kwargs):
         return DispatchOrdering(self)._batch_order(
-            request,
-            workspace,
-            effects,
-            batch_order_lock,
-            directives=directives,
+            request, workspace, effects, batch_order_lock, **kwargs
         )
 
     async def _dispatch_with_controls(self, prepared, **kwargs):
