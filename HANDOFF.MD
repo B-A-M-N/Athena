@@ -373,3 +373,288 @@ The practical target is a bounded system that recognizes an applicable
 capability, uses it, determines whether the intended task actually succeeded,
 and retains a verified correction when it did not. It is not unrestricted
 self-improvement.
+
+## Addendum — Remaining adaptive mechanics at commit `1a18021`
+
+The missing mechanics are the more important part of the follow-up review.
+At commit `1a18021`, Athena can create tools, run speculative candidates,
+learn skills and store reusable workflows, but three essential adaptive loops
+are still incomplete.
+
+### The three implementation gaps that matter most
+
+1. **Complete tool-repair execution.** A generated tool can report a
+   structured failure and retain regression evidence. What is still missing
+   is a fully integrated kernel-owned path that takes an unfamiliar failure,
+   develops a corrected implementation, revalidates it and resumes the
+   original task. The individual mechanisms exist; the complete adaptive
+   journey remains unfinished.
+
+2. **Genuine outcome-based learning.** Athena records outcomes for skills that
+   were included in a task's context. That is not proof that the agent
+   actually followed those skills or that they caused the outcome. Without a
+   stronger attribution mechanism, the system can learn misleading lessons
+   and refine the wrong skills.
+
+3. **Durable adaptive recovery.** Fusion supports bounded correction of failed
+   speculative candidates, but its recovery attempts and pending state are
+   held in the kernel's in-memory `RunState`. The reconstruction path does not
+   yet restore that adaptive state after a process restart. Durable tasks
+   therefore do not yet have fully durable improvement cycles.
+
+These are missing behavioral mechanisms, not requests for more abstractions.
+The first lets Athena improve something during a task; the second lets it
+learn whether that improvement helped; the third lets it continue the same
+improvement process safely after interruption.
+
+## Newly confirmed missing workflow mechanic
+
+### P0 — Learned workflows do not reliably generalize their inputs
+
+Files: `src/athena/workflows/store.py`, `src/athena/workflows/mining.py`
+
+Athena has a mechanism for turning repeated successful procedures into
+parameterized workflows. If two tasks successfully read `one.py` and
+`two.py`, it should replace the literal filename with `$input.path` and
+generate an input schema.
+
+The durable observation path currently constructs a candidate with both task
+IDs already marked as observed, then calls `merge_observation()`. That
+function immediately ignores a task ID already present in the candidate. The
+second observation is skipped instead of generalizing the differing value.
+
+Observed bad state:
+
+```text
+path: "one.py"
+input_schema: {}
+```
+
+Required state:
+
+```text
+path: "$input.path"
+input_schema: {"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
+```
+
+Required edit: In `WorkflowStore.save_pending_observation()`, initialize the
+candidate from the first observation only. Apply subsequent observations in
+order so `merge_observation()` can register each new task ID and generalize
+differing values. Alternatively, implement a pure generalization function
+over the complete observation set, separate from the duplicate-observation
+guard.
+
+Add a database-backed regression test with two different input values, a
+service restart, candidate promotion and execution with a third input.
+
+The database-backed reproduction confirms that this occurs in the actual
+learning path, not just in a helper: after two successful observations the
+candidate is marked ready, but its input schema remains empty and its step
+still contains `first.py`.
+
+Workflow execution, input binding, promotion-time replay validation and
+portable procedure capsules already exist. They do not need to be invented;
+the missing work is connecting discovery, correct generalization and
+subsequent reuse into a reliable learning cycle.
+
+## Remaining implementation mechanics
+
+### M-01 — Complete the generated-tool repair cycle
+
+**Priority:** Essential
+
+Files: `kernel/kernel.py`, `synthesis/executor.py`,
+`capabilities/synthesis_candidate_builder.py`,
+`capabilities/synthesis_revalidation.py`
+
+When generated execution reports an implementation failure, the existing
+kernel must retain the exact tool revision, failing input, dependency
+fingerprint, error and original task objective. It should present that
+evidence to the model for a proposed correction and submit the correction
+through the existing `synthesis.repair` operation.
+
+Revalidation must execute inherited regression cases, the newly observed
+failure and independent acceptance checks. If successful, retry the suspended
+original operation once against the corrected candidate. If unsuccessful,
+request a materially different approach within budget or terminate with
+unresolved evidence. Dependency errors, policy denials and stale environments
+must follow their existing mechanisms rather than triggering source rewrites.
+
+Completion criterion: a generated parser that works initially but fails on an
+unfamiliar valid input is diagnosed, repaired, independently verified and
+finishes the original task without manually scripted tool calls.
+
+### M-02 — Make adaptive decisions survive a restart
+
+**Priority:** Essential
+
+Files: `kernel/kernel.py`, `kernel/continuations_coordinator.py`, existing
+durable task and event stores.
+
+Persist the adaptive transition before dispatching a corrective attempt.
+Record failure identity, proposal fingerprint, remaining allowance and
+pending action under the canonical task ID. On restart, reconstruct that state
+from committed records and reconcile any already-dispatched operation before
+allowing another attempt.
+
+Use the same durable continuation mechanism for generated-tool repairs. A task
+must not acquire inconsistent recovery budgets merely because it moves from
+Fusion into synthesis.
+
+Completion criterion: killing Athena between a failed candidate and its
+correction, and again after a repair is dispatched but before its result is
+consumed, neither duplicates an effect nor resets the corrective-attempt
+allowance.
+
+### M-03 — Integrate tool creation inside speculative work
+
+**Priority:** Essential for combined operation
+
+Files: `fusion/orchestrator.py`, `fusion/ports.py`, the existing synthesis
+capability and canonical dispatcher.
+
+Extend `synthesize_from_branch()` to accept branch identity, effective
+workspace and validation context. Route generated-tool creation through
+canonical dispatch, retain task-local scope and bind proof to the exact
+speculative workspace fingerprint.
+
+The kernel should be able to choose tool creation when a speculative candidate
+encounters a demonstrated capability gap. The resulting task-local tool must
+not gain project-wide authority. Fusion failure must not automatically
+synthesize a tool; many failures require a code correction or a different
+approach.
+
+Completion criterion: a speculative refactor discovers a missing
+transformation utility, creates and validates it inside the candidate
+environment, uses it to complete the refactor and retains independent
+verification of the candidate.
+
+### M-04 — Attribute skill outcomes to actual use
+
+**Priority:** Essential for useful learning
+
+Files: `kernel/kernel.py`, `knowledge/pipeline.py`, `skills/lifecycle.py`,
+`skills/selector.py`
+
+Separate these concepts:
+
+- A skill was available in the task context.
+- The agent explicitly used its procedure.
+- The procedure contributed to an independently verified result.
+
+Extend existing task evidence so explicit skill application references the
+exact skill ID/version and relevant tool calls. Track successful, failed and
+inconclusive applications separately. A completed task must not automatically
+count as successful use of every injected skill.
+
+A failed task should generate targeted refinement candidates only for skills
+with evidence of relevant use. Partial completion should preserve useful
+failure evidence without being classified as proof that the skill failed.
+
+Completion criterion: inject two relevant skills, deliberately use one and
+complete the task. Only the used skill acquires supported reuse evidence. If
+the task fails for an unrelated reason, neither skill receives an automatic
+behavioral-failure verdict.
+
+### M-05 — Make reusable workflows discoverable during ordinary tasks
+
+**Priority:** Important
+
+Files: `context/retrieval.py`, `strategy.py`, `workflows/store.py`,
+`capabilities/workflow.py`
+
+Add a bounded workflow-discovery projection that evaluates the current task
+against promoted workflows' descriptions, input schemas, prerequisites,
+environment and validation evidence. Expose lightweight summaries first and
+allow full definitions only when relevant. Before execution, validate that the
+task supplies required inputs and that the workflow remains compatible with
+its runtime environment.
+
+Completion criterion: after a parameterized procedure is taught through
+independent tasks and promoted, a third related task can discover and use it
+without naming the workflow.
+
+### M-06 — Resolve behavioral evidence before promoting learned skills
+
+**Priority:** Important
+
+Files: `skills/validator.py`, `skills/lifecycle.py`, `knowledge/pipeline.py`
+
+Introduce durable evidence resolution at promotion. Verify that source tasks
+exist, cited verification results belong to the relevant procedure and the
+proposed applicability matches observed environments. Require additional
+evidence when widening a skill from one project to general user scope.
+
+A structurally valid skill with insufficient behavioral evidence may remain an
+unverified draft, but must not acquire a misleading verified status.
+
+Completion criterion: two equally well-formed skills, one with genuine
+passing task evidence and one with nonexistent receipts, are distinguished by
+promotion.
+
+### M-07 — Introduce one bounded adaptive decision gate
+
+**Priority:** Important
+
+Files: `kernel/reasoning_loop.py`, `strategy.py`, `protocol/failure.py`,
+`interpreter/triggering.py`
+
+Extend the kernel's existing decision boundary with a compact typed
+recovery-state projection distinguishing implementation repair, strategy
+change, missing-capability creation, stale-dependency revalidation, authority
+request and stopping.
+
+These are admissible options supported by observed failure, not an automatic
+cascade. Re-evaluate them after material state changes such as failed tests,
+discovered dependencies, changed project indexes or successful repair.
+
+Completion criterion: for unrelated controlled failure classes, Athena chooses
+the appropriate existing mechanism instead of repeatedly attempting source
+repair or generating unnecessary tools.
+
+## Useful but secondary implementations
+
+### Live skill-file synchronization
+
+Add an inexpensive revision-aware refresh path from `SkillLoader` into the
+running lifecycle catalog. Report same-version content conflicts and preserve
+the current turn's skill snapshot. Database-promoted skills already have a
+dynamic retrieval path; this specifically addresses file-backed additions and
+edits.
+
+### Bounded parallel speculative comparison
+
+`fusion/comparison.py` currently evaluates proposals sequentially. Independent
+candidates may execute concurrently only with separate workspaces, immutable
+base identities and individual budgets. Selection and promotion remain
+serialized. This is a latency improvement, not a prerequisite for adaptive
+reasoning.
+
+### Composed behavioral acceptance
+
+`tests/e2e/test_capability_reliability.py` exercises the real kernel with a
+deterministic provider but supplies controlled Fusion results rather than
+running the full Fusion/Shadow/Reality path. Add a composed test for genuine
+candidate execution, correction, verification and promotion, followed by a
+small live-model evaluation on unfamiliar tasks.
+
+## Implementation boundary to preserve
+
+| Mechanism | Responsibility |
+|---|---|
+| Kernel | Selects the next action, decides whether improvement is worthwhile and manages the bounded recovery allowance. |
+| Fusion | Creates and compares isolated candidate work and returns structured outcomes. |
+| Synthesis | Creates, repairs and validates task-local tools and returns versioned proof. |
+| Knowledge | Records attributable observations and proposes reusable procedures. |
+| Skill/workflow lifecycle | Validates, versions, exposes and explicitly promotes reusable knowledge. |
+| RealityCoordinator | Independently verifies and governs candidate changes before they become real. |
+
+The immediate priorities are M-01 through M-04 and the workflow
+generalization defect. Together they close the central gap between having
+advanced capabilities and reliably combining them into a self-improving task
+workflow.
+
+M-05 through M-07 then make those capabilities easier to discover, safer to
+promote and more appropriate to invoke. Parallelism should come after the
+composed sequential behavior is proven; otherwise it risks making incomplete
+feedback loops faster without making them more reliable.
