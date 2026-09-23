@@ -98,6 +98,7 @@ class DispatchOrdering(_Mechanism):
         *,
         directives: DispatchDirectives | None = None,
         descriptor: Any | None = None,
+        executor: Any | None = None,
     ) -> list[tuple[asyncio.Lock, ReferenceCountedKeyedLocks]]:
         """Ordering for one call, or [] when it may parallelize.
 
@@ -112,6 +113,8 @@ class DispatchOrdering(_Mechanism):
         their implementation awaits child dispatches, and holding the child
         operation lane across that await is not reentrant.
         """
+        if getattr(executor, "mediates_nested_dispatch", False):
+            return []
         if not _is_ordering_sensitive(effects):
             return []
         # A trusted reality route has already selected an isolated execution
@@ -241,12 +244,11 @@ class DispatchOrdering(_Mechanism):
             raise RuntimeError("capability dispatch requires a running asyncio task")
         held = self._d._task_held_locks.setdefault(current, set())
 
-        resource_keys = (
+        executor = getattr(prepared, "executor", None)
+        resource_keys = () if getattr(executor, "mediates_nested_dispatch", False) else (
             prepared.resource_keys
             if isinstance(prepared, PreparedCapabilityCall)
-            else self.resource_keys_for(
-                request, workspace, effects, executor=getattr(prepared, "executor", None)
-            )
+            else self.resource_keys_for(request, workspace, effects, executor=executor)
         )
 
         async def invoke_with_locks():
@@ -262,6 +264,7 @@ class DispatchOrdering(_Mechanism):
                 batch_order_lock,
                 directives=effective_directives,
                 descriptor=descriptor,
+                executor=executor,
             )
             # Reservation is the ownership boundary, not lock state.  Acquire
             # all ambient and resource locks as one transaction so cancellation

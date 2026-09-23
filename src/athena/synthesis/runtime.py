@@ -142,7 +142,13 @@ class PersistentGeneratedSession:
         if process is None:
             return ProcessKillOutcome(proven_dead=True, already_dead=True)
         outcome = await kill_tree_async(process, timeout=1.0)
-        if outcome.proven_dead:
+        # A process that exited before cleanup cannot satisfy the stronger
+        # process-tree proof contract, but its session handle must still be
+        # retired when no owned descendants remain.  Keeping a dead handle in
+        # the session map would allow a later call to reuse a runtime that no
+        # longer exists; the conservative cleanup obligation remains owned by
+        # the process-tree outcome.
+        if outcome.proven_dead or (outcome.already_dead and not outcome.survivors):
             self._process = None
         if outcome.proven_dead and self._stderr_task is not None:
             self._stderr_task.cancel()

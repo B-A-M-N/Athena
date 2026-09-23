@@ -16,11 +16,27 @@ class GeneratedCapabilityVerifier:
         if validation.get("all_passed") is not True:
             failures.append("behavioral validation is not fully passing")
         details = validation.get("details") or ()
-        if any(not isinstance(item, dict) or item.get("passed") is not True for item in details):
+        if (
+            not isinstance(details, (list, tuple))
+            or not details
+            or int(validation.get("cases_total") or 0) != len(details)
+            or int(validation.get("cases_passed") or 0)
+            != sum(1 for item in details if isinstance(item, dict) and item.get("passed") is True)
+            or any(not isinstance(item, dict) or item.get("passed") is not True for item in details)
+        ):
             failures.append("a positive validation case is not proven")
         negative = validation.get("negative_cases") or ()
-        if not negative or any(
-            not isinstance(item, dict) or item.get("passed") is not True for item in negative
+        if (
+            not isinstance(negative, (list, tuple))
+            or not negative
+            or int(validation.get("negative_cases_total") or 0) != len(negative)
+            or int(validation.get("negative_cases_passed") or 0)
+            != sum(
+                1 for item in negative if isinstance(item, dict) and item.get("passed") is True
+            )
+            or any(
+                not isinstance(item, dict) or item.get("passed") is not True for item in negative
+            )
         ):
             failures.append("negative input boundary is not proven")
         effective = {str(value) for value in capability.effective_effects}

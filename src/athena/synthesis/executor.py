@@ -28,6 +28,11 @@ _logger = logging.getLogger("athena.synthesis.runtime")
 class GeneratedExecutor:
     """Execute one already-validated generated capability record."""
 
+    # Generated code can re-enter the canonical dispatcher through its framed
+    # host API.  The child operation, not this envelope, must own concrete
+    # resource ordering while that nested dispatch is awaited.
+    mediates_nested_dispatch = True
+
     def __init__(
         self,
         engine: Any,

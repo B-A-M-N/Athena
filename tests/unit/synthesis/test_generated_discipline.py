@@ -127,6 +127,21 @@ class TestEffectAuthority:
         assert review["passed"] is False
         assert review["promotion_authority"] is False
 
+    def test_generated_verifier_rejects_empty_positive_receipts(self):
+        cap = _cap(effects=frozenset({"READ_LOCAL"}))
+        cap.validation = {
+            "all_passed": True,
+            "cases_total": 0,
+            "cases_passed": 0,
+            "details": [],
+            "negative_cases_total": 1,
+            "negative_cases_passed": 1,
+            "negative_cases": [{"passed": True}],
+        }
+        review = GeneratedCapabilityVerifier.review(cap)
+        assert review["passed"] is False
+        assert any("positive validation case" in failure for failure in review["failures"])
+
 
 def _cap(effects) -> SyntheticCapability:
     return SyntheticCapability(

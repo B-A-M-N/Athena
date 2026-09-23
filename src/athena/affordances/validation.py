@@ -62,7 +62,11 @@ class SourceValidation:
         # A timeout or infrastructure failure is not evidence that source is
         # invalid.  It is still a non-passing validation result, so callers
         # cannot accidentally promote unvalidated code.
-        return all(check.status in {"passed", "skipped"} for check in self.checks)
+        required = {"parse", "interface", "security"}
+        names = {check.name for check in self.checks}
+        return bool(self.checks) and required.issubset(names) and all(
+            check.status in {"passed", "skipped"} for check in self.checks
+        )
 
     @property
     def outcome(self) -> str:
