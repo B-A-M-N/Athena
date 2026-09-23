@@ -165,6 +165,29 @@ class ExecutionManager:
     def has_runtime(self, name: str) -> bool:
         return self._runtime_readiness.has_runtime(name)
 
+    def validate_execution_request(self, request: ExecutionRequest) -> None:
+        """Reject limits that the selected execution boundary cannot enforce."""
+        self._validate_resource_limits(
+            request.backend, request.runtime, request.resource_limits
+        )
+
+    def _validate_resource_limits(self, backend: str, runtime: str, resource_limits) -> None:
+        if resource_limits is None:
+            return
+        selected_backend = self._selected_backend(backend)
+        if selected_backend is not None:
+            capabilities = selected_backend.capabilities()
+            if not bool(getattr(capabilities, "resource_limits", False)):
+                raise RuntimeError(
+                    f"backend {backend!r} does not enforce resource limits"
+                )
+            return
+        runtime_impl = self._resolve(runtime)
+        if not bool(getattr(runtime_impl, "supports_resource_limits", False)):
+            raise RuntimeError(
+                f"runtime {runtime!r} does not enforce resource limits"
+            )
+
     def has_live_runtime(self, task_id: str) -> bool:
         """Return whether this task currently owns an execution/session."""
         if self._cancellation_registry.task_sessions.get(task_id):
@@ -185,6 +208,7 @@ class ExecutionManager:
         network_policy: str | None = None,
         resource_limits=None,
     ) -> str:
+        self._validate_resource_limits(backend, runtime, resource_limits)
         return await self._sessions.create_session(
             task_id=task_id,
             runtime=runtime,

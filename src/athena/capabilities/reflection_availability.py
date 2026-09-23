@@ -10,6 +10,10 @@ from athena.protocol.errors import CapabilityUnavailable
 
 __all__ = ["explain_availability"]
 
+_BLOCKING_STATUSES = frozenset(
+    {"missing", "blocked", "denied", "stale", "open", "unavailable", "incompatible", "probing"}
+)
+
 
 async def explain_availability(
     reflection,
@@ -202,9 +206,7 @@ async def explain_availability(
             preconditions.append("capability effects exceed the task ceiling")
     checks.append({"kind": "policy", "status": policy_status, "effects": sorted(effect_values)})
 
-    blocked = any(
-        item["status"] in {"missing", "blocked", "denied", "stale", "open"} for item in checks
-    )
+    blocked = any(item["status"] in _BLOCKING_STATUSES for item in checks)
     approval = any(item["status"] == "approval_required" for item in checks)
     status = "BLOCKED" if blocked else "REQUIRES_APPROVAL" if approval else "AVAILABLE"
     return {

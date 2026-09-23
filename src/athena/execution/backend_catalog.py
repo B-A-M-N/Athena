@@ -39,6 +39,14 @@ class BackendCatalog:
     def get(self, name: str) -> ExecutionBackend | None:
         return self._backends.get(name)
 
+    def _proof_fields(self, name: str) -> dict[str, Any]:
+        passport = self._passports.get(name)
+        status = str(passport.get("status") or "") if passport else ""
+        return {
+            "proof_status": "verified" if status == "PASS" else "unverified",
+            "passport_status": status or None,
+        }
+
     def names(self) -> list[str]:
         return sorted(self._backends)
 
@@ -49,9 +57,34 @@ class BackendCatalog:
         available_runtimes: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Return availability for the full backend inventory."""
-        result = [{"id": "local", "available": True, "healthy": True}]
+        runtimes = tuple(available_runtimes or ())
+        local_available = bool(runtimes)
+        result = [
+            {
+                "id": "local",
+                "physical_backend": getattr(local_backend, "name", "local")
+                if local_backend is not None
+                else "local-runtime-manager",
+                "recognized": True,
+                "available": local_available,
+                "healthy": local_available,
+                "runtimes": list(runtimes),
+                **self._proof_fields(
+                    getattr(local_backend, "name", "local")
+                    if local_backend is not None
+                    else "local"
+                ),
+            }
+        ]
         if local_backend is not None:
             result[0]["implementation"] = type(local_backend).__name__
+            probe = getattr(local_backend, "available", None)
+            if callable(probe):
+                try:
+                    result[0]["available"] = bool(probe()) and local_available
+                except Exception:  # rationale: failed availability probe is unhealthy
+                    result[0]["available"] = False
+                result[0]["healthy"] = result[0]["available"]
             passport = self._passports.get(getattr(local_backend, "name", "local"))
             if passport is not None:
                 result[0]["passport"] = dict(passport)
@@ -69,14 +102,17 @@ class BackendCatalog:
             if callable(probe):
                 try:
                     available = bool(probe())
-                except Exception:
+                except Exception:  # rationale: failed availability probe is unhealthy
                     available = False
             result.append(
                 {
                     "id": name,
+                    "physical_backend": name,
+                    "recognized": True,
                     "available": available,
                     "healthy": available,
                     "implementation": type(backend).__name__,
+                    **self._proof_fields(name),
                 }
             )
             passport = self._passports.get(name)

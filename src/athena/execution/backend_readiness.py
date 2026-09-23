@@ -8,6 +8,8 @@ the canonical backend resolver used by the readiness queries.
 from __future__ import annotations
 
 from collections.abc import Callable
+import os
+import shutil
 from typing import Any
 
 from athena.execution.backend import ExecutionBackend
@@ -18,6 +20,15 @@ __all__ = ["BackendReadiness"]
 
 class BackendReadiness:
     """Expose backend inventory and readiness through manager-owned ports."""
+
+    _BUILTIN_ALIASES = (
+        "local",
+        "sandboxed-local",
+        "shadow",
+        "sandbox",
+        "verification",
+    )
+    _ISOLATED_ALIASES = {"sandboxed-local", "shadow", "sandbox", "verification"}
 
     def __init__(
         self,
@@ -35,22 +46,33 @@ class BackendReadiness:
         self._available_backends = available_backends
 
     def available_backends(self) -> list[str]:
-        return ["local", "sandboxed-local", *self._catalog.names()]
+        return [*self._BUILTIN_ALIASES, *self._catalog.names()]
 
     def backend_status(self) -> list[dict[str, Any]]:
-        return self._catalog.status(
+        result = self._catalog.status(
             local_backend=self._local_backend(),
             available_runtimes=self._available_runtimes(),
         )
+        for alias in self._BUILTIN_ALIASES:
+            if alias == "local":
+                continue
+            status = self._builtin_status(alias)
+            status["id"] = alias
+            result.append(status)
+        return result
 
     def backend_capabilities(self, name: str = "local") -> Any:
         selected = self._selected_backend(name)
         if selected is not None:
             return selected.capabilities()
-        if name in {"local", "sandboxed-local"}:
-            runtimes = tuple(self._available_runtimes())
+        if name in self._BUILTIN_ALIASES:
+            status = self._builtin_status(name)
+            runtimes = tuple(status["runtimes"])
             return {
                 "supported_runtimes": runtimes,
+                "physical_backend": status["physical_backend"],
+                "isolation_required": status["isolation_required"],
+                "isolation_verified": status["isolation_verified"],
                 "dependency_installation": tuple(
                     manager
                     for manager, runtime in (("python", "python"), ("node", "node"))
@@ -69,11 +91,35 @@ class BackendReadiness:
         selected = self._selected_backend(canonical)
         if selected is not None:
             return selected
-        if canonical in {"local", "sandboxed-local", "shadow", "sandbox", "verification"}:
-            return {"backend": canonical, "available": True, "runtime": "local"}
+        if canonical in self._BUILTIN_ALIASES:
+            return self._builtin_status(canonical)
         raise RuntimeError(
             f"no such execution backend: {canonical!r}; registered: {self._available_backends()}"
         )
+
+    def _builtin_status(self, name: str) -> dict[str, Any]:
+        runtimes = tuple(self._available_runtimes())
+        isolated = name in self._ISOLATED_ALIASES
+        bwrap_available = os.name != "nt" and shutil.which("bwrap") is not None
+        available = bool(runtimes) and (not isolated or bwrap_available)
+        if not runtimes:
+            reason = "no concrete runtimes are registered"
+        elif isolated and not bwrap_available:
+            reason = "bubblewrap is unavailable for the requested isolation boundary"
+        else:
+            reason = ""
+        return {
+            "backend": name,
+            "physical_backend": "local-runtime-manager",
+            "runtime": "local",
+            "recognized": True,
+            "available": available,
+            "proof_status": "unverified",
+            "isolation_required": isolated,
+            "isolation_verified": bool(available and isolated),
+            "runtimes": list(runtimes),
+            **({"error": reason} if reason else {}),
+        }
 
     async def check_backend(self, name: str | None = None) -> dict[str, Any]:
         """Prove effective availability for the backend execution would use."""
@@ -91,7 +137,16 @@ class BackendReadiness:
             detail = str(exc)
         return {
             "backend": getattr(resolved, "name", name or "local"),
+            "recognized": True,
             "available": available,
+            "proof_status": (
+                "verified"
+                if (self._catalog.get_passport(getattr(resolved, "name", name or "local")) or {}).get(
+                    "status"
+                )
+                == "PASS"
+                else "unverified"
+            ),
             "implementation": type(resolved).__name__,
             **({"error": detail} if detail else {}),
         }

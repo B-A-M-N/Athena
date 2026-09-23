@@ -31,6 +31,7 @@ class LocalBackend(ExecutionBackend):
             reattach=False,
             filesystem_persistence=True,
             network_modes=("allow", "deny", "restricted"),
+            resource_limits=True,
             secret_materialization=True,
             interactive_stdin=True,
             process_signals=True,

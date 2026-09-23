@@ -36,6 +36,7 @@ class ExecutionStreamCoordinator:
     ) -> AsyncIterator[ExecutionEvent]:
         manager = self._manager
         execution_id = execution_id or new_id("exec")
+        manager.validate_execution_request(request)
         manager._cancellation_registry.executions[execution_id] = request.task_id
         selected_backend = manager._selected_backend(request.backend)
         runtime: Any = selected_backend or manager._resolve(request.runtime)

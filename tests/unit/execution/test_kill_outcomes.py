@@ -10,6 +10,8 @@ from __future__ import annotations
 import subprocess
 import sys
 import time
+import os
+import signal
 from types import SimpleNamespace
 
 import pytest
@@ -75,8 +77,30 @@ def test_kill_tree_reports_proven_death():
     assert process.poll() is not None  # child exited on its own
     outcome = kill_tree(process)
     assert isinstance(outcome, ProcessKillOutcome)
-    assert outcome.proven_dead is True
+    assert outcome.proven_dead is False
     assert outcome.already_dead is True
+    assert outcome.cleanup_obligation
+
+
+def test_kill_tree_does_not_claim_proof_after_root_exits_before_capture():
+    source = (
+        "import subprocess, sys; "
+        "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], "
+        "start_new_session=True); "
+        "print(child.pid, flush=True)"
+    )
+    process = spawn_owned([sys.executable, "-c", source], stdout=subprocess.PIPE, text=True)
+    child_pid = int(process.stdout.readline().strip())
+    process.wait(timeout=5)
+    try:
+        outcome = kill_tree(process)
+        assert outcome.proven_dead is False
+        assert outcome.cleanup_obligation
+    finally:
+        try:
+            os.kill(child_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 @pytest.mark.athena_claim("BHV-062")

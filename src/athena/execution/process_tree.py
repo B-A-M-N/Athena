@@ -18,6 +18,7 @@ import time
 import asyncio
 from dataclasses import dataclass, field
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 try:
@@ -27,7 +28,7 @@ except ImportError:  # pragma: no cover - Windows does not expose POSIX rlimits
 
 try:
     import psutil  # type: ignore
-except Exception:  # pragma: no cover - psutil is optional
+except Exception:  # rationale: psutil is optional; portable fallback remains available
     psutil = None
 
 
@@ -46,6 +47,7 @@ class ProcessKillOutcome:
     proven_dead: bool
     survivors: tuple[int, ...] = field(default_factory=tuple)
     already_dead: bool = False
+    cleanup_obligation: str | None = None
 
 
 _MINIMAL_ENV_KEYS = (
@@ -65,6 +67,55 @@ _MINIMAL_ENV_KEYS = (
     "TERM",
 )
 _WINDOWS_ENV_KEYS = ("SYSTEMROOT", "WINDIR", "PATHEXT", "COMSPEC", "USERPROFILE", "SystemDrive")
+
+
+def _create_process_cgroup() -> str | None:
+    """Create a private cgroup when the host grants a writable cgroup v2 root."""
+    root = Path("/sys/fs/cgroup")
+    if os.name == "nt" or not (root / "cgroup.controllers").is_file():
+        return None
+    if not os.access(root, os.W_OK | os.X_OK):
+        return None
+    path = root / f"athena-{os.getpid()}-{time.monotonic_ns()}"
+    try:
+        path.mkdir()
+    except OSError:
+        return None
+    return str(path)
+
+
+def _join_process_cgroup(path: str) -> None:
+    try:
+        with open(Path(path) / "cgroup.procs", "w", encoding="ascii") as handle:
+            handle.write(str(os.getpid()))
+    except OSError:
+        # The parent verifies membership after spawn and falls back to process
+        # group ownership when the child cannot join the optional cgroup.
+        pass
+
+
+def _cgroup_pids(path: str | None) -> set[int]:
+    if not path:
+        return set()
+    try:
+        return {
+            int(value)
+            for value in (Path(path) / "cgroup.procs").read_text(encoding="ascii").split()
+            if int(value) > 0
+        }
+    except (OSError, ValueError):
+        return set()
+
+
+def _remove_process_cgroup(path: str | None) -> None:
+    if not path:
+        return
+    try:
+        Path(path).rmdir()
+    except OSError:
+        # A non-empty cgroup is retained as an operator-visible cleanup
+        # obligation; an already-removed cgroup needs no further action.
+        pass
 
 
 def spawn_owned(
@@ -150,12 +201,15 @@ def spawn_owned(
         # cwd to Popen would be both redundant and misleading.
         cwd = None
     existing_preexec = popen_kwargs.pop("preexec_fn", None)
-    if resource_limits is not None or existing_preexec is not None:
+    cgroup_path = _create_process_cgroup()
+    if resource_limits is not None or existing_preexec is not None or cgroup_path is not None:
         def _preexec() -> None:
             if resource_limits is not None:
                 _apply_resource_limits(resource_limits)
             if existing_preexec is not None:
                 existing_preexec()
+            if cgroup_path is not None:
+                _join_process_cgroup(cgroup_path)
 
         popen_kwargs["preexec_fn"] = _preexec
     kwargs: dict = {"env": my_env}
@@ -164,7 +218,22 @@ def spawn_owned(
     if os.name != "nt":
         kwargs["start_new_session"] = True
     kwargs.update(popen_kwargs)
-    return subprocess.Popen(argv, **kwargs)
+    try:
+        process = subprocess.Popen(argv, **kwargs)
+    except (OSError, ValueError, TypeError):
+        _remove_process_cgroup(cgroup_path)
+        raise
+    if cgroup_path is not None and process.pid not in _cgroup_pids(cgroup_path):
+        _remove_process_cgroup(cgroup_path)
+        cgroup_path = None
+    if cgroup_path is not None:
+        setattr(process, "_athena_cgroup_path", cgroup_path)
+    if os.name != "nt":
+        try:
+            setattr(process, "_athena_process_group_id", os.getpgid(process.pid))
+        except ProcessLookupError:
+            pass
+    return process
 
 
 def _apply_resource_limits(limits: Any) -> None:
@@ -445,9 +514,37 @@ def child_pids(root_pid: int) -> list[int]:
         return []
 
 
-def _capture_owned_processes(root_pid: int) -> dict[int, str | None]:
+def _processes_in_group(pgid: int | None) -> set[int]:
+    if os.name == "nt" or pgid is None:
+        return set()
+    result: set[int] = set()
+    for raw_pid in os.listdir("/proc"):
+        if not raw_pid.isdigit():
+            continue
+        pid = int(raw_pid)
+        try:
+            with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
+                _prefix, separator, remainder = handle.read().rpartition(")")
+            if separator and int(remainder.split()[2]) == pgid:
+                result.add(pid)
+        except (OSError, ValueError, IndexError):
+            continue
+    return result
+
+
+def _capture_owned_processes(
+    root_pid: int,
+    *,
+    process_group: int | None = None,
+    cgroup_path: str | None = None,
+) -> dict[int, str | None]:
     """Capture root/descendant identities before the root can disappear."""
-    pids = {root_pid, *child_pids(root_pid)}
+    pids = {
+        root_pid,
+        *child_pids(root_pid),
+        *_processes_in_group(process_group),
+        *_cgroup_pids(cgroup_path),
+    }
     return {pid: process_start_identity(pid) for pid in pids if pid > 0}
 
 
@@ -501,13 +598,13 @@ def _reap(process: "subprocess.Popen", timeout: float) -> None:
     except subprocess.TimeoutExpired:
         try:
             process.kill()
-        except Exception:
+        except Exception:  # rationale: cleanup escalation must continue
             pass
         try:
             process.wait(timeout=timeout)
-        except Exception:
+        except Exception:  # rationale: cleanup escalation must continue
             pass
-    except Exception:
+    except Exception:  # rationale: failed wait is reported by the caller's outcome
         pass
 
 
@@ -523,28 +620,54 @@ def kill_tree(process: "subprocess.Popen", *, timeout: float = 3.0) -> ProcessKi
     root survived the escalation ladder, so shutdown can report it instead
     of the failure hiding in a log line.
     """
-    captured = _capture_owned_processes(process.pid)
+    cgroup_path = getattr(process, "_athena_cgroup_path", None)
+    pgid = process_group_id(process) or getattr(process, "_athena_process_group_id", None)
+    captured = _capture_owned_processes(
+        process.pid,
+        process_group=pgid,
+        cgroup_path=cgroup_path,
+    )
     if process.poll() is not None:
-        survivors = tuple(
-            pid for pid, identity in captured.items() if pid != process.pid and _process_alive(pid, identity)
-        )
+        for pid, identity in captured.items():
+            if pid == process.pid or not _process_alive(pid, identity):
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+        survivors = _wait_for_owned_exit(captured, timeout=min(timeout, 1.0))
+        if not survivors:
+            _remove_process_cgroup(cgroup_path)
+        ownership_proven = cgroup_path is not None and not survivors
         return ProcessKillOutcome(
-            proven_dead=not survivors,
+            proven_dead=ownership_proven,
             survivors=survivors,
             already_dead=True,
+            cleanup_obligation=(
+                f"owned process descendants remain after root exit: {survivors}"
+                if survivors
+                else "root exited before the owned process tree could be proven"
+            ),
         )
-    pgid = process_group_id(process)
     if os.name == "nt":
         try:
             process.kill()
-        except Exception:
+        except Exception:  # rationale: fall back to direct process termination
             pass
         _reap(process, 5.0)
         dead = process.poll() is not None
-        survivors = tuple(
-            pid for pid, identity in captured.items() if pid != process.pid and _process_alive(pid, identity)
+        survivors = _wait_for_owned_exit(captured, timeout=min(timeout, 1.0))
+        if not survivors:
+            _remove_process_cgroup(cgroup_path)
+        return ProcessKillOutcome(
+            proven_dead=dead and not survivors,
+            survivors=survivors,
+            cleanup_obligation=(
+                f"owned process descendants remain after termination: {survivors}"
+                if survivors
+                else None
+            ),
         )
-        return ProcessKillOutcome(proven_dead=dead and not survivors, survivors=survivors)
 
     assert pgid is not None  # POSIX + live process (checked above) implies a pgid
     try:
@@ -554,7 +677,7 @@ def kill_tree(process: "subprocess.Popen", *, timeout: float = 3.0) -> ProcessKi
     except Exception:
         try:
             process.terminate()
-        except Exception:
+        except Exception:  # rationale: process-group escalation is best effort
             pass
 
     deadline = time.monotonic() + timeout
@@ -566,7 +689,7 @@ def kill_tree(process: "subprocess.Popen", *, timeout: float = 3.0) -> ProcessKi
             os.killpg(pgid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        except Exception:
+        except Exception:  # rationale: descendant cleanup is best effort
             pass
     # A detached descendant is no longer in the root's process group and the
     # root may already have exited by the time the escalation branch runs.
@@ -579,7 +702,7 @@ def kill_tree(process: "subprocess.Popen", *, timeout: float = 3.0) -> ProcessKi
                 os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        except Exception:
+        except Exception:  # rationale: platform interrupt fallback is best effort
             pass
 
     _reap(process, timeout=5.0)
@@ -594,7 +717,17 @@ def kill_tree(process: "subprocess.Popen", *, timeout: float = 3.0) -> ProcessKi
 
     dead = process.poll() is not None
     survivors = _wait_for_owned_exit(captured, timeout=min(timeout, 1.0))
-    return ProcessKillOutcome(proven_dead=dead and not survivors, survivors=survivors)
+    if not survivors:
+        _remove_process_cgroup(cgroup_path)
+    return ProcessKillOutcome(
+        proven_dead=dead and not survivors,
+        survivors=survivors,
+        cleanup_obligation=(
+            f"owned process descendants remain after termination: {survivors}"
+            if survivors
+            else None
+        ),
+    )
 
 
 async def kill_tree_async(process: Any, *, timeout: float = 3.0) -> ProcessKillOutcome:
@@ -607,24 +740,55 @@ async def kill_tree_async(process: Any, *, timeout: float = 3.0) -> ProcessKillO
     """
     if process is None or process.returncode is not None:
         pid = int(getattr(process, "pid", 0) or 0)
-        captured = _capture_owned_processes(pid) if pid else {}
-        survivors = tuple(
-            child for child, identity in captured.items() if _process_alive(child, identity)
+        cgroup_path = getattr(process, "_athena_cgroup_path", None)
+        pgid = getattr(process, "_athena_process_group_id", None)
+        captured = (
+            _capture_owned_processes(pid, process_group=pgid, cgroup_path=cgroup_path)
+            if pid
+            else {}
         )
+        for child, identity in captured.items():
+            if child == pid or not _process_alive(child, identity):
+                continue
+            try:
+                os.kill(child, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+        survivors = _wait_for_owned_exit(captured, timeout=min(timeout, 1.0))
+        if not survivors:
+            _remove_process_cgroup(cgroup_path)
+        ownership_proven = cgroup_path is not None and not survivors
         return ProcessKillOutcome(
-            proven_dead=not survivors,
+            proven_dead=ownership_proven,
             survivors=survivors,
             already_dead=True,
+            cleanup_obligation=(
+                f"owned process descendants remain after root exit: {survivors}"
+                if survivors
+                else "root exited before the owned process tree could be proven"
+            ),
         )
     pid = int(process.pid)
-    captured = _capture_owned_processes(pid)
+    cgroup_path = getattr(process, "_athena_cgroup_path", None)
+    captured = _capture_owned_processes(
+        pid,
+        process_group=getattr(process, "_athena_process_group_id", None),
+        cgroup_path=cgroup_path,
+    )
     if os.name == "nt":
         try:
             process.kill()
         except ProcessLookupError:
             pass
         await _wait_async_process(process, timeout=5.0)
-        return ProcessKillOutcome(proven_dead=process.returncode is not None)
+        return ProcessKillOutcome(
+            proven_dead=process.returncode is not None,
+            cleanup_obligation=(
+                "Windows process-tree descendants could not be enumerated"
+                if process.returncode is not None
+                else "Windows process root did not terminate"
+            ),
+        )
 
     try:
         pgid = os.getpgid(pid)
@@ -670,9 +834,16 @@ async def kill_tree_async(process: Any, *, timeout: float = 3.0) -> ProcessKillO
         except (ProcessLookupError, PermissionError):
             pass
     survivors = _wait_for_owned_exit(captured, timeout=min(timeout, 1.0))
+    if not survivors:
+        _remove_process_cgroup(cgroup_path)
     return ProcessKillOutcome(
         proven_dead=process.returncode is not None and not survivors,
         survivors=survivors,
+        cleanup_obligation=(
+            f"owned process descendants remain after termination: {survivors}"
+            if survivors
+            else None
+        ),
     )
 
 
@@ -690,7 +861,7 @@ def interrupt_group(process: "subprocess.Popen") -> None:
     if os.name == "nt":
         try:
             process.kill()
-        except Exception:
+        except Exception:  # rationale: failed interrupt is observable by the owner
             pass
         _reap(process, 5.0)
         return

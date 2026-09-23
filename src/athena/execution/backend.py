@@ -50,6 +50,7 @@ class BackendCapabilities:
     filesystem_containment: bool = False
     network_modes: tuple[str, ...] = ()
     network_containment: bool = False
+    resource_limits: bool = False
     secret_materialization: bool = False
     interactive_stdin: bool = False
     process_signals: bool = False

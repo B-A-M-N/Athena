@@ -45,6 +45,7 @@ class BaseRuntime(metaclass=abc.ABCMeta):
     """Abstract base for persistent, process-backed runtimes."""
 
     name: str = ""  # required: unique runtime name
+    supports_resource_limits: bool = os.name != "nt"
     aliases: tuple[str, ...] = ()
     persistence: str = "persistent"
 
