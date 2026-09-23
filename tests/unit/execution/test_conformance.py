@@ -107,6 +107,24 @@ def test_empty_or_incomplete_backend_passports_fail_closed():
     )
 
 
+def test_backend_passport_rejects_cells_from_another_backend():
+    passport = BackendPassport(
+        backend="local",
+        release_sha="sha",
+        release_run_id="run",
+        environment={"platform": "fixture"},
+        expected_runtimes=("python",),
+        receipts=(
+            ConformanceReceipt(
+                backend="container",
+                runtime="python",
+                checks=("execution",),
+            ),
+        ),
+    )
+    assert passport.status == "FAIL"
+
+
 def test_proof_status_is_shared_by_receipts_and_operator_projection():
     receipt = ConformanceReceipt(
         backend="fixture",

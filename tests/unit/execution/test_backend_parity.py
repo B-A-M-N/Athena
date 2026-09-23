@@ -162,6 +162,7 @@ def test_backend_passport_is_unverified_without_runtime_binding_expectations():
         "expected_runtimes": ["python"],
         "cells": [
             {
+                "backend": "local",
                 "runtime": "python",
                 "passed": True,
                 "checks": ["execution"],

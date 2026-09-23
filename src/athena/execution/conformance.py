@@ -47,20 +47,20 @@ def passport_binding_errors(
         errors.append("unsupported passport kind")
     if str(passport.get("backend") or "") != str(backend):
         errors.append("backend identity mismatch")
-    release_sha = str(passport.get("release_sha") or "")
-    release_run_id = str(passport.get("release_run_id") or "")
+    release_sha = str(passport.get("release_sha") or "").strip()
+    release_run_id = str(passport.get("release_run_id") or "").strip()
     if not release_sha:
         errors.append("missing release source identity")
     if not release_run_id:
         errors.append("missing release run identity")
-    if expected_release_sha is None or release_sha != str(expected_release_sha):
+    if expected_release_sha is None or release_sha != str(expected_release_sha).strip():
         errors.append("release source identity is not bound to the running deployment")
-    if expected_release_run_id is None or release_run_id != str(expected_release_run_id):
+    if expected_release_run_id is None or release_run_id != str(expected_release_run_id).strip():
         errors.append("release run identity is not bound to the running deployment")
     environment = passport.get("environment")
     if not isinstance(environment, Mapping) or not environment:
         errors.append("missing certification environment identity")
-    if expected_environment is None:
+    if not isinstance(expected_environment, Mapping) or not expected_environment:
         errors.append("certification environment expectation is not supplied")
     elif not isinstance(environment, Mapping) or any(
         environment.get(key) != value for key, value in expected_environment.items()
@@ -76,11 +76,16 @@ def passport_binding_errors(
         runtimes = [str(cell.get("runtime") or "") for cell in cells if isinstance(cell, Mapping)]
         if len(runtimes) != len(cells) or len(set(runtimes)) != len(runtimes):
             errors.append("backend runtime cells are duplicated or malformed")
-        if set(runtimes) != {str(item) for item in expected}:
+        expected_values = [str(item) for item in expected]
+        if len(expected_values) != len(set(expected_values)):
+            errors.append("advertised runtime inventory is duplicated")
+        if set(runtimes) != set(expected_values):
             errors.append("backend runtime cells do not match advertised inventory")
     if passport.get("status") != "PASS":
         errors.append("passport status is not PASS")
     for cell in cells if isinstance(cells, list) else ():
+        if not isinstance(cell, Mapping) or str(cell.get("backend") or "") != str(backend):
+            errors.append("backend runtime cell identity does not match passport")
         if not isinstance(cell, Mapping) or cell.get("passed") is not True:
             errors.append("backend runtime cell did not pass")
         if cell.get("unverified_claims"):
@@ -174,12 +179,17 @@ class BackendPassport:
         return (
             "PASS"
             if complete
-            and bool(self.release_sha)
-            and bool(self.release_run_id)
+            and bool(str(self.release_sha).strip())
+            and bool(str(self.release_run_id or "").strip())
             and bool(self.environment)
-            and self.backend != "unknown"
+            and str(self.backend).strip() not in {"", "unknown"}
             and all(receipt.proof_status == "passed" for receipt in self.receipts)
             and not self.unverified_claims
+            and all(
+                str(receipt.backend).strip() == str(self.backend).strip()
+                and bool(str(receipt.runtime).strip())
+                for receipt in self.receipts
+            )
             else "FAIL"
         )
 
