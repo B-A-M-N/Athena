@@ -37,6 +37,7 @@ from athena.protocol.execution import (
     ExecutionEvent,
     ExecutionRequest,
 )
+from athena.protocol.tasks import NetworkPolicy
 
 __all__ = ["BaseRuntime"]
 
@@ -51,6 +52,7 @@ class BaseRuntime(metaclass=abc.ABCMeta):
 
     def __init__(self) -> None:
         self._sessions: dict[str, Any] = {}
+        self._session_tasks: dict[str, str] = {}
         # execution_id -> session id (interrupt registry, BHV-061 ownership).
         self._exec_owner: dict[str, str] = {}
         # Serialize one session at a time; the keyed lock is released after each execution.
@@ -59,8 +61,9 @@ class BaseRuntime(metaclass=abc.ABCMeta):
     # ------------------------------------------------------------------ #
     # Concrete session bookkeeping (shared scaffolding)
     # ------------------------------------------------------------------ #
-    def _register_session(self, runtime_session_id: str, session: Any) -> None:
+    def _register_session(self, runtime_session_id: str, session: Any, *, task_id: str) -> None:
         self._sessions[runtime_session_id] = session
+        self._session_tasks[runtime_session_id] = task_id
 
     def _session_for(self, runtime_session_id: str) -> Any:
         return self._sessions[runtime_session_id]
@@ -80,6 +83,11 @@ class BaseRuntime(metaclass=abc.ABCMeta):
             session = self._sessions.get(sid)
             if session is None:
                 raise PermissionError(f"unknown runtime session {sid}")
+            if self._session_tasks.get(sid) != request.task_id:
+                raise PermissionError(
+                    f"runtime session {sid} belongs to task "
+                    f"{self._session_tasks.get(sid)}, not {request.task_id}"
+                )
             if not self._request_matches_session(request, session):
                 raise PermissionError(
                     f"security-sensitive identity of runtime session {sid} cannot be changed"
@@ -90,11 +98,15 @@ class BaseRuntime(metaclass=abc.ABCMeta):
             existing = self._sessions[existing_sid]
             if self._request_matches_session(request, existing):
                 return existing_sid, existing
-            runtime_session_id = f"{self.name}_{request.task_id}_{len(self._sessions) + 1}"
-            self._register_session(runtime_session_id, self._make_session_for_request(request))
-            return runtime_session_id, self._sessions[runtime_session_id]
+            raise PermissionError(
+                f"security-sensitive identity of runtime session {existing_sid} cannot be changed"
+            )
         runtime_session_id = existing_sid
-        self._register_session(runtime_session_id, self._make_session_for_request(request))
+        self._register_session(
+            runtime_session_id,
+            self._make_session_for_request(request),
+            task_id=request.task_id,
+        )
         return runtime_session_id, self._sessions[runtime_session_id]
 
     def _make_session_for_request(self, request: ExecutionRequest) -> Any:
@@ -169,12 +181,39 @@ class BaseRuntime(metaclass=abc.ABCMeta):
         cwd: str | None = None,
         env: Mapping[str, str] | None = None,  # noqa: N802
         workspace_root: str | None = None,
-        network_policy: str | None = None,
+        network_policy: NetworkPolicy | str | None = None,
         resource_limits=None,
         writable_paths: tuple[str, ...] | None = None,
         read_only_paths: tuple[str, ...] = (),
     ) -> str:
         runtime_session_id = f"{self.name}_{task_id}"
+        existing = self._sessions.get(runtime_session_id)
+        if existing is not None:
+            if self._session_tasks.get(runtime_session_id) != task_id:
+                raise PermissionError(
+                    f"runtime session {runtime_session_id} has an ownership mismatch"
+                )
+            request = ExecutionRequest(
+                runtime=self.name,
+                source="",
+                task_id=task_id,
+                workspace_id="",
+                cwd=cwd,
+                env=env or {},
+                workspace_root=workspace_root,
+                network_policy=(
+                    NetworkPolicy(network_policy) if network_policy is not None else None
+                ),
+                resource_limits=resource_limits,
+                writable_paths=writable_paths,
+                read_only_paths=read_only_paths,
+            )
+            if not self._request_matches_session(request, existing):
+                raise PermissionError(
+                    f"security-sensitive identity of runtime session {runtime_session_id} "
+                    "cannot be changed"
+                )
+            return runtime_session_id
         self._register_session(
             runtime_session_id,
             self._make_session_compatible(
@@ -188,6 +227,7 @@ class BaseRuntime(metaclass=abc.ABCMeta):
                     "read_only_paths": read_only_paths,
                 }
             ),
+            task_id=task_id,
         )
         return runtime_session_id
 
@@ -246,6 +286,7 @@ class BaseRuntime(metaclass=abc.ABCMeta):
 
     async def close(self, runtime_session_id: str) -> None:
         session = self._sessions.pop(runtime_session_id, None)
+        self._session_tasks.pop(runtime_session_id, None)
         if session is not None:
             self._close_session(session)
 

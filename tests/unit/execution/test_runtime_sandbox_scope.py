@@ -113,3 +113,21 @@ async def test_base_runtime_session_locks_are_released_after_execution():
         events = [event async for event in runtime.execute(request, f"exec-{index}")]
         assert events[-1].type is ExecutionEventType.EXITED
     assert len(runtime._session_locks) == 0
+
+
+async def test_base_runtime_rejects_implicit_session_identity_changes(tmp_path):
+    runtime = _ScopeRuntime()
+    await runtime.create_session(
+        task_id="task-scope",
+        workspace_root=str(tmp_path),
+        network_policy="deny",
+    )
+
+    with pytest.raises(PermissionError, match="security-sensitive identity"):
+        await runtime.create_session(
+            task_id="task-scope",
+            workspace_root=str(tmp_path / "different"),
+            network_policy="deny",
+        )
+
+    assert list(runtime._sessions) == ["scope-test_task-scope"]

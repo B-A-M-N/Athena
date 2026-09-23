@@ -36,6 +36,7 @@ class ComparisonLifecycle:
             raise ValueError("compare accepts at most eight proposals")
 
         candidates: list[dict[str, Any]] = []
+        comparative_evidence: dict[str, dict] = {}
         for index, proposal in enumerate(proposals):
             if not proposal:
                 candidates.append(
@@ -54,14 +55,30 @@ class ComparisonLifecycle:
                 profile=profile,
                 auto_fork_on_failure=False,
             )
-            candidates.append({"candidate_index": index, **dataclasses.asdict(outcome)})
+            record = {"candidate_index": index, **dataclasses.asdict(outcome)}
+            branch_id = str(outcome.branch_id or "")
+            evidence = {
+                "verified": bool(outcome.verified),
+                "elapsed_ms": outcome.elapsed_ms,
+                "changed_resource_count": len(outcome.changed_resources),
+                "changed_resources": list(outcome.changed_resources),
+                "verification_checks": len(outcome.verification),
+                "verification_passed": sum(
+                    1 for item in outcome.verification if item.get("passed") is True
+                ),
+                "failure_record": dict(outcome.failure_record),
+            }
+            record["comparative_evidence"] = evidence
+            if branch_id:
+                comparative_evidence[branch_id] = evidence
+            candidates.append(record)
 
         attempted: list[str] = []
         verified: list[str] = []
         failed: list[str] = []
         certificates: dict[str, dict] = {}
         for record in candidates:
-            branch_id = record.get("branch_id")
+            branch_id = str(record.get("branch_id") or "")
             if not branch_id:
                 continue
             attempted.append(str(branch_id))
@@ -89,6 +106,7 @@ class ComparisonLifecycle:
             candidate_branch_ids=attempted,
             verified_branch_ids=verified,
             verification_certificates=certificates,
+            comparative_evidence=comparative_evidence,
         )
         return {
             "status": "COMPLETED",

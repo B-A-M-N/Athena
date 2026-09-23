@@ -310,6 +310,20 @@ class ContextRetrieval:
             task_objective=task.objective,
             available=available,
             limit=self._c.skill_limit,
+            task_context={
+                "objective": task.objective,
+                "project_id": task.workspace.id if task.workspace else None,
+                "principal_id": self._c._principal_id,
+                # Capability availability is deliberately optional here; the
+                # selector must not fabricate an authority inventory. A
+                # caller that has a canonical inventory can provide it in
+                # task metadata.
+                "available_capabilities": (task.metadata or {}).get("available_capabilities", ()),
+                "environment": getattr(task.workspace, "execution_backend", None)
+                if task.workspace
+                else None,
+                "dependencies": (task.metadata or {}).get("dependencies", ()),
+            },
         )
         return selected
 

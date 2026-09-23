@@ -9,7 +9,8 @@ every installed skill) are injected. This is the raised-relevance step between
 from __future__ import annotations
 
 import re
-from typing import Sequence
+from collections.abc import Mapping
+from typing import Any, Sequence
 
 from athena.skills.models import Skill
 
@@ -52,12 +53,15 @@ class SkillSelector:
         task_objective: str,
         available: Sequence[Skill],
         limit: int,
+        task_context: Mapping[str, Any] | None = None,
     ) -> list[Skill]:
         if limit <= 0 or not task_objective:
             return []
         objective_tokens = set(self._tokens(task_objective))
         scored: list[tuple[float, Skill]] = []
         for skill in available:
+            if not self._applicable(skill, task_context or {}):
+                continue
             score = self._score(skill, objective_tokens)
             if score >= self.min_score:
                 scored.append((score, skill))
@@ -72,7 +76,68 @@ class SkillSelector:
         overlap = len(skill_tokens & objective_tokens)
         if overlap:
             score += 1.0 * overlap
+        evidence = self._athena_metadata(skill).get("evidence") or {}
+        score += min(float(evidence.get("verified_reuses") or 0), 3.0) * 0.25
         return score
+
+    @staticmethod
+    def _athena_metadata(skill: Skill) -> Mapping[str, Any]:
+        raw = skill.metadata.get("athena") if isinstance(skill.metadata, Mapping) else None
+        return raw if isinstance(raw, Mapping) else {}
+
+    @classmethod
+    def _applicable(cls, skill: Skill, context: Mapping[str, Any]) -> bool:
+        """Apply explicit scope/prerequisite gates after keyword discovery."""
+        meta = cls._athena_metadata(skill)
+        if skill.scope == "project":
+            project_id = context.get("project_id")
+            owner = meta.get("project_id") or meta.get("owner")
+            if not project_id:
+                return False
+            if owner and project_id and str(owner) != str(project_id):
+                return False
+            if owner and not project_id:
+                return False
+        owner = meta.get("user_id") or meta.get("principal_id")
+        principal = context.get("principal_id")
+        if owner and principal and str(owner) != str(principal):
+            return False
+        if owner and not principal:
+            return False
+        applicability = meta.get("applicability")
+        if not isinstance(applicability, Mapping):
+            applicability = {}
+        required = applicability.get("required_capabilities") or meta.get("required_capabilities")
+        available = set(str(value) for value in (context.get("available_capabilities") or ()))
+        if required and not set(str(value) for value in required).issubset(available):
+            return False
+        required_dependencies = applicability.get("required_dependencies") or meta.get(
+            "required_dependencies"
+        )
+        dependencies = set(str(value) for value in (context.get("dependencies") or ()))
+        if required_dependencies and not set(
+            str(value) for value in required_dependencies
+        ).issubset(dependencies):
+            return False
+        environment = applicability.get("environment")
+        if environment:
+            actual = context.get("environment")
+            allowed = (
+                {str(value) for value in environment}
+                if isinstance(environment, (list, tuple, set))
+                else {str(environment)}
+            )
+            if str(actual) not in allowed:
+                return False
+        failure_terms = set(
+            cls._tokens(
+                " ".join(str(value) for value in (meta.get("known_failure_conditions") or ()))
+            )
+        )
+        objective_terms = set(cls._tokens(str(context.get("objective") or "")))
+        if failure_terms & objective_terms:
+            return False
+        return True
 
     @staticmethod
     def _trigger_score(trigger: str, objective_tokens: set[str]) -> float:

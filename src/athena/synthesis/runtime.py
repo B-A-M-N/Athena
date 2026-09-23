@@ -35,6 +35,27 @@ __all__ = [
 class GeneratedHostError(RuntimeError):
     """A governed host call could not be completed for generated code."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_class: str = "governance_failure",
+        recovery_action: str = "inspect_and_revalidate",
+        code: str = "generated_host_failure",
+    ) -> None:
+        super().__init__(message)
+        self.failure_class = failure_class
+        self.recovery_action = recovery_action
+        self.code = code
+
+    def to_record(self) -> dict[str, str]:
+        return {
+            "code": self.code,
+            "failure_class": self.failure_class,
+            "recovery_action": self.recovery_action,
+            "message": str(self),
+        }
+
 
 class PersistentGeneratedSession:
     """One serialized, sandboxed generated-process session.
@@ -168,7 +189,18 @@ class PersistentGeneratedSession:
             value = await host.call(request["capability_id"], request["arguments"])
             return {"ok": True, "value": value}
         except Exception as exc:  # noqa: BLE001 - child receives a failed call
-            return {"ok": False, "error": str(exc)}
+            if isinstance(exc, GeneratedHostError):
+                return {"ok": False, "error": str(exc), "failure": exc.to_record()}
+            return {
+                "ok": False,
+                "error": str(exc),
+                "failure": {
+                    "code": "host_bridge_exception",
+                    "failure_class": "infrastructure_failure",
+                    "recovery_action": "inspect_environment_and_retry",
+                    "message": str(exc),
+                },
+            }
 
     async def _read_stderr(self, stream: asyncio.StreamReader) -> None:
         try:

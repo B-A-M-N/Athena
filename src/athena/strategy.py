@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace as dataclasses_replace
+from dataclasses import dataclass, field
 from collections.abc import Iterable, Mapping
 import re
 from typing import Any
@@ -22,6 +22,14 @@ RESPOND = "respond"
 ACT = "act"
 DISCOVER = "discover"
 GAP = "gap"
+
+# Route admission is based on the task's observed requirements, not on the
+# number of powerful affordances that happen to be registered. These labels
+# remain advisory; the kernel is still the sole action authority.
+DIRECT_EXECUTION = "direct_execution"
+PERSISTENT_MUTATION = "persistent_mutation"
+SPECULATIVE_CHANGE = "speculative_change"
+MISSING_AFFORDANCE = "missing_affordance"
 
 # The deterministic pre-model layer answers one narrow question: "is this
 # turn *definitely* a self-contained response-only exchange?"  Anything
@@ -739,6 +747,7 @@ class StrategyGuidance:
     completion_mode: str = RESPONSE_ONLY
     discovery_state: str = "not_required"
     turn_intent: str = RESPONSE
+    work_requirement: str = RESPONSE_ONLY
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -753,6 +762,7 @@ class StrategyGuidance:
             "completion_mode": self.completion_mode,
             "discovery_state": self.discovery_state,
             "turn_intent": self.turn_intent,
+            "work_requirement": self.work_requirement,
         }
 
 
@@ -792,6 +802,7 @@ def select_strategy(
             completion_mode=RESPONSE_ONLY,
             discovery_state="not_required",
             turn_intent=intent.kind,
+            work_requirement=RESPONSE_ONLY,
         )
     affordances = tuple(_coerce_affordance(value) for value in capability_ids)
     available = {
@@ -802,6 +813,7 @@ def select_strategy(
 
     actionable = intent.requires_observable_work
     state = str(discovery_state or ("resolved" if affordances else "miss"))
+    work_requirement = _work_requirement(objective, intent, missing_affordance)
 
     # An empty inventory is not itself proof that the objective is
     # conversational. Keep response-only, discovery miss, and degraded
@@ -819,6 +831,7 @@ def select_strategy(
                 completion_mode=OBSERVABLE_WORK_REQUIRED,
                 discovery_state=state,
                 turn_intent=intent.kind,
+                work_requirement=work_requirement,
             )
         if actionable and state in {"miss", "degraded", "unavailable"}:
             rationale = (
@@ -835,6 +848,7 @@ def select_strategy(
                 completion_mode=OBSERVABLE_WORK_REQUIRED,
                 discovery_state=state,
                 turn_intent=intent.kind,
+                work_requirement=work_requirement,
             )
         return StrategyGuidance(
             route=RESPOND,
@@ -847,6 +861,7 @@ def select_strategy(
             discovery_state=state,
             affordances=affordances,
             turn_intent=intent.kind,
+            work_requirement=work_requirement,
         )
 
     if actionable and state in {"miss", "degraded", "unavailable"}:
@@ -868,6 +883,7 @@ def select_strategy(
             completion_mode=OBSERVABLE_WORK_REQUIRED,
             discovery_state=state,
             turn_intent=intent.kind,
+            work_requirement=work_requirement,
         )
 
     # Route is advisory evidence ranking over the visible descriptor
@@ -915,6 +931,8 @@ def select_strategy(
     terms = set(_tokens(text))
 
     def profile_score(profile: Mapping[str, Any]) -> tuple[int, int, int, str]:
+        if not _route_admissible(str(profile["route"]), work_requirement, terms):
+            return (-1, -1, int(profile.get("priority", 0)), profile["route"])
         preferred_ids = tuple(profile["preferred"])
         evidence_score = 0
         for item in affordances:
@@ -1013,6 +1031,7 @@ def select_strategy(
             completion_mode=OBSERVABLE_WORK_REQUIRED,
             discovery_state=str(discovery_state or "resolved"),
             turn_intent=intent.kind,
+            work_requirement=work_requirement,
         )
     guidance = StrategyGuidance(
         route,
@@ -1024,30 +1043,87 @@ def select_strategy(
         completion_mode=OBSERVABLE_WORK_REQUIRED if actionable else RESPONSE_ONLY,
         discovery_state=str(discovery_state or "resolved"),
         turn_intent=intent.kind,
+        work_requirement=work_requirement,
     )
-    if (
-        intent.kind == MUTATION
-        and route != "fusion"
-        and any(_matches(item.id, "fusion") for item in affordances if item.available)
-    ):
-        # Coding/mutation work is high-risk by default. If the bounded
-        # speculative-comparison surface is visible, require it in the
-        # advisory route so direct fs/execute edits do not bypass the
-        # candidate/verification boundary by default.
-        return dataclasses_replace(
-            guidance,
-            route="fusion",
-            candidates=(
-                "fusion",
-                *(candidate for candidate in candidates if candidate != "fusion"),
-            ),
-            route_kind=route_kind_for("fusion"),
-            rationale=(
-                "Complex coding/mutation work must run as bounded speculative "
-                "candidates with verification before any real-workspace commit."
-            ),
-        )
     return guidance
+
+
+def _work_requirement(objective: str, intent: TurnIntent, missing_affordance: str | None) -> str:
+    """Classify task need independently from the visible capability inventory."""
+    if missing_affordance:
+        return MISSING_AFFORDANCE
+    if intent.kind in {MUTATION, EXTERNAL_ACTION}:
+        terms = set(_tokens(objective))
+        complexity_terms = {
+            "alternative",
+            "architecture",
+            "broad",
+            "candidate",
+            "complex",
+            "experiment",
+            "isolate",
+            "migration",
+            "migrate",
+            "multiple",
+            "refactor",
+            "rewrite",
+            "shadow",
+            "speculative",
+        }
+        code_terms = {
+            "bug",
+            "class",
+            "code",
+            "function",
+            "implementation",
+            "logic",
+            "module",
+            "parser",
+            "package",
+            "test",
+            "tests",
+        }
+        simple_document_terms = {
+            "docs",
+            "documentation",
+            "readme",
+            "spelling",
+            "text",
+            "typo",
+            "word",
+        }
+        if terms & complexity_terms or (terms & code_terms and not terms & simple_document_terms):
+            return SPECULATIVE_CHANGE
+        return PERSISTENT_MUTATION
+    if intent.requires_observable_work:
+        return DIRECT_EXECUTION
+    return RESPONSE_ONLY
+
+
+def _route_admissible(route: str, work_requirement: str, terms: set[str]) -> bool:
+    """Prevent inventory size from admitting an unrelated advanced route."""
+    if route == "fusion":
+        return work_requirement == SPECULATIVE_CHANGE
+    if route == "evidence_acquisition":
+        return work_requirement == OBSERVATION or bool(
+            terms & {"evidence", "investigate", "research", "source", "sources"}
+        )
+    if route == "synthesize":
+        return bool(
+            terms
+            & {
+                "affordance",
+                "capability",
+                "generate",
+                "generated",
+                "synthesis",
+                "tool",
+                "utility",
+            }
+        )
+    if route == "compose":
+        return bool(terms & {"compose", "pipeline", "sequence", "steps", "workflow"})
+    return True
 
 
 def objective_requires_observable_work(objective: str) -> bool:
@@ -1140,6 +1216,10 @@ __all__ = [
     "DEFINITELY_RESPONSE_ONLY",
     "MAY_REQUIRE_OBSERVATION_OR_ACTION",
     "RESPONSE_ONLY",
+    "DIRECT_EXECUTION",
+    "PERSISTENT_MUTATION",
+    "SPECULATIVE_CHANGE",
+    "MISSING_AFFORDANCE",
     "TurnIntent",
     "StrategyAffordance",
     "StrategyGuidance",

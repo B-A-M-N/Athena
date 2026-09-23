@@ -264,8 +264,9 @@ class SkillLifecycle:
         await self._db.execute(
             "INSERT INTO skill_candidates("
             "id, source_task_id, name, draft, rationale, evidence, confidence, "
-            "lifecycle_state, promoted_skill_id, created_at, updated_at, metadata) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?) "
+            "lifecycle_state, promoted_skill_id, target_skill_id, "
+            "target_skill_version, created_at, updated_at, metadata) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?) "
             "ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at, "
             "lifecycle_state=CASE WHEN skill_candidates.lifecycle_state IN "
             "('PROMOTED', 'DEPRECATED') THEN skill_candidates.lifecycle_state "
@@ -279,11 +280,14 @@ class SkillLifecycle:
                 json.dumps(list(candidate.evidence), sort_keys=True),
                 float(candidate.confidence),
                 lifecycle_state,
+                candidate.target_skill,
+                candidate.target_skill_version,
                 now,
                 now,
                 json.dumps(
                     {
                         "task_id": task_id or candidate.source_task_id,
+                        "confidence_kind": "heuristic_proposal",
                         "validation_errors": list(result.errors),
                         "validation_warnings": list(result.warnings),
                     },
@@ -398,15 +402,50 @@ class SkillLifecycle:
             return None
 
         draft = _with_trust(candidate.draft, TrustClass.AGENT_CURATED)
-        if candidate.target_skill and await self.get(candidate.target_skill):
-            # NOTE: latent bug fixed - `update` returns the new *version* (int),
-            # not a skill_id (str). Previously _new_version (an int) flowed into
-            # the return under the variable name `skill_id`; return the real id.
+        current = await self.get(candidate.target_skill) if candidate.target_skill else None
+        if candidate.target_skill and current is not None:
+            if (
+                candidate.target_skill_version is not None
+                and current.version != candidate.target_skill_version
+            ):
+                await self._emit_candidate(
+                    candidate,
+                    accepted=False,
+                    task_id=task_id,
+                    lifecycle_state="REVISION_CONFLICT",
+                )
+                logger.warning(
+                    "skill promotion target changed for %s: expected version %s, found %s",
+                    candidate.target_skill,
+                    candidate.target_skill_version,
+                    current.version,
+                )
+                return None
+            if candidate.target_skill_version is None:
+                await self._emit_candidate(
+                    candidate,
+                    accepted=False,
+                    task_id=task_id,
+                    lifecycle_state="REVISION_CONFLICT",
+                )
+                logger.warning(
+                    "skill promotion target has no expected version: %s", candidate.target_skill
+                )
+                return None
             await self.update(candidate.target_skill, draft)
             await self._emit_candidate(
                 candidate, accepted=True, skill_id=candidate.target_skill, task_id=task_id
             )
             return candidate.target_skill
+        if candidate.target_skill:
+            await self._emit_candidate(
+                candidate,
+                accepted=False,
+                task_id=task_id,
+                lifecycle_state="TARGET_MISSING",
+            )
+            logger.warning("skill promotion target no longer exists: %s", candidate.target_skill)
+            return None
         skill_id = await self.install(draft, task_id=task_id)
         await self._emit_candidate(candidate, accepted=True, skill_id=skill_id, task_id=task_id)
         return skill_id
@@ -444,6 +483,72 @@ class SkillLifecycle:
         )
         return skill
 
+    async def record_outcome(
+        self,
+        skill_id: str,
+        *,
+        version: int,
+        passed: bool,
+        task_id: str | None = None,
+        failure: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Attach verified reuse evidence to the exact skill revision.
+
+        This extends lifecycle metadata rather than creating a second usage
+        ledger. A version mismatch is reported without mutating the active
+        successor, so an outcome cannot be attributed to the wrong revision.
+        """
+        skill = await self.get(skill_id)
+        if skill is None:
+            return {"status": "missing", "skill_id": skill_id, "version": version}
+        if skill.version != version:
+            return {
+                "status": "revision_mismatch",
+                "skill_id": skill_id,
+                "expected_version": version,
+                "active_version": skill.version,
+            }
+        metadata = dict(skill.metadata)
+        athena = dict(metadata.get("athena") or {})
+        evidence = dict(athena.get("evidence") or {})
+        key = "verified_reuses" if passed else "failed_reuses"
+        evidence[key] = int(evidence.get(key) or 0) + 1
+        outcome = {
+            "task_id": task_id,
+            "passed": passed,
+            "failure": dict(failure or {}),
+            "version": version,
+            "at": utcnow().isoformat(),
+        }
+        history = list(evidence.get("outcomes") or [])
+        history.append(outcome)
+        evidence["outcomes"] = history[-32:]
+        evidence["refinement_required"] = bool(evidence.get("failed_reuses"))
+        athena["evidence"] = evidence
+        metadata["athena"] = athena
+        await self._db.execute(
+            "UPDATE skills SET metadata = ?, updated_at = ? WHERE id = ? AND version = ?",
+            (json.dumps(metadata), utcnow().isoformat(), skill_id, version),
+        )
+        await self._emit(
+            EventCategory.SKILL_ACTIVATED.value,
+            {
+                "skill_id": skill_id,
+                "op": "outcome",
+                "version": version,
+                "passed": passed,
+                "refinement_required": evidence["refinement_required"],
+            },
+            task_id=task_id,
+        )
+        return {
+            "status": "recorded",
+            "skill_id": skill_id,
+            "version": version,
+            "passed": passed,
+            "refinement_required": evidence["refinement_required"],
+        }
+
     async def load_active(self) -> List[Skill]:
         return await self.list(active_only=True)
 
@@ -469,8 +574,10 @@ class SkillLifecycle:
         payload = {
             "source_task_id": candidate.source_task_id,
             "target_skill": candidate.target_skill,
+            "target_skill_version": candidate.target_skill_version,
             "name": candidate.propose_name,
             "confidence": candidate.confidence,
+            "confidence_kind": "heuristic_proposal",
             "accepted": accepted,
             "candidate_id": candidate_id or candidate.id,
             "lifecycle_state": lifecycle_state or ("PROMOTED" if accepted else "PENDING_REVIEW"),
@@ -529,6 +636,8 @@ def _candidate_record(row: Mapping[str, Any]) -> dict[str, Any]:
         "rationale": str(row.get("rationale") or ""),
         "confidence": float(row.get("confidence") or 0.0),
         "promoted_skill_id": row.get("promoted_skill_id"),
+        "target_skill": row.get("target_skill_id"),
+        "target_skill_version": row.get("target_skill_version"),
         "metadata": metadata if isinstance(metadata, dict) else {},
     }
 
@@ -557,10 +666,15 @@ def _candidate_from_record(row: Mapping[str, Any]) -> SkillCandidate:
     return SkillCandidate(
         draft=draft,
         source_task_id=str(row.get("source_task_id") or ""),
-        target_skill=None,
+        target_skill=(str(row["target_skill_id"]) if row.get("target_skill_id") else None),
         rationale=str(row.get("rationale") or ""),
         evidence=tuple(str(item) for item in evidence or ()),
         confidence=float(row.get("confidence") or 0.0),
+        target_skill_version=(
+            int(row["target_skill_version"])
+            if row.get("target_skill_version") is not None
+            else None
+        ),
     )
 
 
@@ -590,6 +704,11 @@ class SkillStore:
         if self._lifecycle is not None:
             return await self._lifecycle.trigger(skill_id, arguments, task_id=task_id)
         raise KeyError(f"no such skill: {skill_id}")
+
+    async def record_outcome(self, skill_id: str, **kwargs: Any) -> dict[str, Any]:
+        if self._lifecycle is not None:
+            return await self._lifecycle.record_outcome(skill_id, **kwargs)
+        return {"status": "unavailable", "skill_id": skill_id}
 
     async def load_active(self) -> list[Skill]:
         if self._lifecycle is not None:

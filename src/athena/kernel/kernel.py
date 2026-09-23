@@ -21,7 +21,9 @@ pseudocode (BUILDSPEC §§17-18):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
 import logging
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -218,6 +220,23 @@ class RunState:
     # counts every failed result after the normal path has run.
     interpreter_failure_counts: dict[str, int] = field(default_factory=dict)
     work_evidence: list[WorkEvidence] = field(default_factory=list)
+    # Fusion supplies evidence; this state records the kernel-owned recovery
+    # boundary.  It is deliberately bounded and does not construct proposals.
+    speculative_failure_records: list[dict[str, Any]] = field(default_factory=list)
+    speculative_recovery_attempts: int = 0
+    speculative_recovery_rejections: int = 0
+    speculative_recovery_pending: bool = False
+    speculative_recovery_limit: int = 1
+
+    def __post_init__(self) -> None:
+        raw_limit = (self.task.metadata or {}).get("speculation_recovery_attempts", 1)
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            limit = 1
+        # A task may narrow the bound, but no request can turn this into an
+        # unbounded autonomous loop.
+        self.speculative_recovery_limit = max(0, min(limit, 2))
 
     @property
     def elapsed_ms(self) -> int:
@@ -323,11 +342,78 @@ def _observation_from_result(task, result: CapabilityResultBlock):
             "error": error_text,
             "output": output_text,
             "generated_failure": dict((result.metadata or {}).get("generated_failure") or {}),
+            "diagnostic": dict(
+                (result.metadata or {}).get("diagnostic")
+                or ((result.metadata or {}).get("generated_failure") or {}).get("diagnostic")
+                or {}
+            ),
         },
         task_id=task.id,
         session_id=task.session_id,
     )
 
+
+def _json_fingerprint(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _fusion_candidate_payload(call: CapabilityCallBlock) -> tuple[list[Any], str] | None:
+    """Return candidate proposals plus the model's recovery explanation."""
+    if call.capability_id != "fusion":
+        return None
+    arguments = dict(call.arguments or {})
+    operation = str(arguments.get("operation") or "")
+    if operation == "run":
+        proposal = arguments.get("proposal")
+        return ([proposal] if isinstance(proposal, list) else []), str(
+            arguments.get("changes_from_previous") or ""
+        ).strip()
+    if operation == "compare":
+        proposals = arguments.get("proposals")
+        return (
+            [item for item in proposals if isinstance(item, list)]
+            if isinstance(proposals, list)
+            else [],
+            str(arguments.get("changes_from_previous") or "").strip(),
+        )
+    return None
+
+
+def _failed_proposal_fingerprints(records: list[dict[str, Any]]) -> set[str]:
+    fingerprints: set[str] = set()
+    for record in records:
+        operation = record.get("failed_operation")
+        if isinstance(operation, list):
+            fingerprints.add(_json_fingerprint(operation))
+    return fingerprints
+
+
+def _recovery_hint(state: RunState) -> dict[str, Any]:
+    record = state.speculative_failure_records[-1] if state.speculative_failure_records else {}
+    remaining = max(state.speculative_recovery_limit - state.speculative_recovery_attempts, 0)
+    budget = record.get("remaining_execution_budget")
+    compact = {
+        "failed_operation": record.get("failed_operation", []),
+        "verification_results": record.get("verification_results", []),
+        "violated_invariants": record.get("violated_invariants", []),
+        "workspace_changes": record.get("workspace_changes", []),
+        "remaining_execution_budget": budget,
+    }
+    return {
+        "kind": "speculative_failure_recovery",
+        "remaining_attempts": remaining,
+        "failure": compact,
+        "message": (
+            "The previous Fusion candidate failed canonical verification. "
+            "Use the structured failure evidence below. If a meaningful alternative "
+            "remains, make exactly one materially different proposal and include a "
+            "non-empty changes_from_previous explanation. Do not repeat the failed "
+            "proposal. Stop if no meaningful alternative remains or the budget is "
+            "exhausted. Fusion executes the proposal; the kernel owns this decision. "
+            + json.dumps(compact, sort_keys=True, default=str)[:6000]
+        ),
+    }
 
 def _repeated_failure_observation(task, result: CapabilityResultBlock, attempts: int):
     """Build a REPEATED_FAILURE observation when a capability keeps failing.
@@ -774,6 +860,12 @@ class AgentKernel:
     async def _compile(
         self, task: TaskSpec, *, context_window: int | None = None
     ) -> CompiledContext:
+        context_task = task
+        state = self._runs.get(task.id)
+        if state is not None and state.speculative_recovery_pending:
+            metadata = dict(task.metadata or {})
+            metadata["_runtime_recovery_hint"] = _recovery_hint(state)
+            context_task = replace(task, metadata=metadata)
         recent: list[Message] = []
         if task.session_id:
             try:
@@ -796,9 +888,9 @@ class AgentKernel:
                     session_id=task.session_id,
                 ) from exc
         compiled = await self._compiler.compile(
-            task,
+            context_task,
             recent_messages=_textable_messages(recent),
-            workspace=task.workspace.root if task.workspace else None,
+            workspace=context_task.workspace.root if context_task.workspace else None,
             context_window=context_window,
         )
         strategy = compiled.strategy
@@ -816,6 +908,18 @@ class AgentKernel:
                         for d in compiled.degradations
                     ],
                     "count": len(compiled.degradations),
+                },
+                task,
+            )
+        if compiled.selected_skill_versions:
+            await self._emit(
+                "SkillContextSelected",
+                {
+                    "skills": [
+                        {"skill_id": skill_id, "version": version}
+                        for skill_id, version in compiled.selected_skill_versions
+                    ],
+                    "source": "context_injection",
                 },
                 task,
             )
@@ -1224,6 +1328,70 @@ class AgentKernel:
     async def _relay_delta(self, task: TaskSpec, delta: ModelDelta) -> None:
         return await InferenceBroker(self)._relay_delta(task, delta)
 
+    async def _record_speculative_failure(
+        self, task: TaskSpec, state: RunState, result: CapabilityResultBlock
+    ) -> bool:
+        """Retain Fusion failure evidence and prepare one bounded next turn.
+
+        Fusion supplies evidence; this method only records it and exposes a
+        kernel-owned hint. It never creates or ranks a proposal.
+        """
+        metadata = dict(result.metadata or {})
+        raw = metadata.get("failure_record")
+        if not isinstance(raw, Mapping) or not raw.get("failed_operation"):
+            return False
+        if state.speculative_recovery_limit <= state.speculative_recovery_attempts:
+            return True
+        record = dict(raw)
+        record["capability_id"] = result.capability_id
+        record["call_id"] = result.call_id
+        state.speculative_failure_records.append(record)
+        state.speculative_failure_records = state.speculative_failure_records[-4:]
+        state.speculative_recovery_pending = True
+        await self._emit(
+            "SpeculativeFailureObserved",
+            {
+                "attempt": state.speculative_recovery_attempts,
+                "remaining_attempts": max(
+                    state.speculative_recovery_limit - state.speculative_recovery_attempts,
+                    0,
+                ),
+                "failure_record": record,
+            },
+            task,
+        )
+        return True
+
+    def _validate_speculative_recovery(
+        self, state: RunState, calls: list[CapabilityCallBlock]
+    ) -> str | None:
+        """Fail closed on an unchanged or unexplained recovery proposal."""
+        if not state.speculative_recovery_pending:
+            return None
+        candidate_calls = [
+            payload
+            for call in calls
+            if (payload := _fusion_candidate_payload(call)) is not None
+        ]
+        if not candidate_calls:
+            return None
+        if state.speculative_recovery_attempts >= state.speculative_recovery_limit:
+            return "speculative recovery budget exhausted"
+        failed = _failed_proposal_fingerprints(state.speculative_failure_records)
+        if any(not explanation for _, explanation in candidate_calls):
+            state.speculative_recovery_rejections += 1
+            return "speculative recovery requires changes_from_previous"
+        if not any(
+            _json_fingerprint(proposal) not in failed
+            for proposals, _ in candidate_calls
+            for proposal in proposals
+        ):
+            state.speculative_recovery_rejections += 1
+            return "speculative recovery proposal repeats the failed approach"
+        state.speculative_recovery_attempts += 1
+        state.speculative_recovery_pending = False
+        return None
+
     async def _dispatch(self, task, state, response, calls):
         # A model-issued clarification request is kernel-owned, not a capability
         # execution: intercept it before the dispatcher so the task can park in
@@ -1268,6 +1436,35 @@ class AgentKernel:
             await self._append_results(task, not_executed, calls=calls)
             return None
 
+        recovery_error = self._validate_speculative_recovery(state, calls)
+        if recovery_error is not None:
+            rejected = [
+                CapabilityResultBlock(
+                    call_id=call.call_id,
+                    capability_id=call.capability_id,
+                    ok=False,
+                    error=recovery_error,
+                    metadata={
+                        "diagnostic": {
+                            "failure_class": "speculative_recovery_boundary",
+                            "recovery_action": "stop",
+                            "permitted_recovery": ["stop"],
+                        }
+                    },
+                )
+                for call in calls
+            ]
+            await self._append_results(task, rejected, calls=calls)
+            await self._emit(
+                "SpeculativeRecoveryStopped",
+                {
+                    "reason": recovery_error,
+                    "rejections": state.speculative_recovery_rejections,
+                },
+                task,
+            )
+            return await self._finalize(task, state, TaskStatus.FAILED, recovery_error)
+
         # The dispatcher may create and publish an approval request before it
         # returns a SuspendedCall.  Arm the task's resume boundary before that
         # call so an operator decision cannot arrive into an unarmed window.
@@ -1292,6 +1489,28 @@ class AgentKernel:
             return await self._approval_path(task, state, outcome)
 
         await self._append_results(task, outcome.results, calls=calls)
+        exhausted_recovery = False
+        for result in outcome.results:
+            if isinstance(result, CapabilityResultBlock) and result.capability_id == "fusion":
+                recorded = await self._record_speculative_failure(task, state, result)
+                exhausted_recovery = exhausted_recovery or (
+                    recorded and state.speculative_recovery_attempts >= state.speculative_recovery_limit
+                )
+        if exhausted_recovery:
+            await self._emit(
+                "SpeculativeRecoveryStopped",
+                {
+                    "reason": "speculative recovery produced another failed candidate",
+                    "attempts": state.speculative_recovery_attempts,
+                },
+                task,
+            )
+            return await self._finalize(
+                task,
+                state,
+                TaskStatus.FAILED,
+                "speculative recovery produced another failed candidate",
+            )
         # Loop-side observation producer (audit P0.2 completion): a FAILED
         # capability result is an execution-grounded observation. Offer at
         # most ONE per dispatch (cost-amplification bound: a turn with N

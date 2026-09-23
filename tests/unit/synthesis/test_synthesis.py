@@ -35,7 +35,7 @@ from athena.policy.engine import PolicyEngine
 from athena.execution.dependencies import environment_fingerprint
 from athena.reality import RealityGate
 from athena.shadow.engine import ShadowEngine
-from athena.synthesis.engine import SynthesisEngine, _risk_tier
+from athena.synthesis.engine import SynthesisEngine, _remember_live_failure, _risk_tier
 from athena.synthesis.runtime import GeneratedHostError, GeneratedToolHost
 from athena.research.models import EvidenceObject, SourceRecord
 from athena.research.store import ResearchStore
@@ -477,6 +477,96 @@ async def test_generated_failure_exposes_bounded_repair_signal(tmp_path, monkeyp
     assert signal["failure_class"] == "contract_mismatch"
     assert signal["repairable"] is True
     assert signal["repair_operation"] == "synthesis.repair"
+
+
+@pytest.mark.asyncio
+async def test_generated_validation_rejects_zero_exit_without_result_envelope(monkeypatch):
+    engine = SynthesisEngine()
+    cap = _make_cap(engine, name="missing_result_envelope")
+
+    async def fake_child(*args, **kwargs):
+        del args, kwargs
+        return "ordinary stdout without a result", "", 0
+
+    monkeypatch.setattr(engine, "_run_child_async", fake_child)
+    result = await engine.validate(cap, [{"args": {}}])
+
+    assert result.validation["all_passed"] is False
+    assert result.validation["details"][0]["passed"] is False
+    assert "missing result envelope" in result.validation["details"][0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_generated_validation_rejects_extra_protocol_output(monkeypatch):
+    engine = SynthesisEngine()
+    cap = _make_cap(engine, name="extra_protocol_output")
+
+    async def fake_child(*args, **kwargs):
+        del args, kwargs
+        return 'log line\n__RESULT__{"echo": ""}\n', "", 0
+
+    monkeypatch.setattr(engine, "_run_child_async", fake_child)
+    result = await engine.validate(cap, [{"args": {}}])
+
+    assert result.validation["all_passed"] is False
+    assert "extra incompatible protocol output" in result.validation["details"][0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_generated_validation_labels_smoke_as_unverified_semantics():
+    engine = SynthesisEngine()
+    cap = _make_cap(engine, name="smoke_only")
+
+    result = await engine.validate(cap, [{"args": {}}])
+
+    assert result.validation["all_passed"] is True
+    assert result.validation["semantic_verification"]["status"] == "execution_only"
+    assert result.validation["independent_verification"]["warnings"]
+
+
+@pytest.mark.asyncio
+async def test_replayed_live_failure_without_oracle_is_not_marked_resolved():
+    engine = SynthesisEngine()
+    cap = _make_cap(engine, name="unoracled_regression")
+    _remember_live_failure(
+        cap,
+        {},
+        failure_class="implementation_failure",
+        observed_failure="known failure",
+        environment_fingerprint="env-1",
+    )
+    inherited = dict(cap.validation["regression_cases"][0])
+    cap.revision = 2
+    validated = await engine.validate(cap, [{**inherited, "args": {}}])
+
+    regression = validated.validation["regression_cases"][0]
+    assert regression["resolved_by_revision"] is None
+    assert regression["last_replay"]["status"] == ("execution_recovered_semantically_unverified")
+
+
+@pytest.mark.asyncio
+async def test_generated_validation_executes_derived_schema_proof_cases():
+    engine = SynthesisEngine()
+    cap = engine.synthesize(
+        name="derived_cases",
+        description="records executable schema proof",
+        code=GOOD_CODE,
+        input_schema={
+            "type": "object",
+            "required": ["msg"],
+            "properties": {"msg": {"type": "string"}},
+            "additionalProperties": False,
+        },
+        task_id="task-derived-cases",
+    )
+
+    result = await engine.validate(cap, [{"args": {"msg": "fixture"}}])
+
+    derived = result.validation["derived_proof_corpus"]
+    assert derived["executed"] >= 2
+    assert derived["passed"] == derived["executed"]
+    assert all(case["analyzer_status"] in {"passed", "unverified"} for case in derived["cases"])
+    assert all("verification_claim" in case for case in derived["cases"])
 
 
 @pytest.mark.asyncio
@@ -1164,7 +1254,7 @@ async def test_to_skill_candidate_requires_diverse_repeated_success():
     engine = SynthesisEngine()
     registry = CapabilityRegistry()
     cap = _make_cap(engine)
-    await engine.validate(cap, [{"args": {}}])
+    await engine.validate(cap, [{"args": {}, "expect_output": {"echo": ""}}])
     engine.register_ephemeral(registry, cap)
 
     assert engine.to_skill_candidate(cap.id) is None  # zero uses

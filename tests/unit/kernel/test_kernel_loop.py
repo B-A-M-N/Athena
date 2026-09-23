@@ -17,7 +17,14 @@ from athena.models.fake import FakeModelProvider
 from athena.models.registry import ProviderRegistry
 from athena.models.router import ModelRouter
 from athena.protocol.ids import new_id
-from athena.protocol.messages import Message, Provenance, Role, SourceType, TextBlock, utcnow
+from athena.protocol.messages import (
+    Message,
+    Provenance,
+    Role,
+    SourceType,
+    TextBlock,
+    utcnow,
+)
 from athena.protocol.models import CostInfo
 from athena.protocol.tasks import ResourceBudget, TaskSpec, TaskStatus
 from athena.tasks.budgets import BudgetStateUnavailable, BudgetTracker
@@ -251,6 +258,109 @@ async def test_scripted_capability_then_answer_runs_two_iterations(stack):
     # UNIQUE(task_id, sequence) collision between the kernel and lifecycle
     # event emitters; see source-bug note in the report).
     assert len(iterations) >= 1
+
+
+async def test_speculative_failure_gets_one_kernel_owned_changed_recovery_attempt(stack):
+    """Fusion evidence drives one bounded, materially different next turn."""
+
+    stack.provider._scripts = [
+        {
+            "match": {"last_capability_result_contains": "kernel_decision_required"},
+            "respond": {"text": "verified candidate selected", "done": True},
+        },
+        {
+            "match": {"last_capability_result_contains": "speculative_verification_failure"},
+            "respond": {
+                "capability_call": {
+                    "capability_id": "fusion",
+                    "arguments": {
+                        "operation": "compare",
+                        "proposals": [
+                            [{"capability_id": "fs", "arguments": {"path": "wrong.py"}}],
+                            [{"capability_id": "fs", "arguments": {"path": "fixed.py"}}],
+                        ],
+                        "changes_from_previous": "Use the corrected path and compare it against the failed candidate.",
+                    },
+                },
+                "done": False,
+            },
+        },
+        {
+            "match": {"user_contains": "speculative coding"},
+            "respond": {
+                "capability_call": {
+                    "capability_id": "fusion",
+                    "arguments": {
+                        "operation": "run",
+                        "proposal": [
+                            [{"capability_id": "fs", "arguments": {"path": "wrong.py"}}]
+                        ][0],
+                    },
+                },
+                "done": False,
+            },
+        },
+    ]
+
+    class _FusionDispatch:
+        def __init__(self):
+            self.calls = []
+
+        async def dispatch(self, task, calls):
+            self.calls.extend(calls)
+            if len(self.calls) == 1:
+                return DispatchResult(
+                    results=(
+                        CapabilityResultBlock(
+                            call_id=calls[0].call_id,
+                            capability_id="fusion",
+                            ok=True,
+                            output='{"status":"FAILED","error":"known test failure",'
+                            '"kind":"speculative_verification_failure"}',
+                            metadata={
+                                "operation": "run",
+                                "failure_record": {
+                                    "kind": "speculative_failure",
+                                    "failed_operation": [
+                                        {"capability_id": "fs", "arguments": {"path": "wrong.py"}}
+                                    ],
+                                    "verification_results": [{"passed": False, "name": "known test"}],
+                                    "violated_invariants": ["known test"],
+                                    "workspace_changes": ["wrong.py"],
+                                    "remaining_execution_budget": {"iterations": 47},
+                                },
+                            },
+                        ),
+                    )
+                )
+            return DispatchResult(
+                results=(
+                    CapabilityResultBlock(
+                        call_id=calls[0].call_id,
+                        capability_id="fusion",
+                        ok=True,
+                        output='{"status":"COMPLETED","comparison_id":"cmp-1",'
+                        '"verified_count":1,"selection":"kernel_decision_required"}',
+                        metadata={"operation": "compare", "verified_count": 1},
+                    ),
+                )
+            )
+
+    dispatch = _FusionDispatch()
+    stack.kernel._dispatch_factory = lambda task: dispatch
+    spec = await _create(stack, "speculative coding: repair the known test failure")
+    result = await stack.kernel.run_task(spec.id)
+
+    assert result.status == TaskStatus.COMPLETE
+    assert len(dispatch.calls) == 2
+    assert dispatch.calls[0].arguments["operation"] == "run"
+    assert dispatch.calls[1].arguments["operation"] == "compare"
+    assert "changes_from_previous" in "\n".join(
+        message.conversation_text() for message in stack.provider.requests[1].messages
+    )
+    events = await stack.events.list_for_task(spec.id)
+    assert any(event.type == "SpeculativeFailureObserved" for event in events)
+    assert not any(event.type == "SpeculativeRecoveryStopped" for event in events)
 
 
 async def test_transcript_failure_after_effect_parks_without_new_model_or_effect(

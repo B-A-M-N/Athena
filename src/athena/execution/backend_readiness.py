@@ -76,6 +76,7 @@ class BackendReadiness:
                 "supported_runtimes": runtimes,
                 "physical_backend": status["physical_backend"],
                 "isolation_required": status["isolation_required"],
+                "isolation_available": status["isolation_available"],
                 "isolation_verified": status["isolation_verified"],
                 "network_modes": ("allow", "deny"),
                 "network_policy_effects": {
@@ -128,7 +129,10 @@ class BackendReadiness:
             "available": available,
             "proof_status": "unverified",
             "isolation_required": isolated,
-            "isolation_verified": bool(available and isolated),
+            # Bubblewrap availability is only a launch preflight.  It is not
+            # behavioral evidence that the boundary held for this runtime.
+            "isolation_available": bool(available and isolated),
+            "isolation_verified": False,
             "network_modes": ["allow", "deny"],
             "network_policy_effects": {
                 "allow": "allow",
@@ -161,9 +165,9 @@ class BackendReadiness:
             "available": available,
             "proof_status": (
                 "verified"
-                if (self._catalog.get_passport(getattr(resolved, "name", name or "local")) or {}).get(
-                    "status"
-                )
+                if (
+                    self._catalog.get_passport(getattr(resolved, "name", name or "local")) or {}
+                ).get("status")
                 == "PASS"
                 else "unverified"
             ),

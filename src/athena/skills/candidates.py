@@ -9,6 +9,8 @@ decides whether they become active skills.
 from __future__ import annotations
 
 import re
+import json
+from dataclasses import replace
 from typing import Any, Sequence
 
 from athena.skills.models import Skill, SkillCandidate
@@ -207,14 +209,19 @@ def _render_body(objective: str, transcript: Sequence[Any]) -> str:
     )
     evidence = _successful_ordinary_calls(transcript)
     if evidence:
-        body += "\n## Distilled sequence\n\n"
-        for index, call in enumerate(evidence, 1):
-            operation = str((getattr(call, "arguments", {}) or {}).get("operation") or "call")
-            keys = sorted(
-                str(key) for key in (getattr(call, "arguments", {}) or {}) if key != "operation"
-            )
-            suffix = f"; inputs: {', '.join(keys)}" if keys else ""
-            body += f"{index}. Use `{call.capability_id}` ({operation}){suffix}.\n"
+        procedure = _procedure_evidence(transcript, evidence)
+        body += "\n## Applicability\n\n"
+        body += f"- Apply when the objective matches: {objective.strip()}\n"
+        body += "- Required native capabilities: " + ", ".join(procedure["capabilities"]) + ".\n"
+        body += "\n## Operational procedure\n\n"
+        for step in procedure["steps"]:
+            body += f"{step}\n"
+        body += "\n## Expected observations\n\n"
+        for observation in procedure["observations"]:
+            body += f"- {observation}\n"
+        body += "\n## Verification and stopping\n\n"
+        body += "- " + procedure["verification"] + "\n"
+        body += "- " + procedure["stopping"] + "\n"
         body += (
             "\nThe original transcript and result records remain separate evidence for review.\n"
         )
@@ -227,6 +234,7 @@ async def candidates_from_task(
     result: Any = None,
     *,
     min_confidence: float = 0.4,
+    target_skill: Skill | None = None,
 ) -> list[SkillCandidate]:
     """Propose candidate skill drafts from a completed task transcript.
 
@@ -239,6 +247,12 @@ async def candidates_from_task(
         return []
 
     evidence = _successful_ordinary_calls(transcript)
+    if _successful_excluded_calls(transcript):
+        # Task-local synthesis/workflow/delegation is not portable prose. The
+        # workflow learner owns deterministic native-call sequences; until an
+        # excluded dependency is promoted or replaced, retain only the task
+        # evidence and do not emit an incomplete skill.
+        return []
     if not _repeatable_procedure_evidence(transcript, evidence, objective=objective):
         return []
 
@@ -246,6 +260,15 @@ async def candidates_from_task(
     if confidence < min_confidence:
         return []
 
+    procedure = _procedure_evidence(transcript, evidence)
+    status = getattr(getattr(result, "status", None), "value", getattr(result, "status", None))
+    task_status = str(status or "unknown")
+    verification_receipts = getattr(result, "verification_receipts", None)
+    if verification_receipts is None and isinstance(result, dict):
+        verification_receipts = result.get("verification_receipts")
+    semantic_status = (
+        "verified" if task_status == "COMPLETE" and verification_receipts else "unverified"
+    )
     draft = Skill(
         id="",
         name=_slug(objective),
@@ -256,17 +279,54 @@ async def candidates_from_task(
         version=1,
         source=None,
         enabled=True,
-        metadata={"provenance": "candidate"},
+        metadata={
+            "provenance": "candidate",
+            "athena": {
+                "proposal_confidence": confidence,
+                "evidence": {
+                    "task_status": task_status,
+                    "verification_receipts": verification_receipts or [],
+                    "semantic_status": semantic_status,
+                },
+                "procedure": procedure,
+            },
+        },
     )
     candidate = SkillCandidate(
         draft=draft,
         source_task_id=_task_id_of(task),
-        target_skill=None,
-        rationale="Task transcript exhibited a repeatable procedure worth "
-        "preserving as agent-curated guidance.",
+        target_skill=getattr(target_skill, "id", None),
+        rationale=(
+            "Observed failure while using an existing skill; propose a targeted "
+            "successor that preserves the prior procedure and addresses the new evidence."
+            if target_skill is not None
+            else "Task transcript exhibited a repeatable procedure worth preserving as "
+            "agent-curated guidance."
+        ),
         evidence=tuple(_evidence_refs(transcript)),
         confidence=confidence,
+        target_skill_version=(
+            int(getattr(target_skill, "version", 1) or 1) if target_skill is not None else None
+        ),
     )
+    if target_skill is not None:
+        draft = replace(
+            draft,
+            id=target_skill.id,
+            name=target_skill.name,
+            version=target_skill.version,
+            metadata={
+                **dict(draft.metadata),
+                "athena": {
+                    **dict((draft.metadata.get("athena") or {})),
+                    "refinement_of": {
+                        "skill_id": target_skill.id,
+                        "version": target_skill.version,
+                    },
+                },
+            },
+        )
+        candidate = replace(candidate, draft=draft)
     return [candidate]
 
 
@@ -298,6 +358,80 @@ def _successful_ordinary_calls(transcript: Sequence[Any]) -> list[Any]:
         if call.capability_id not in {"delegate", "workflow", "scratch", "synthesis", "capsule"}
         and getattr(results.get(call.call_id), "ok", False)
     ]
+
+
+def _successful_excluded_calls(transcript: Sequence[Any]) -> list[Any]:
+    from athena.protocol.messages import CapabilityCallBlock, CapabilityResultBlock
+
+    excluded = {"delegate", "workflow", "scratch", "synthesis", "capsule"}
+    calls: dict[str, Any] = {}
+    results: dict[str, Any] = {}
+    for item in transcript:
+        for block in getattr(item, "blocks", ()):
+            if isinstance(block, CapabilityCallBlock) and block.capability_id in excluded:
+                calls[block.call_id] = block
+            elif isinstance(block, CapabilityResultBlock):
+                results[block.call_id] = block
+    return [call for call in calls.values() if getattr(results.get(call.call_id), "ok", False)]
+
+
+def _procedure_evidence(transcript: Sequence[Any], calls: Sequence[Any]) -> dict[str, Any]:
+    from athena.protocol.messages import CapabilityResultBlock
+
+    results: dict[str, Any] = {}
+    text = _transcript_text(transcript).casefold()
+    for item in transcript:
+        for block in getattr(item, "blocks", ()):
+            if isinstance(block, CapabilityResultBlock) and block.ok:
+                results[block.call_id] = block
+    steps: list[str] = []
+    observations: list[str] = []
+    capabilities: list[str] = []
+    for index, call in enumerate(calls, 1):
+        arguments = dict(getattr(call, "arguments", {}) or {})
+        operation = str(arguments.get("operation") or "call")
+        keys = sorted(str(key) for key in arguments if key != "operation")
+        capability = str(call.capability_id)
+        if capability not in capabilities:
+            capabilities.append(capability)
+        suffix = f"; named inputs: {', '.join(keys)}" if keys else ""
+        steps.append(
+            f"{index}. Use `{capability}` ({operation}){suffix}; substitute task-local values."
+        )
+        result = results.get(getattr(call, "call_id", ""))
+        shape = _output_shape(getattr(result, "output", "") if result else "")
+        observations.append(
+            f"`{capability}` returns a successful result"
+            + (f" with shape {shape}" if shape else "")
+            + "; inspect it before continuing."
+        )
+    verification = (
+        "Confirm the final result against the task's acceptance criteria and any "
+        "independent test/check output."
+        if any(marker in text for marker in ("verify", "validated", "passed", "test", "check"))
+        else "Run an independent check of the intended outcome before reporting success."
+    )
+    return {
+        "capabilities": capabilities,
+        "steps": steps,
+        "observations": observations,
+        "verification": verification,
+        "stopping": "Stop after the independent check passes; stop and preserve diagnostics on failure.",
+    }
+
+
+def _output_shape(raw: str) -> str:
+    if not raw:
+        return ""
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return "a non-JSON result"
+    if isinstance(value, dict):
+        return "object keys " + ", ".join(sorted(str(key) for key in value)[:8])
+    if isinstance(value, list):
+        return "array"
+    return type(value).__name__
 
 
 def _repeatable_procedure_evidence(

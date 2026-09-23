@@ -30,6 +30,59 @@ _GENERATED_EFFECTIVE_AUTHORITY = frozenset(
 _MISSING = object()
 
 
+def _verification_evidence(case: Mapping[str, object]) -> dict[str, object]:
+    """Describe what a validation fixture actually proves.
+
+    Running a generated program and checking its output schema is contract
+    evidence, not semantic evidence.  Keep that distinction attached to the
+    receipt so callers can permit task-local smoke tests without mistaking
+    them for proof suitable for promotion.
+    """
+    if isinstance(case.get("behavioral_oracle"), Mapping):
+        return {
+            "category": "behavioral_oracle",
+            "independent": True,
+            "source": "recorded_independent_oracle",
+        }
+    if "expect_output" in case:
+        return {
+            "category": "exact_output",
+            "independent": True,
+            "source": str(case.get("oracle_source") or "fixture_assertion"),
+        }
+    if case.get("expect_output_contains") is not None:
+        return {
+            "category": "output_assertion",
+            "independent": True,
+            "source": str(case.get("oracle_source") or "fixture_assertion"),
+        }
+    if case.get("invariants") or case.get("verification_requirements"):
+        return {
+            "category": "independent_invariant",
+            "independent": True,
+            "source": "service_verification_requirement",
+        }
+    if any(
+        case.get(key) is not None
+        for key in (
+            "trusted_reference",
+            "reference_output",
+            "reference_implementation",
+            "downstream_verification",
+        )
+    ):
+        return {
+            "category": "trusted_reference_or_downstream",
+            "independent": True,
+            "source": "declared_independent_oracle",
+        }
+    return {
+        "category": "execution_only",
+        "independent": False,
+        "source": "process_and_contract",
+    }
+
+
 def _child_code(cap_code_repr: str, *, persistent: bool = False) -> str:
     """Build the sandboxed child-process program for one capability.
 
@@ -72,7 +125,9 @@ def _child_code(cap_code_repr: str, *, persistent: bool = False) -> str:
         "            raise RuntimeError('generated host closed without a response')\n"
         "        envelope = json.loads(response)\n"
         "        if not envelope.get('ok'):\n"
-        "            raise RuntimeError(str(envelope.get('error') or 'host call failed'))\n"
+        "            failure = envelope.get('failure')\n"
+        "            detail = json.dumps(failure, sort_keys=True) if failure else str(envelope.get('error') or 'host call failed')\n"
+        "            raise RuntimeError('__ATHENA_FAILURE__' + detail)\n"
         "        return envelope.get('value')\n"
         "NS = {}\n"
         "NS['athena'] = _GeneratedHost()\n"
@@ -83,6 +138,9 @@ def _child_code(cap_code_repr: str, *, persistent: bool = False) -> str:
 def _candidate_ready(cap: SyntheticCapability) -> bool:
     """Require proof scaled to the capability's actual effect risk."""
     if cap.validation.get("all_passed") is not True or cap.failures != 0:
+        return False
+    semantic = cap.validation.get("semantic_verification") or {}
+    if semantic.get("verified_cases", 0) < 1:
         return False
     risk_tier = _risk_tier(cap)
     minimum_uses = {"low": 3, "medium": 4, "high": 5}[risk_tier]
@@ -108,6 +166,9 @@ def _promotion_proof_error(
     risk_tier = _risk_tier(cap)
     if cap.validation.get("all_passed") is not True:
         return "target-tier behavioral validation did not pass"
+    semantic = cap.validation.get("semantic_verification") or {}
+    if semantic.get("verified_cases", 0) < 1:
+        return "promotion requires at least one independent semantic verification case"
     if cap.failures:
         return "unresolved live failures remain"
     minimum_uses = {"low": 1, "medium": 2, "high": 3}[risk_tier]

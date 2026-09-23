@@ -60,6 +60,7 @@ class SkillCandidate:
     evidence: tuple[str, ...] = ()
     confidence: float = 0.0
     promotion_hint: bool = True
+    target_skill_version: int | None = None
 
     @property
     def propose_name(self) -> str:

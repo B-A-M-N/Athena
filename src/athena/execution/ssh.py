@@ -25,7 +25,12 @@ from athena.execution.ssh_session import (
 from athena.execution.ssh_lifecycle import SSHSessionLifecycle
 from athena.execution.ssh_transport import SSHTransport
 from athena.execution.ssh_capabilities import ssh_capabilities
-from athena.protocol.execution import ExecutionEvent, ExecutionEventType, ExecutionRequest
+from athena.protocol.execution import (
+    ExecutionEvent,
+    ExecutionEventType,
+    ExecutionLimits,
+    ExecutionRequest,
+)
 from athena.protocol.tasks import NetworkPolicy
 
 
@@ -34,6 +39,7 @@ __all__ = ["SSHBackend", "SSHProfile", "_REMOTE_PYTHON_SUPERVISOR_V2"]
 
 class SSHBackend(ExecutionBackend):
     """Run persistent Python, shell, and Node workers over a fixed SSH profile."""
+
     supports_reattach = True
 
     def __init__(
@@ -169,8 +175,11 @@ class SSHBackend(ExecutionBackend):
         cwd: str | None = None,
         env: Mapping[str, str] | None = None,
         workspace_root: str | None = None,
-        network_policy: NetworkPolicy | str | None = None,
+        network_policy: str | None = None,
+        resource_limits: ExecutionLimits | None = None,
     ) -> str:
+        if resource_limits is not None:
+            raise RuntimeError("ssh backend does not enforce resource limits")
         session = await run_blocking(
             self._make_session,
             _pool="long",

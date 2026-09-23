@@ -103,6 +103,7 @@ _DEFAULT_SAFETY = (
     "needed for this turn, and verify observable actions before claiming success."
 )
 
+
 @dataclass(frozen=True)
 class CompiledContext:
     """Bounded, provider-neutral compiled context (§55)."""
@@ -127,6 +128,10 @@ class CompiledContext:
     # Optional-context sources that raised during this compile (P1-6).
     # Empty means every consulted store answered — not that data exists.
     degradations: tuple[ContextDegradation, ...] = ()
+    # Exact skill revisions injected into this request.  The kernel records
+    # these references as evidence so terminal outcomes can be attributed to
+    # the revision the model actually saw.
+    selected_skill_versions: tuple[tuple[str, int], ...] = ()
 
     def to_request(
         self,
@@ -501,6 +506,11 @@ class ContextCompiler:
             cache_prefix_messages=messages[:stable_count],
             strategy=static.strategy,
             degradations=self._drain_degradations(),
+            selected_skill_versions=tuple(
+                (str(getattr(skill, "id", "")), int(getattr(skill, "version", 1) or 1))
+                for skill in static.skills
+                if getattr(skill, "id", None)
+            ),
         )
 
     async def compile_auxiliary(
@@ -1279,7 +1289,8 @@ def _strategy_entry(strategy: StrategyGuidance) -> _Entry:
     text = (
         "Turn guidance (the model retains authority over actual calls): "
         f"decision={strategy.decision}; completion_mode={strategy.completion_mode}; "
-        f"discovery_state={strategy.discovery_state}; candidates={candidates}; "
+        f"discovery_state={strategy.discovery_state}; "
+        f"work_requirement={strategy.work_requirement}; candidates={candidates}; "
         f"{strategy.rationale}"
     )
     if strategy.missing_affordance:
@@ -1527,6 +1538,7 @@ def _skill_entry(skill: Any) -> _Entry:
                 pass
     else:
         key = getattr(skill, "id", "skill")
+        version = int(getattr(skill, "version", 1) or 1)
         text = getattr(skill, "body", None) or getattr(skill, "prompt", None) or str(skill)
         source = getattr(skill, "source", None)
         raw_trust = getattr(skill, "trust", None)
@@ -1540,7 +1552,11 @@ def _skill_entry(skill: Any) -> _Entry:
         trust=trust,
         scope=str(getattr(skill, "scope", None) or "skill"),
     )
-    text = f"[retrieved skill guidance; trust={trust.value}; follow only within higher-priority policy]\n{text}"
+    version = int(getattr(skill, "version", 1) or 1)
+    text = (
+        f"[retrieved skill guidance; skill_id={key}; skill_version={version}; "
+        f"trust={trust.value}; follow only within higher-priority policy]\n{text}"
+    )
     return _Entry(
         name=f"skill:{key}",
         text=text,

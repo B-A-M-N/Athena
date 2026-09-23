@@ -22,7 +22,7 @@ class ContainmentProof:
     checks: tuple[str, ...] = ()
     proven: Mapping[str, bool] = field(default_factory=dict)
     failures: tuple[str, ...] = ()
-    contract_checks: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    contract_checks: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
 
 def containment_source(
@@ -144,9 +144,8 @@ async def prove_containment(
 ) -> ContainmentProof:
     claims = {"filesystem_containment": "FS=DENIED", "network_containment": "NET=DENIED"}
     proven = {name: False for name in claims}
-    contract_checks: dict[str, Mapping[str, str]] = {
-        name: {"status": "unverified" if advertised[name] else "not_advertised"}
-        for name in claims
+    contract_checks: dict[str, Mapping[str, Any]] = {
+        name: {"status": "unverified" if advertised[name] else "not_advertised"} for name in claims
     }
     checks: list[str] = []
     failures: list[str] = []
@@ -182,7 +181,12 @@ async def prove_containment(
                 if not positive_ok:
                     contract_checks["network_containment"] = {
                         "status": "failed",
-                        "detail": positive_detail,
+                        "positive_control": positive_detail,
+                    }
+                else:
+                    contract_checks["network_containment"] = {
+                        "status": "unverified",
+                        "positive_control": positive_detail,
                     }
                     if require_all_claims:
                         failures.append(
@@ -215,13 +219,22 @@ async def prove_containment(
             for name, marker in claims.items():
                 if not advertised[name]:
                     continue
-                if name == "network_containment" and contract_checks[name].get("status") == "failed":
+                if (
+                    name == "network_containment"
+                    and contract_checks[name].get("status") == "failed"
+                ):
+                    failed_check = dict(contract_checks[name])
+                    failed_check["restricted_control"] = containment_result.stdout[-500:]
+                    contract_checks[name] = failed_check
                     continue
                 ok = containment_result.exit_code == 0 and marker in containment_result.stdout
-                contract_checks[name] = {
+                check = {
                     "status": "passed" if ok else "failed",
-                    "detail": containment_result.stdout[-500:],
+                    "restricted_control": containment_result.stdout[-500:],
                 }
+                if name == "network_containment":
+                    check["positive_control"] = contract_checks[name].get("positive_control", "")
+                contract_checks[name] = check
                 if ok:
                     checks.append(name)
                     proven[name] = True

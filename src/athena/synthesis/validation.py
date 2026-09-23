@@ -34,6 +34,7 @@ from athena.synthesis.helpers import (
     _admit_generated_input,
     _schema_for_values,
     _service_negative_cases,
+    _verification_evidence,
 )
 from athena.synthesis.sandbox_runner import ValidationSandboxRunner
 from athena.synthesis.helpers import _risk_tier, canonical_generated_identity
@@ -354,6 +355,32 @@ class Validator:
             output_schema_inferred = True
 
         total = len(details)
+        semantic_cases = 0
+        for index, detail in enumerate(details):
+            evidence = _verification_evidence(cases[index] if index < len(cases) else {})
+            detail["verification_category"] = evidence["category"]
+            detail["verification_source"] = evidence["source"]
+            detail["semantic_verification"] = evidence["independent"] is True
+            if detail["semantic_verification"] and detail.get("passed") is True:
+                semantic_cases += 1
+        derived_cases = derive_proof_cases(cap.input_schema, cap.effective_effects)
+        derived_records = await self._run_derived_proof_cases(
+            cap,
+            derived_cases,
+            authored_cases=cases,
+            authored_details=details,
+            tier=tier,
+            workspace_root=workspace_root,
+            workspace=workspace,
+            task_id=task_id,
+            session_id=session_id,
+            profile=profile,
+            task_policy=task_policy,
+            task_budget=task_budget,
+            generated_call_depth=generated_call_depth,
+            generated_call_chain=generated_call_chain,
+            timeout=timeout,
+        )
         cap.validation = {
             "tier": tier if isinstance(tier, str) else tier.value,
             "cases_total": total,
@@ -374,12 +401,22 @@ class Validator:
             "negative_cases": negative_details,
             "live_failure_cases": historical_failures,
             "regression_cases": historical_failures,
+            "semantic_verification": {
+                "verified_cases": semantic_cases,
+                "total_cases": total,
+                "unverified_cases": max(total - semantic_cases, 0),
+                "promotion_required": True,
+                "status": "verified" if semantic_cases else "execution_only",
+            },
         }
-        derived_cases = derive_proof_cases(cap.input_schema, cap.effective_effects)
         cap.validation["derived_proof_corpus"] = {
             "source": "schema_and_effects",
             "digest": corpus_digest(derived_cases),
-            "cases": [case.to_record() for case in derived_cases],
+            "cases": derived_records,
+            "executed": sum(
+                1 for case in derived_records if case.get("analyzer_status") in {"passed", "failed"}
+            ),
+            "passed": sum(1 for case in derived_records if case.get("analyzer_status") == "passed"),
         }
         independent_review = GeneratedCapabilityVerifier.review(cap)
         cap.validation["independent_verification"] = independent_review
@@ -396,6 +433,115 @@ class Validator:
             )
             cap.id_generated = False
         return cap
+
+    async def _run_derived_proof_cases(
+        self,
+        cap: SyntheticCapabilityT,
+        derived_cases,
+        *,
+        authored_cases: list[dict],
+        authored_details: list[dict],
+        tier,
+        workspace_root,
+        workspace,
+        task_id,
+        session_id,
+        profile,
+        task_policy,
+        task_budget,
+        generated_call_depth,
+        generated_call_chain,
+        timeout,
+    ) -> list[dict[str, Any]]:
+        """Execute derived schema cases without merging them into authored proof."""
+        executable: list[tuple[Any, dict[str, Any]]] = []
+        records: list[dict[str, Any]] = []
+        authored_inputs = {
+            json.dumps(
+                item.get("input") if "input" in item else item.get("args") or {},
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ): index
+            for index, item in enumerate(authored_cases)
+            if index < len(authored_details)
+            and authored_details[index].get("passed") is True
+            and not (
+                item.get("expect_failure")
+                or item.get("expect_error_contains") is not None
+                or item.get("expected_error") is not None
+            )
+        }
+        has_authored_positive = bool(authored_inputs)
+        native_dependencies = bool(cap.required_capabilities)
+        schema = cap.input_schema if isinstance(cap.input_schema, Mapping) else {}
+        unconstrained_object = (
+            schema.get("type", "object") == "object"
+            and not schema.get("required")
+            and not schema.get("properties")
+        )
+        workspace_bound = workspace_root is not None or workspace is not None
+        for case in derived_cases:
+            record = case.to_record()
+            if case.kind == "positive" and case.expected == "accept":
+                input_key = json.dumps(
+                    case.input, sort_keys=True, separators=(",", ":"), default=str
+                )
+                if input_key in authored_inputs:
+                    record["analyzer_status"] = "passed"
+                    record["result"] = {
+                        "passed": True,
+                        "covered_by_authored_case": authored_inputs[input_key],
+                    }
+                elif (
+                    native_dependencies
+                    or workspace_bound
+                    or unconstrained_object
+                    or (authored_cases and not has_authored_positive)
+                ):
+                    record["analyzer_status"] = "unverified"
+                    record["verification_note"] = (
+                        "no standalone derived input was safe to execute; "
+                        "authored validation evidence remains the behavioral oracle"
+                    )
+                else:
+                    executable.append((case, {"input": case.input}))
+            elif case.kind == "negative" and case.expected == "reject":
+                executable.append((case, {"input": case.input, "expect_invalid_input": True}))
+            else:
+                record["analyzer_status"] = "unverified"
+                record["verification_note"] = "no executable behavioral oracle was derivable"
+            records.append(record)
+        if not executable:
+            return records
+        records_by_id = {str(record["id"]): record for record in records}
+
+        runner = ValidationSandboxRunner(
+            self._e,
+            cap=cap,
+            cases=[case for _derived, case in executable],
+            historical_by_id={},
+            tier=tier,
+            workspace_root=workspace_root,
+            workspace=workspace,
+            task_id=task_id,
+            session_id=session_id,
+            profile=profile,
+            task_policy=task_policy,
+            task_budget=task_budget,
+            generated_call_depth=generated_call_depth,
+            generated_call_chain=generated_call_chain,
+            timeout=timeout,
+            emit_progress=False,
+        )
+        result = await runner.run()
+        details = iter(result.details)
+        for case, _case_input in executable:
+            record = records_by_id[str(case.id)]
+            detail = next(details, {"passed": False, "error": "derived case produced no receipt"})
+            record["analyzer_status"] = "passed" if detail.get("passed") is True else "failed"
+            record["result"] = dict(detail)
+        return records
 
     async def _emit_validation_progress(
         self,

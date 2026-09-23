@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
@@ -68,6 +69,7 @@ class ValidationSandboxRunner:
         generated_call_depth: int,
         generated_call_chain: tuple[str, ...],
         timeout: float = 15.0,
+        emit_progress: bool = True,
     ) -> None:
         self._e = engine
         self.cap = cap
@@ -84,6 +86,7 @@ class ValidationSandboxRunner:
         self.generated_call_depth = generated_call_depth
         self.generated_call_chain = generated_call_chain
         self.timeout = timeout
+        self.emit_progress = emit_progress
         self.validation_parent: str | None = None
         self.result = SandboxResult()
 
@@ -220,23 +223,26 @@ class ValidationSandboxRunner:
         except (KeyError, OSError, TypeError, ValueError) as exc:
             self.result.details.append({"case": index, "passed": False, "error": str(exc)})
         finally:
-            await self._e._emit_validation_progress(
-                task_id=self.task_id or self.cap.task_id,
-                capability_id=self.cap.id,
-                completed=index + 1,
-                total=len(self.cases),
-            )
+            if self.emit_progress:
+                await self._e._emit_validation_progress(
+                    task_id=self.task_id or self.cap.task_id,
+                    capability_id=self.cap.id,
+                    completed=index + 1,
+                    total=len(self.cases),
+                )
 
     def _record_invalid_input(self, index: int, case: dict, input_errors: list[str]) -> None:
         regression_id = str(case.get("id") or "")
-        if case.get("expect_invalid_input") and regression_id in self.historical_by_id:
-            self.historical_by_id[regression_id]["resolved_by_revision"] = self.cap.revision
+        replay = self._record_historical_replay(
+            regression_id, passed=bool(case.get("expect_invalid_input"))
+        )
         self.result.details.append(
             {
                 "case": index,
                 "passed": bool(case.get("expect_invalid_input")),
                 "error": "input contract: " + "; ".join(input_errors),
                 **({"regression_id": regression_id} if regression_id else {}),
+                **replay,
             }
         )
         if case.get("expect_invalid_input"):
@@ -247,15 +253,27 @@ class ValidationSandboxRunner:
     ) -> None:
         raw_invariants = case.get("invariants")
         raw_requirements = case.get("verification_requirements")
+        oracle = case.get("behavioral_oracle")
         combined: list[object] = []
         if isinstance(raw_invariants, (list, tuple)):
             combined.extend(raw_invariants)
         if isinstance(raw_requirements, (list, tuple)):
             combined.extend(raw_requirements)
+        if isinstance(oracle, Mapping) and isinstance(oracle.get("invariants"), (list, tuple)):
+            combined.extend(oracle["invariants"])
         invariant_errors = await _check_invariants({**case, "invariants": combined}, case_host)
         if invariant_errors:
+            regression_id = str(case.get("id") or "")
             self.result.details.append(
-                {"case": index, "passed": False, "value": None, "rc": rc, "error": invariant_errors}
+                {
+                    "case": index,
+                    "passed": False,
+                    "value": None,
+                    "rc": rc,
+                    "error": invariant_errors,
+                    **({"regression_id": regression_id} if regression_id else {}),
+                    **self._record_historical_replay(regression_id, passed=False),
+                }
             )
             return
         self._record_result(index, case, out, err, rc, case_root, before, case_host)
@@ -265,6 +283,20 @@ class ValidationSandboxRunner:
         ok = rc == 0
         value = None
         output_errors: list[str] = []
+        expected_failure = bool(
+            case.get("expect_failure")
+            or case.get("expect_error_contains") is not None
+            or case.get("expected_error") is not None
+        )
+        if ok and not expected_failure:
+            lines = [line for line in out.splitlines() if line.strip()]
+            result_lines = [line for line in lines if line.startswith("__RESULT__")]
+            if not result_lines:
+                ok = False
+                output_errors.append("missing result envelope")
+            elif len(result_lines) != 1 or len(lines) != 1:
+                ok = False
+                output_errors.append("extra incompatible protocol output")
         if ok and "__RESULT__" in out:
             try:
                 line = out.split("__RESULT__", 1)[1].splitlines()[0]
@@ -272,20 +304,21 @@ class ValidationSandboxRunner:
                 self.result.observed_values.append(value)
             except (IndexError, json.JSONDecodeError):
                 ok = False
+                output_errors.append("malformed result envelope")
         if ok and self.cap.output_schema is not None:
             output_errors = validate_schema(self.cap.output_schema, value)
             ok = not output_errors
-        expect = case.get("expect_output_contains")
+        oracle = case.get("behavioral_oracle")
+        oracle_map = oracle if isinstance(oracle, Mapping) else {}
+        expect = case.get("expect_output_contains", oracle_map.get("expect_output_contains"))
         if expect is not None:
             ok = value is not None and ok and str(expect).lower() in json.dumps(value).lower()
-        expected_output = case.get("expect_output", _MISSING)
+        expected_output = case.get(
+            "expect_output",
+            oracle_map.get("expect_output", oracle_map.get("expected_output", _MISSING)),
+        )
         if expected_output is not _MISSING:
             ok = ok and value == expected_output
-        expected_failure = bool(
-            case.get("expect_failure")
-            or case.get("expect_error_contains") is not None
-            or case.get("expected_error") is not None
-        )
         if expected_failure:
             ok = rc != 0
             expected_error = case.get("expect_error_contains")
@@ -322,5 +355,40 @@ class ValidationSandboxRunner:
         )
         if ok:
             self.result.passed += 1
-        if ok and case.get("id") in self.historical_by_id:
-            self.historical_by_id[str(case["id"])]["resolved_by_revision"] = self.cap.revision
+        regression_id = str(case.get("id") or "")
+        replay = self._record_historical_replay(regression_id, passed=ok)
+        if replay:
+            self.result.details[-1].update(replay)
+
+    def _record_historical_replay(self, regression_id: str, *, passed: bool) -> dict[str, object]:
+        """Record replay truth; execution recovery alone is not semantic proof."""
+        record = self.historical_by_id.get(regression_id)
+        if record is None:
+            return {}
+        oracle = record.get("behavioral_oracle")
+        has_oracle = isinstance(oracle, Mapping) and bool(oracle)
+        record["last_replay"] = {
+            "revision": self.cap.revision,
+            "reproduced": not passed,
+            "semantic_oracle_available": has_oracle,
+            "status": (
+                "reproduced"
+                if not passed
+                else "resolved"
+                if has_oracle
+                else "execution_recovered_semantically_unverified"
+            ),
+        }
+        if passed and has_oracle:
+            record["resolved_by_revision"] = self.cap.revision
+        return {
+            "regression_id": regression_id,
+            "regression_reproduced": not passed,
+            "regression_resolution": (
+                "proven"
+                if passed and has_oracle
+                else "execution_recovered_semantically_unverified"
+                if passed
+                else "reproduced"
+            ),
+        }

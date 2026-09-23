@@ -49,5 +49,6 @@
   "048_inference_accounting.sql": "2021c8b156d034489efef66a92d1136bad5fc2a955cfd826f8edde5701328c88",
   "049_inference_obligations.sql": "6800d0369fae7ef3a9e35c063558a44826fb0c3fa6aae0913cb3046337706d5e",
   "050_inference_attempt_authority.sql": "bbe6c94cfe181855131718e933e2c60be4cedd5e0927c5a268ea1ed7d29a3932",
-  "051_event_identity_canonicalization.sql": "771c6d7e2576e8fa2bc2776e9476e7f676fabf913252437ef16f2ca742a767f0"
+  "051_event_identity_canonicalization.sql": "771c6d7e2576e8fa2bc2776e9476e7f676fabf913252437ef16f2ca742a767f0",
+  "052_skill_candidate_targets.sql": "434e80a6520f23962f99e235f91b08e52254e5968684dbd2a168c4790d940c06"
 }

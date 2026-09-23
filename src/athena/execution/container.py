@@ -31,6 +31,7 @@ from athena.execution.runtimes.base import BaseRuntime
 from athena.protocol.execution import (
     ExecutionEvent,
     ExecutionEventType,
+    ExecutionLimits,
     ExecutionRequest,
 )
 from athena.protocol.tasks import NetworkPolicy
@@ -117,6 +118,7 @@ class ContainerBackend(ExecutionBackend):
                 for runtime in ("python", "shell")
             },
         )
+
     def available(self) -> bool:
         return self._transport.available()
 
@@ -236,8 +238,11 @@ class ContainerBackend(ExecutionBackend):
         cwd: str | None = None,
         env: Mapping[str, str] | None = None,
         workspace_root: str | None = None,
-        network_policy: NetworkPolicy | str | None = None,
+        network_policy: str | None = None,
+        resource_limits: ExecutionLimits | None = None,
     ) -> str:
+        if resource_limits is not None:
+            raise RuntimeError("container backend does not enforce resource limits")
         session_id = f"container_{task_id}_{uuid.uuid4().hex[:10]}"
         session = await run_blocking(
             self._make_session,

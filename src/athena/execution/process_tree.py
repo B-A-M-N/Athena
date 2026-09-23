@@ -9,13 +9,13 @@ processes after cancellation are a release-blocking defect).
 from __future__ import annotations
 
 import os
-import shutil
+import shutil  # noqa: F401 - release probes patch the compatibility surface
 import signal
 import subprocess
 import time
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable, cast
 
 from athena.execution.process_ownership import (
     capture_owned_processes,
@@ -32,9 +32,12 @@ from athena.execution.process_ownership import (
 from athena.execution.sandbox import namespace_path, network_syscalls_denied, sandbox_argv
 
 try:
-    import resource
+    import resource as _resource
+
+    resource: Any = _resource
 except ImportError:  # pragma: no cover - Windows does not expose POSIX rlimits
     resource = None
+
 
 @dataclass(frozen=True)
 class ProcessKillOutcome:
@@ -135,7 +138,11 @@ def spawn_owned(
         # host can create network sockets, a denied policy still requires the
         # normal isolated namespace below.
         effective_network_policy = normalized_network_policy
-        if normalized_network_policy and normalized_network_policy != "allow" and network_syscalls_denied():
+        if (
+            normalized_network_policy
+            and normalized_network_policy != "allow"
+            and network_syscalls_denied()
+        ):
             effective_network_policy = "allow"
         argv = sandbox_argv(
             argv,
@@ -155,9 +162,10 @@ def spawn_owned(
         # The process now starts in the namespace's path.  Passing the host
         # cwd to Popen would be both redundant and misleading.
         cwd = None
-    existing_preexec = popen_kwargs.pop("preexec_fn", None)
+    existing_preexec = cast(Callable[[], None] | None, popen_kwargs.pop("preexec_fn", None))
     cgroup_path = create_process_cgroup()
     if resource_limits is not None or existing_preexec is not None or cgroup_path is not None:
+
         def _preexec() -> None:
             if resource_limits is not None:
                 _apply_resource_limits(resource_limits)
@@ -375,9 +383,7 @@ async def kill_tree_async(process: Any, *, timeout: float = 3.0) -> ProcessKillO
         cgroup_path = getattr(process, "_athena_cgroup_path", None)
         pgid = getattr(process, "_athena_process_group_id", None)
         captured = (
-            capture_owned_processes(pid, process_group=pgid, cgroup_path=cgroup_path)
-            if pid
-            else {}
+            capture_owned_processes(pid, process_group=pgid, cgroup_path=cgroup_path) if pid else {}
         )
         for child, identity in captured.items():
             if child == pid or not process_alive(child, identity):

@@ -7,6 +7,7 @@ import pytest
 from athena.knowledge.pipeline import KnowledgePipeline
 from athena.protocol.messages import CapabilityCallBlock, CapabilityResultBlock
 from athena.protocol.tasks import TaskStatus
+from athena.skills.models import Skill
 from athena.workflows.mining import merge_observation
 from athena.workflows.models import Workflow, WorkflowStep
 
@@ -52,8 +53,7 @@ class _CandidateWorkflows(_Workflows):
         verification=None,
         observed_at=None,
     ):
-        from athena.workflows.mining import merge_observation
-
+        updated = None
         for workflow in self.saved:
             if workflow.id == workflow_id:
                 updated = merge_observation(workflow, task_id=task_id, steps=steps)
@@ -61,6 +61,113 @@ class _CandidateWorkflows(_Workflows):
                 return updated
         return None
 
+
+class _SkillEvents:
+    def __init__(self, events):
+        self._events = events
+
+    async def list_for_task(self, task_id):
+        return self._events
+
+
+class _OutcomeSkills:
+    def __init__(self):
+        self.skill = Skill(
+            id="skill-release",
+            name="release-checks",
+            description="Run release checks",
+            body="Run the checks and verify the receipt.",
+            triggers=("release", "checks"),
+            version=1,
+        )
+        self.outcomes = []
+        self.candidates = []
+
+    async def get(self, skill_id):
+        return self.skill if skill_id == self.skill.id else None
+
+    async def record_outcome(self, skill_id, **kwargs):
+        self.outcomes.append((skill_id, kwargs))
+        return {"status": "recorded"}
+
+    async def promote(self, candidate, **kwargs):
+        self.candidates.append((candidate, kwargs))
+        return None
+
+
+@pytest.mark.asyncio
+async def test_failed_skill_reuse_is_attributed_and_targets_exact_revision():
+    messages = [
+        SimpleNamespace(
+            blocks=(
+                CapabilityCallBlock(
+                    call_id="read",
+                    capability_id="fs",
+                    arguments={"operation": "read", "path": "release.toml"},
+                ),
+                CapabilityResultBlock(
+                    call_id="read", capability_id="fs", ok=True, output="config"
+                ),
+                CapabilityCallBlock(
+                    call_id="check",
+                    capability_id="execute",
+                    arguments={"command": "pytest -q"},
+                ),
+                CapabilityResultBlock(
+                    call_id="check", capability_id="execute", ok=True, output="passed"
+                ),
+            )
+        )
+    ]
+    skills = _OutcomeSkills()
+    pipeline = KnowledgePipeline(
+        messages=_Messages(messages),
+        skill_lifecycle=skills,
+        events=_SkillEvents(
+            [
+                SimpleNamespace(
+                    type="SkillContextSelected",
+                    payload={"skills": [{"skill_id": "skill-release", "version": 1}]},
+                )
+            ]
+        ),
+    )
+
+    await pipeline(
+        SimpleNamespace(
+            id="task-failed-reuse",
+            session_id="session-failed-reuse",
+            objective="follow these repeatable release steps and verify the project",
+        ),
+        SimpleNamespace(
+            status=TaskStatus.FAILED,
+            summary="the release check selected the wrong scope",
+            unresolved=("release scope",),
+        ),
+    )
+
+    assert skills.outcomes == [
+        (
+            "skill-release",
+            {
+                "version": 1,
+                "passed": False,
+                "task_id": "task-failed-reuse",
+                "failure": {
+                    "status": "FAILED",
+                    "summary": "the release check selected the wrong scope",
+                    "unresolved": ["release scope"],
+                },
+            },
+        )
+    ]
+    assert len(skills.candidates) == 1
+    candidate, kwargs = skills.candidates[0]
+    assert kwargs["authorized"] is False
+    assert candidate.target_skill == "skill-release"
+    assert candidate.target_skill_version == 1
+    assert candidate.draft.id == "skill-release"
+    assert candidate.draft.version == 1
 
 @pytest.mark.asyncio
 async def test_single_successful_trace_waits_for_repeatability():

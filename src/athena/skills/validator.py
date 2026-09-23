@@ -96,6 +96,8 @@ class SkillValidator:
         errors = list(result.errors)
         if not (0.0 <= candidate.confidence <= 1.0):
             errors.append("candidate confidence must be within [0, 1]")
+        if candidate.target_skill and candidate.target_skill_version is None:
+            errors.append("target skill refinements require an expected target version")
         return ValidationResult(
             ok=not errors,
             errors=tuple(errors),

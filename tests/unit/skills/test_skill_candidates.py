@@ -47,3 +47,8 @@ async def test_two_successful_ordinary_calls_can_create_skill_candidate():
     )
 
     assert len(candidates) == 1
+    body = candidates[0].draft.body
+    assert "Operational procedure" in body
+    assert "Expected observations" in body
+    assert "independent check" in body
+    assert candidates[0].draft.metadata["athena"]["evidence"]["semantic_status"] == "unverified"

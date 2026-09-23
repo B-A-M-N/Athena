@@ -373,10 +373,31 @@ class GeneratedExecutor:
 
         cap = self.cap
         cap.failures += 1
-        failure_class = (
-            "governance_failure"
-            if "host call" in (stderr or "").lower()
-            else "implementation_failure"
+        structured_failure: dict[str, Any] = {}
+        marker = "__ATHENA_FAILURE__"
+        if marker in (stderr or ""):
+            raw = str(stderr).split(marker, 1)[1].splitlines()[0]
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    structured_failure = parsed
+            except json.JSONDecodeError:
+                structured_failure = {}
+        failure_class = str(
+            structured_failure.get("failure_class")
+            or (
+                "governance_failure"
+                if "host call" in (stderr or "").lower()
+                else "implementation_failure"
+            )
+        )
+        recovery_action = str(
+            structured_failure.get("recovery_action")
+            or (
+                "request_authority_or_fail"
+                if failure_class == "governance_failure"
+                else "source_repair"
+            )
         )
         cap.lifecycle_state = _failure_lifecycle_state(failure_class)
         if failure_class == "implementation_failure":
@@ -388,6 +409,15 @@ class GeneratedExecutor:
                 environment_fingerprint=environment_signature,
             )
         proof_error = await self._persist_proof()
+        generated_failure = _generated_failure(
+            cap,
+            failure_class,
+            repairable=failure_class in {"implementation_failure", "contract_mismatch"},
+            evidence={
+                **structured_failure,
+                "recovery_action": recovery_action,
+            },
+        )
         return CapabilityResult(
             request.call_id,
             request.capability_id,
@@ -395,10 +425,7 @@ class GeneratedExecutor:
             error=(stderr or "synthetic failed")[-500:],
             metadata={
                 **({"proof_persistence_error": proof_error} if proof_error else {}),
-                "generated_failure": _generated_failure(
-                    cap,
-                    failure_class,
-                    repairable=failure_class == "implementation_failure",
-                ),
+                "generated_failure": generated_failure,
+                "diagnostic": generated_failure.get("diagnostic", {}),
             },
         )

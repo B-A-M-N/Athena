@@ -77,7 +77,7 @@ async def test_model_can_create_task_local_tool(tmp_path):
                 "properties": {"echo": {"type": "string"}},
             },
             "effects": ["READ_LOCAL"],
-            "validation_cases": [{"args": {"msg": "hello"}}],
+            "validation_cases": [{"args": {"msg": "hello"}, "expect_output": {"echo": "hello"}}],
         },
     )
 
@@ -479,7 +479,7 @@ async def test_synthesis_promotion_is_policy_checked(tmp_path):
                 "code": "def run(args):\n    return {'ok': True}\n",
                 "input_schema": {"type": "object"},
                 "effects": ["READ_LOCAL"],
-                "validation_cases": [{"args": {}}],
+                "validation_cases": [{"args": {}, "expect_output": {"ok": True}}],
             },
         )
     )
@@ -779,7 +779,7 @@ async def test_promoted_capability_usage_proof_survives_restart(tmp_path):
                     "properties": {"ok": {"type": "boolean"}},
                     "additionalProperties": False,
                 },
-                "validation_cases": [{"args": {"ok": True}}],
+                "validation_cases": [{"args": {"ok": True}, "expect_output": {"ok": True}}],
             },
         )
     )
@@ -880,7 +880,7 @@ async def test_promotion_persistence_failure_keeps_task_overlay_live(tmp_path, m
                     "properties": {"ok": {"type": "boolean"}},
                     "additionalProperties": False,
                 },
-                "validation_cases": [{"args": {"ok": True}}],
+                "validation_cases": [{"args": {"ok": True}, "expect_output": {"ok": True}}],
             },
         )
     )
@@ -970,8 +970,8 @@ async def test_candidate_can_be_rehydrated_and_promoted_after_restart(tmp_path):
                     "additionalProperties": False,
                 },
                 "validation_cases": [
-                    {"args": {"value": 1}},
-                    {"args": {"value": 2}},
+                    {"args": {"value": 1}, "expect_output": {"value": 1}},
+                    {"args": {"value": 2}, "expect_output": {"value": 2}},
                 ],
             },
         )

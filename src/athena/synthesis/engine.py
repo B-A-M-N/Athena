@@ -37,6 +37,7 @@ from athena.execution.process_tree import (  # noqa: F401 (patch seams)
 from athena.protocol.capabilities import (
     EffectClass,
 )
+from athena.protocol.failure import RecoveryDiagnostic
 from athena.schema import validate_schema
 from athena.protocol.resources import TaskResourceCloseResult
 from athena.protocol.tasks import WorkspaceSpec
@@ -126,7 +127,9 @@ def _child_code(cap_code_repr: str, *, persistent: bool = False) -> str:
         "            raise RuntimeError('generated host closed without a response')\n"
         "        envelope = json.loads(response)\n"
         "        if not envelope.get('ok'):\n"
-        "            raise RuntimeError(str(envelope.get('error') or 'host call failed'))\n"
+        "            failure = envelope.get('failure')\n"
+        "            detail = json.dumps(failure, sort_keys=True) if failure else str(envelope.get('error') or 'host call failed')\n"
+        "            raise RuntimeError('__ATHENA_FAILURE__' + detail)\n"
         "        return envelope.get('value')\n"
         "NS = {}\n"
         "NS['athena'] = _GeneratedHost()\n"
@@ -142,22 +145,29 @@ def _generated_failure(
     evidence: dict | None = None,
 ) -> dict[str, object]:
     """Expose a bounded repair signal without granting repair authority."""
+    recovery_action = (
+        "source_repair"
+        if repairable
+        else {
+            "environment_changed": "dependency_refresh_and_revalidation",
+            "provenance_stale": "evidence_reacquisition_and_revalidation",
+            "governance_failure": "request_authority_or_fail",
+            "missing_authority": "request_authority_or_fail",
+        }.get(failure_class, "inspect_and_revalidate")
+    )
     return {
         "capability_id": cap.id,
         "code_hash": hashlib.sha256(cap.code.encode()).hexdigest(),
         "failure_class": failure_class,
         "repairable": repairable,
         "repair_operation": "synthesis.repair" if repairable else None,
-        "recovery_action": (
-            "source_repair"
-            if repairable
-            else {
-                "environment_changed": "dependency_refresh_and_revalidation",
-                "provenance_stale": "evidence_reacquisition_and_revalidation",
-                "governance_failure": "request_authority_or_fail",
-                "missing_authority": "request_authority_or_fail",
-            }.get(failure_class, "inspect_and_revalidate")
-        ),
+        "recovery_action": recovery_action,
+        "diagnostic": RecoveryDiagnostic(
+            operation=cap.id,
+            failure_class=failure_class,
+            permitted_recovery=(recovery_action,),
+            evidence=evidence or {},
+        ).as_dict(),
         "evidence": evidence or {},
     }
 
@@ -176,6 +186,7 @@ def _remember_live_failure(
     failure_class: str,
     observed_failure: str,
     environment_fingerprint: str | None = None,
+    behavioral_oracle: Mapping[str, object] | None = None,
 ) -> None:
     """Retain repairable live failures as deterministic regression inputs."""
     raw_input = dict(arguments or {})
@@ -198,6 +209,7 @@ def _remember_live_failure(
         "expected_contract": expected_contract,
         "failure_class": failure_class,
         "observed_failure": observed_failure[-1000:],
+        "behavioral_oracle": dict(behavioral_oracle or {}),
     }
     encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"), default=str)
     fingerprint = hashlib.sha256(encoded.encode()).hexdigest()
@@ -211,6 +223,13 @@ def _remember_live_failure(
         expected_contract=expected_contract,
         observed_failure=observed_failure[-1000:],
         failure_class=failure_class,
+        behavioral_oracle=behavioral_oracle,
+        original_failure_reproduced=True,
+        last_replay={
+            "revision": cap.revision,
+            "reproduced": True,
+            "status": "original_failure_observed",
+        },
     ).to_record()
     for key in ("live_failure_cases", "regression_cases"):
         cases = cap.validation.setdefault(key, [])

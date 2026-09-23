@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -46,6 +47,7 @@ from athena.fusion.ports import FusionPorts
 from athena.fusion.selection import CandidateSelectionStore
 from athena.causal.fork import TaskForker
 from athena.protocol.capabilities import CapabilityRequestOrigin
+from athena.protocol.failure import RecoveryDiagnostic
 from athena.protocol.ids import new_id
 
 __all__ = ["ExperimentResult", "FusionOrchestrator"]
@@ -66,6 +68,9 @@ class ExperimentResult:
     error: str | None = None
     fork_id: str | None = None  # set when auto-forking on failure
     verified: bool = False  # shadow criteria + invariant envelope passed
+    elapsed_ms: float = 0.0
+    changed_resources: tuple[str, ...] = ()
+    failure_record: dict = field(default_factory=dict)
 
 
 class FusionOrchestrator:
@@ -195,6 +200,7 @@ class FusionOrchestrator:
             )
         )
         result = ExperimentResult()
+        started = time.monotonic()
         pre_experiment_sequence = 0
         try:
             timeline = await self.forker.timeline(task_id)
@@ -224,6 +230,8 @@ class FusionOrchestrator:
         if branch.status == "FAILED":
             result.status = "FAILED"
             result.error = branch.error
+            await self._attach_failure_record(result, proposal, task, branch)
+            result.elapsed_ms = round((time.monotonic() - started) * 1000, 3)
             await self._fail_path(
                 task_id, result, auto_fork_on_failure, ckpt_id, pre_experiment_sequence
             )
@@ -273,6 +281,7 @@ class FusionOrchestrator:
                     | set(changes.get("deleted", ()))
                 )
             )
+            result.changed_resources = changed_resources
             verifier_impact = getattr(
                 canonical_verifier,
                 "_candidate_verification",
@@ -313,6 +322,8 @@ class FusionOrchestrator:
                     or invariant_report.get("failed")
                     or "required invariant failed"
                 )
+                await self._attach_failure_record(result, proposal, task, branch)
+                result.elapsed_ms = round((time.monotonic() - started) * 1000, 3)
                 await self.shadow.discard(branch, reason=result.error)
                 await self._fail_path(
                     task_id,
@@ -338,6 +349,8 @@ class FusionOrchestrator:
                 if criteria_present
                 else "verification failed: no acceptance criteria were supplied"
             )
+            await self._attach_failure_record(result, proposal, task, branch)
+            result.elapsed_ms = round((time.monotonic() - started) * 1000, 3)
             await self.shadow.discard(branch, reason=result.error)
             await self._fail_path(
                 task_id, result, auto_fork_on_failure, ckpt_id, pre_experiment_sequence
@@ -352,6 +365,7 @@ class FusionOrchestrator:
 
         result.verified = True
         result.status = "CANDIDATE_READY"
+        result.elapsed_ms = round((time.monotonic() - started) * 1000, 3)
         await self._close_experiment_checkpoint(
             ckpt_id,
             task_owner=checkpoint_owner,
@@ -359,6 +373,58 @@ class FusionOrchestrator:
             state="CANDIDATE_READY",
         )
         return result
+
+    async def _attach_failure_record(self, result, proposal, task, branch) -> None:
+        """Attach typed evidence for kernel-owned recovery decisions."""
+        budget = getattr(task, "resource_budget", None) if task is not None else None
+        budget_record = None
+        budget_tracker = getattr(self.service, "_budgets", None) if self.service else None
+        remaining = None
+        if budget_tracker is not None and task is not None:
+            remaining_fn = getattr(budget_tracker, "remaining", None)
+            if callable(remaining_fn):
+                try:
+                    remaining = dict(await remaining_fn(task.id))
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    remaining = None
+        if budget is not None:
+            to_record = getattr(budget, "to_record", None)
+            if callable(to_record):
+                budget_record = to_record()
+            elif hasattr(budget, "__dict__"):
+                budget_record = dict(vars(budget))
+        diagnostic = RecoveryDiagnostic(
+            operation="fusion.speculative_proposal",
+            failure_class="speculative_verification_failure",
+            verification=tuple(item for item in result.verification if isinstance(item, dict)),
+            resource_constraints=remaining or budget_record or {},
+            permitted_recovery=(
+                "propose_materially_different_candidate",
+                "reverify_against_canonical_acceptance",
+                "stop_if_no_meaningful_alternative_or_budget",
+            ),
+            evidence={"branch_id": result.branch_id},
+        ).as_dict()
+        result.failure_record = {
+            "diagnostic": diagnostic,
+            "kind": "speculative_failure",
+            "failed_operation": [dict(item) for item in proposal],
+            "error": result.error,
+            "verification_results": list(result.verification),
+            "violated_invariants": list(
+                result.invariant_report.get("violations")
+                or result.invariant_report.get("failed")
+                or []
+            ),
+            "workspace_changes": list(result.changed_resources),
+            "remaining_execution_budget": remaining or budget_record,
+            "branch_id": result.branch_id,
+            "recovery_actions": [
+                "propose_materially_different_candidate",
+                "reverify_against_canonical_acceptance",
+                "stop_if_no_meaningful_alternative_or_budget",
+            ],
+        }
 
     async def compare(
         self,

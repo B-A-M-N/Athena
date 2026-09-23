@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from athena.protocol.errors import (
@@ -81,6 +81,35 @@ class FailureInfo:
             "kind": self.kind,
             "code": self.code,
             "fatal": self.fatal,
+        }
+
+
+@dataclass(frozen=True)
+class RecoveryDiagnostic:
+    """Typed evidence envelope consumed by the kernel's recovery reasoning.
+
+    This is descriptive data only. It names permitted recovery actions but
+    does not select or execute one; the AgentKernel remains the sole decision
+    authority.
+    """
+
+    operation: str = ""
+    failure_class: str = ""
+    verification: tuple[Mapping[str, Any], ...] = ()
+    environment: Mapping[str, Any] = field(default_factory=dict)
+    resource_constraints: Mapping[str, Any] = field(default_factory=dict)
+    permitted_recovery: tuple[str, ...] = ()
+    evidence: Mapping[str, Any] = field(default_factory=dict)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "operation": self.operation,
+            "failure_class": self.failure_class,
+            "verification": [dict(item) for item in self.verification],
+            "environment": dict(self.environment or {}),
+            "resource_constraints": dict(self.resource_constraints or {}),
+            "permitted_recovery": list(self.permitted_recovery),
+            "evidence": dict(self.evidence or {}),
         }
 
 
@@ -166,4 +195,4 @@ def failure_from_exception(exc: BaseException) -> FailureInfo:
     )
 
 
-__all__ = ["FailureInfo", "failure_from_exception"]
+__all__ = ["FailureInfo", "RecoveryDiagnostic", "failure_from_exception"]

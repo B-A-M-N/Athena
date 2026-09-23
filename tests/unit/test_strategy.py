@@ -110,6 +110,26 @@ def test_coding_mutation_defaults_to_fusion_when_speculative_surface_is_visible(
     assert guidance.completion_mode == "observable_work_required"
 
 
+def test_simple_readme_edit_stays_direct_when_advanced_capabilities_are_visible():
+    guidance = select_strategy(
+        "fix a typo in README.md",
+        ("fs", "execute", "fusion", "synthesis"),
+    )
+
+    assert guidance.route == "direct"
+    assert guidance.work_requirement == "persistent_mutation"
+    assert "fusion" not in guidance.candidates[:1]
+
+
+def test_unrelated_research_inventory_does_not_change_a_direct_edit():
+    guidance = select_strategy(
+        "fix a typo in README.md",
+        ("fs", "execute", "research", "fusion", "synthesis", "workflow"),
+    )
+
+    assert guidance.route == "direct"
+
+
 def test_coding_mutation_does_not_invent_a_missing_fusion_capability():
     guidance = select_strategy(
         "fix the parser bug in this repository",
@@ -133,7 +153,7 @@ def test_observation_work_does_not_get_the_mutation_fusion_override():
     assert guidance.completion_mode == "observable_work_required"
 
 
-def test_structured_tags_and_effects_can_select_a_route_without_keywords():
+def test_structured_tags_and_effects_do_not_override_task_requirements():
     guidance = select_strategy(
         "perform the bounded operation",
         (
@@ -147,8 +167,8 @@ def test_structured_tags_and_effects_can_select_a_route_without_keywords():
         ),
     )
 
-    assert guidance.route == "fusion"
-    assert guidance.route_kind == "fusion_shadow"
+    assert guidance.route == "direct"
+    assert guidance.work_requirement == "direct_execution"
 
 
 # ---------------------------------------------------------------------- #

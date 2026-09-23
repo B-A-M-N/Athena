@@ -99,6 +99,7 @@ class FusionCapability:
                 "checkpoint_id": {"type": "string"},
                 "label": {"type": "string"},
                 "reason": {"type": "string"},
+                "changes_from_previous": {"type": "string", "minLength": 1, "maxLength": 2000},
             },
             "oneOf": [
                 {"properties": {"operation": {"const": "run"}}, "required": ["proposal"]},
@@ -157,7 +158,18 @@ class FusionCapability:
                     profile=args.get("profile"),
                     auto_fork_on_failure=bool(args.get("auto_fork_on_failure", True)),
                 )
-                return _result(request, output=json.dumps(dataclasses.asdict(outcome)))
+                return _result(
+                    request,
+                    output=json.dumps(dataclasses.asdict(outcome)),
+                    metadata={
+                        "operation": operation,
+                        "branch_id": outcome.branch_id,
+                        "speculative_status": outcome.status,
+                        "diagnostic": dict(outcome.failure_record.get("diagnostic") or {}),
+                        "failure_record": dict(outcome.failure_record),
+                        "changes_from_previous": str(args.get("changes_from_previous") or ""),
+                    },
+                )
             if operation == "compare":
                 proposals = [
                     [dict(step) for step in proposal] for proposal in args.get("proposals") or ()
@@ -174,7 +186,20 @@ class FusionCapability:
                     invariants=[dict(item) for item in args.get("invariants") or ()],
                     profile=args.get("profile"),
                 )
-                return _result(request, output=json.dumps(outcome))
+                return _result(
+                    request,
+                    output=json.dumps(outcome),
+                    metadata={
+                        "operation": operation,
+                        "comparison_id": outcome.get("comparison_id"),
+                        "verified_count": outcome.get("verified_count", 0),
+                        "comparative_evidence": {
+                            str(item.get("branch_id")): dict(item.get("comparative_evidence") or {})
+                            for item in outcome.get("candidates", ())
+                            if item.get("branch_id")
+                        }
+                    },
+                )
 
             branch_id = str(args.get("branch_id") or "")
             if operation == "status":
@@ -292,13 +317,21 @@ def _checkpoint_owned_by_task(checkpoint: Any, task_id: str) -> bool:
     return owner is None or str(owner) == task_id
 
 
-def _result(request, *, ok: bool = True, output: str = "", error: str | None = None):
+def _result(
+    request,
+    *,
+    ok: bool = True,
+    output: str = "",
+    error: str | None = None,
+    metadata: dict[str, Any] | None = None,
+):
     return CapabilityResult(
         request.call_id,
         request.capability_id,
         CapabilityResultStatus.OK if ok else CapabilityResultStatus.FAILED,
         output=output,
         error=error,
+        metadata=metadata or {},
     )
 
 

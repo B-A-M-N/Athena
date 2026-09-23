@@ -83,6 +83,9 @@ class RegressionCase:
     expected_contract: Mapping[str, object]
     observed_failure: str
     failure_class: str
+    behavioral_oracle: Mapping[str, object] | None = None
+    original_failure_reproduced: bool | None = None
+    last_replay: Mapping[str, object] | None = None
     resolved_by_revision: int | None = None
 
     def to_record(self) -> dict[str, object]:
@@ -99,6 +102,11 @@ class RegressionCase:
             "expected_contract": dict(self.expected_contract),
             "observed_failure": self.observed_failure,
             "failure_class": self.failure_class,
+            "behavioral_oracle": (
+                dict(self.behavioral_oracle) if self.behavioral_oracle is not None else None
+            ),
+            "original_failure_reproduced": self.original_failure_reproduced,
+            "last_replay": dict(self.last_replay) if self.last_replay is not None else None,
             "resolved_by_revision": self.resolved_by_revision,
         }
 
@@ -115,6 +123,8 @@ class RegressionCase:
         raw_revision = record.get("revision_first_seen")
         raw_resolved = record.get("resolved_by_revision")
         raw_contract = record.get("expected_contract")
+        raw_oracle = record.get("behavioral_oracle")
+        raw_replay = record.get("last_replay")
         return cls(
             id=str(record.get("id") or ""),
             capability_family=str(record.get("capability_family") or capability_family),
@@ -129,5 +139,12 @@ class RegressionCase:
             expected_contract=dict(raw_contract) if isinstance(raw_contract, Mapping) else {},
             observed_failure=str(record.get("observed_failure") or ""),
             failure_class=str(record.get("failure_class") or "implementation_failure"),
+            behavioral_oracle=dict(raw_oracle) if isinstance(raw_oracle, Mapping) else None,
+            original_failure_reproduced=(
+                bool(record["original_failure_reproduced"])
+                if record.get("original_failure_reproduced") is not None
+                else None
+            ),
+            last_replay=dict(raw_replay) if isinstance(raw_replay, Mapping) else None,
             resolved_by_revision=(int(str(raw_resolved)) if raw_resolved is not None else None),
         )

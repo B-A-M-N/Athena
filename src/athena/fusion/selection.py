@@ -34,6 +34,7 @@ class ComparisonRecord:
     discarded_branch_ids: list[str] = field(default_factory=list)
     candidate_branch_ids: list[str] = field(default_factory=list)
     verification_certificates: dict[str, dict] = field(default_factory=dict)
+    comparative_evidence: dict[str, dict] = field(default_factory=dict)
     selected_branch_id: str | None = None
     selected_branch_fingerprint: str | None = None
     selected_certificate_hash: str | None = None
@@ -62,6 +63,7 @@ class ComparisonRecord:
             discarded_branch_ids=list(raw.get("discarded_branch_ids") or ()),
             candidate_branch_ids=verified,
             verification_certificates=dict(raw.get("verification_certificates") or {}),
+            comparative_evidence=dict(raw.get("comparative_evidence") or {}),
             selected_branch_id=raw.get("selected_branch_id"),
             selected_branch_fingerprint=raw.get("selected_branch_fingerprint"),
             selected_certificate_hash=raw.get("selected_certificate_hash"),
@@ -88,6 +90,7 @@ class CandidateSelectionStore:
         candidate_branch_ids: list[str],
         verified_branch_ids: list[str] | None = None,
         verification_certificates: dict[str, dict] | None = None,
+        comparative_evidence: dict[str, dict] | None = None,
     ) -> ComparisonRecord:
         verified = list(verified_branch_ids or ())
         if not verified:
@@ -103,6 +106,7 @@ class CandidateSelectionStore:
             ],
             candidate_branch_ids=verified,
             verification_certificates=dict(verification_certificates or {}),
+            comparative_evidence=dict(comparative_evidence or {}),
         )
         self._records[record.comparison_id] = record
         self._persist()

@@ -60,21 +60,24 @@ def passport_binding_errors(
     environment = passport.get("environment")
     if not isinstance(environment, Mapping) or not environment:
         errors.append("missing certification environment identity")
+    cells = passport.get("cells")
+    expected = passport.get("expected_runtimes")
     if not isinstance(expected_environment, Mapping) or not expected_environment:
         errors.append("certification environment expectation is not supplied")
     elif not isinstance(environment, Mapping) or any(
         environment.get(key) != value for key, value in expected_environment.items()
     ):
         errors.append("certification environment identity mismatch")
-    cells = passport.get("cells")
-    expected = passport.get("expected_runtimes")
     if not isinstance(cells, list) or not cells:
         errors.append("missing backend runtime cells")
     if not isinstance(expected, list) or not expected:
         errors.append("missing advertised runtime inventory")
     else:
-        runtimes = [str(cell.get("runtime") or "") for cell in cells if isinstance(cell, Mapping)]
-        if len(runtimes) != len(cells) or len(set(runtimes)) != len(runtimes):
+        cell_rows = cells if isinstance(cells, list) else []
+        runtimes = [
+            str(cell.get("runtime") or "") for cell in cell_rows if isinstance(cell, Mapping)
+        ]
+        if len(runtimes) != len(cell_rows) or len(set(runtimes)) != len(runtimes):
             errors.append("backend runtime cells are duplicated or malformed")
         expected_values = [str(item) for item in expected]
         if len(expected_values) != len(set(expected_values)):
@@ -434,7 +437,7 @@ async def run_backend_conformance(
         for runtime in advertised:
             checks: list[str] = []
             failures: list[str] = []
-            contract_checks: dict[str, dict[str, Any]] = {}
+            contract_checks: dict[str, Mapping[str, Any]] = {}
             session_id: str | None = None
             unverified: tuple[str, ...] = ()
             cell = runtime_caps.get(runtime, {}) if isinstance(runtime_caps, Mapping) else {}
@@ -568,19 +571,31 @@ async def run_backend_conformance(
                     "network_containment": advertised_contract["network_containment"],
                 }
                 if any(containment_claims.values()):
-                    proof = await prove_containment(
-                        manager,
-                        backend=backend,
-                        runtime=str(runtime),
-                        workspace_id=workspace_id,
-                        cwd=cwd,
-                        advertised=containment_claims,
-                        require_all_claims=require_all_claims,
-                    )
-                    checks.extend(proof.checks)
-                    failures.extend(proof.failures)
-                    proven_contract.update(proof.proven)
-                    contract_checks.update(proof.contract_checks)
+                    if workspace_root is None:
+                        detail = "workspace root is required for containment proof"
+                        for name, claimed in containment_claims.items():
+                            if claimed:
+                                contract_checks[name] = {
+                                    "status": "failed",
+                                    "detail": detail,
+                                }
+                                if require_all_claims:
+                                    failures.append(f"{name} proof failed: {detail}")
+                    else:
+                        proof = await prove_containment(
+                            manager,
+                            backend=backend,
+                            runtime=str(runtime),
+                            workspace_id=workspace_id,
+                            workspace_root=workspace_root,
+                            cwd=cwd,
+                            advertised=containment_claims,
+                            require_all_claims=require_all_claims,
+                        )
+                        checks.extend(proof.checks)
+                        failures.extend(proof.failures)
+                        proven_contract.update(proof.proven)
+                        contract_checks.update(proof.contract_checks)
                 unverified = tuple(
                     name
                     for name, claimed in advertised_contract.items()

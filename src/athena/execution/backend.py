@@ -14,7 +14,7 @@ import abc
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Mapping
 
-from athena.protocol.execution import ExecutionEvent, ExecutionRequest
+from athena.protocol.execution import ExecutionEvent, ExecutionLimits, ExecutionRequest
 
 __all__ = [
     "BackendCapabilities",
@@ -89,6 +89,7 @@ class ExecutionBackend(abc.ABC):
         env: Mapping[str, str] | None = None,
         workspace_root: str | None = None,
         network_policy: str | None = None,
+        resource_limits: ExecutionLimits | None = None,
     ) -> str:
         """Create a persistent runtime session scoped to ``task_id``."""
 
