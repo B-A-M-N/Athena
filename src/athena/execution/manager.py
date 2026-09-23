@@ -166,7 +166,12 @@ class ExecutionManager:
         return self._runtime_readiness.has_runtime(name)
 
     def validate_execution_request(self, request: ExecutionRequest) -> None:
-        """Reject limits that the selected execution boundary cannot enforce."""
+        """Reject request features the selected execution boundary cannot enforce."""
+        if request.stdin is not None:
+            raise ValueError(
+                "ExecutionRequest.stdin is not supported by the canonical runtime API; "
+                "use the task-owned interactive stdin operation"
+            )
         self._validate_resource_limits(
             request.backend, request.runtime, request.resource_limits
         )

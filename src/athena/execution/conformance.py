@@ -19,6 +19,20 @@ from athena.protocol.execution import ExecutionRequest
 from athena.protocol.tasks import NetworkPolicy
 
 
+def proof_status(
+    *,
+    checks: tuple[str, ...] | list[str] = (),
+    failures: tuple[str, ...] | list[str] = (),
+    unverified_claims: tuple[str, ...] | list[str] = (),
+) -> str:
+    """Return the canonical status for one behavioral proof cell."""
+    if tuple(str(item) for item in unverified_claims):
+        return "unverified"
+    if not checks or "execution" not in checks or failures:
+        return "failed"
+    return "passed"
+
+
 @dataclass(frozen=True)
 class ConformanceReceipt:
     backend: str
@@ -28,10 +42,18 @@ class ConformanceReceipt:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     @property
-    def passed(self) -> bool:
+    def proof_status(self) -> str:
         # A receipt with no executed checks is not evidence.  In particular,
         # an advertised runtime cannot earn PASS from a vacuous probe.
-        return bool(self.checks) and "execution" in self.checks and not self.failures
+        return proof_status(
+            checks=self.checks,
+            failures=self.failures,
+            unverified_claims=self.unverified_claims,
+        )
+
+    @property
+    def passed(self) -> bool:
+        return self.proof_status == "passed"
 
     @property
     def unverified_claims(self) -> tuple[str, ...]:
@@ -45,6 +67,7 @@ class ConformanceReceipt:
             "failures": list(self.failures),
             "unverified_claims": list(self.unverified_claims),
             "metadata": dict(self.metadata),
+            "proof_status": self.proof_status,
             "passed": self.passed,
         }
 
@@ -96,7 +119,7 @@ class BackendPassport:
         return (
             "PASS"
             if complete
-            and all(receipt.passed for receipt in self.receipts)
+            and all(receipt.proof_status == "passed" for receipt in self.receipts)
             and not self.unverified_claims
             else "FAIL"
         )
@@ -564,6 +587,7 @@ async def run_backend_passport(
 __all__ = [
     "BackendPassport",
     "ConformanceReceipt",
+    "proof_status",
     "run_backend_conformance",
     "run_backend_passport",
 ]

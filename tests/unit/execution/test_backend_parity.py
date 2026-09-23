@@ -110,3 +110,16 @@ async def test_backend_without_resource_limit_enforcement_fails_closed():
             backend="unsupported-limits",
             resource_limits=ExecutionLimits(max_cpu_seconds=1),
         )
+
+
+def test_execution_request_stdin_is_rejected_until_a_governed_input_contract_exists():
+    manager = ExecutionManager()
+    request = ExecutionRequest(
+        runtime="python",
+        source="pass",
+        task_id="stdin",
+        workspace_id="stdin",
+        stdin=b"input",
+    )
+    with pytest.raises(ValueError, match="stdin is not supported"):
+        manager.validate_execution_request(request)

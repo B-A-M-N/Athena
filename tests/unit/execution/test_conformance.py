@@ -3,6 +3,7 @@ import pytest
 from athena.execution.conformance import (
     BackendPassport,
     ConformanceReceipt,
+    proof_status,
     run_backend_conformance,
     run_backend_passport,
 )
@@ -53,7 +54,7 @@ class _ConformanceManager:
 async def test_conformance_executes_every_advertised_persistent_cell():
     receipts = await run_backend_conformance(_ConformanceManager(), backend="fixture")
     assert {receipt.runtime for receipt in receipts} == {"python", "shell", "node"}
-    assert all(receipt.passed for receipt in receipts), receipts
+    assert all(not receipt.passed for receipt in receipts), receipts
     assert all("persistent_runtime_state" in receipt.checks for receipt in receipts)
     assert all("reattach" in receipt.unverified_claims for receipt in receipts)
 
@@ -104,6 +105,35 @@ def test_empty_or_incomplete_backend_passports_fail_closed():
         ).status
         == "FAIL"
     )
+
+
+def test_proof_status_is_shared_by_receipts_and_operator_projection():
+    receipt = ConformanceReceipt(
+        backend="fixture",
+        runtime="python",
+        checks=("execution",),
+        metadata={"unverified_claims": ("network_containment",)},
+    )
+    assert proof_status(
+        checks=receipt.checks,
+        failures=receipt.failures,
+        unverified_claims=receipt.unverified_claims,
+    ) == "unverified"
+    assert receipt.passed is False
+    assert receipt.to_record()["proof_status"] == "unverified"
+
+    from athena.service.operational_matrix import behavioral_proof
+
+    projection = behavioral_proof(
+        {
+            "status": "FAIL",
+            "release_sha": "sha",
+            "cells": [receipt.to_record() | {"runtime": "python"}],
+        },
+        "python",
+    )
+    assert projection["status"] == "unverified"
+    assert projection["certified"] is False
 
 
 def test_containment_probe_uses_only_the_controlled_endpoint():

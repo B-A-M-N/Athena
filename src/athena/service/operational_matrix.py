@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from athena.execution.conformance import proof_status
 from athena.service.operational_matrix_ports import OperationalMatrixPorts
 
 
@@ -12,8 +13,16 @@ def behavioral_proof(passport: Any, runtime: Any) -> dict[str, Any]:
         return {"status": "not_run"}
     for cell in passport["cells"]:
         if isinstance(cell, dict) and cell.get("runtime") == runtime:
+            cell_status = proof_status(
+                checks=cell.get("checks") or (),
+                failures=cell.get("failures") or (),
+                unverified_claims=cell.get("unverified_claims") or (),
+            )
+            certified = passport.get("status") == "PASS" and cell_status == "passed"
             return {
-                "status": "passed" if cell.get("passed") else "failed",
+                "status": "passed" if certified else cell_status,
+                "certified": certified,
+                "passport_status": passport.get("status"),
                 "release_sha": passport.get("release_sha"),
                 "unverified_claims": list(cell.get("unverified_claims") or ()),
             }

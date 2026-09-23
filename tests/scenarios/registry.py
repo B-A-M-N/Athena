@@ -133,7 +133,7 @@ FUSE = (
         nodeids=(
             "tests/unit/models/test_role_router.py::test_router_exposes_selected_provider_without_second_authority",
         ),
-        required=False,  # companion scenario FUSE-002 documents the open defect
+        required=True,
         notes=(
             "RoleRouter exposes the selected provider without building a second "
             "authority. The single sanctioned ModelRouter construction site is "

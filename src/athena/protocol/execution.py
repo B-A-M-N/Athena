@@ -38,6 +38,9 @@ class ExecutionRequest:
     persistence: RuntimePersistence = RuntimePersistence.EPHEMERAL
     cwd: str | None = None
     env: Mapping[str, str] = field(default_factory=dict)
+    # Retained for wire compatibility only. ExecutionManager rejects this
+    # field because built-in persistent runtimes expose task-owned interactive
+    # stdin through a separate governed operation, not initial request input.
     stdin: bytes | None = None
     timeout: timedelta | None = None
     network_policy: NetworkPolicy | None = None
