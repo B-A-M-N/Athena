@@ -75,16 +75,15 @@ class BaseRuntime(metaclass=abc.ABCMeta):
         on task cancellation.
         """
         sid = request.runtime_session_id
-        if sid and sid in self._sessions:
-            session = self._sessions[sid]
-            if self._request_matches_session(request, session):
-                return sid, session
-            # An explicit session id was requested with differing env/cwd: close
-            # the old one and spawn a fresh session under the same id.
-            self._close_session(session)
-            self._sessions.pop(sid, None)
-            self._register_session(sid, self._make_session_for_request(request))
-            return sid, self._sessions[sid]
+        if sid:
+            session = self._sessions.get(sid)
+            if session is None:
+                raise PermissionError(f"unknown runtime session {sid}")
+            if not self._request_matches_session(request, session):
+                raise PermissionError(
+                    f"security-sensitive identity of runtime session {sid} cannot be changed"
+                )
+            return sid, session
         existing_sid = f"{self.name}_{request.task_id}"
         if existing_sid in self._sessions:
             existing = self._sessions[existing_sid]
@@ -110,6 +109,7 @@ class BaseRuntime(metaclass=abc.ABCMeta):
             "read_only_paths": request.read_only_paths,
             "toolchain_paths": request.toolchain_paths,
             "writable_toolchain_paths": request.writable_toolchain_paths,
+            "resource_limits": request.resource_limits,
         }
         return self._make_session_compatible(kwargs)
 
@@ -153,6 +153,8 @@ class BaseRuntime(metaclass=abc.ABCMeta):
             getattr(session, "writable_toolchain_paths", ()) or ()
         ):
             return False
+        if request.resource_limits != getattr(session, "resource_limits", None):
+            return False
         return True
 
     # ------------------------------------------------------------------ #
@@ -167,6 +169,7 @@ class BaseRuntime(metaclass=abc.ABCMeta):
         env: Mapping[str, str] | None = None,  # noqa: N802
         workspace_root: str | None = None,
         network_policy: str | None = None,
+        resource_limits=None,
         writable_paths: tuple[str, ...] | None = None,
         read_only_paths: tuple[str, ...] = (),
     ) -> str:
@@ -179,6 +182,7 @@ class BaseRuntime(metaclass=abc.ABCMeta):
                     "cwd": cwd,
                     "sandbox_root": workspace_root,
                     "network_policy": network_policy,
+                    "resource_limits": resource_limits,
                     "writable_paths": writable_paths,
                     "read_only_paths": read_only_paths,
                 }

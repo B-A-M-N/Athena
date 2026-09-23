@@ -10,6 +10,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +19,48 @@ from athena.execution.process_tree import ProcessKillOutcome, kill_tree, spawn_o
 
 def _sleep_process(seconds: float = 30) -> subprocess.Popen:
     return spawn_owned([sys.executable, "-c", f"import time; time.sleep({seconds})"])
+
+
+def test_restricted_network_requires_a_containment_root():
+    with pytest.raises(RuntimeError, match="requires a workspace sandbox"):
+        spawn_owned(
+            [sys.executable, "-c", "pass"],
+            network_policy="deny",
+        )
+
+
+def test_local_resource_limits_are_applied_before_runtime_start():
+    process = spawn_owned(
+        [
+            sys.executable,
+            "-c",
+            "import resource; print(resource.getrlimit(resource.RLIMIT_CPU)[0])",
+        ],
+        resource_limits=SimpleNamespace(max_cpu_seconds=1),
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        output, _stderr = process.communicate(timeout=5)
+        output = output.strip()
+        assert int(output) == 1
+    finally:
+        if process.poll() is None:
+            kill_tree(process)
+
+
+def test_kill_tree_proves_detached_descendant_cleanup():
+    source = (
+        "import subprocess, sys, time; "
+        "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], "
+        "start_new_session=True); "
+        "print(child.pid, flush=True); time.sleep(30)"
+    )
+    process = spawn_owned([sys.executable, "-c", source], stdout=subprocess.PIPE, text=True)
+    child_pid = int(process.stdout.readline().strip())
+    outcome = kill_tree(process, timeout=1.0)
+    assert outcome.proven_dead is True
+    assert child_pid not in outcome.survivors
 
 
 def test_kill_tree_reports_proven_death():

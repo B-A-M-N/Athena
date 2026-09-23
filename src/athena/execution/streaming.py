@@ -46,11 +46,10 @@ class ExecutionStreamCoordinator:
                 metadata={**dict(request.metadata), "__execution_id": execution_id},
             )
         runtime_session_id: str | None = request.runtime_session_id
-        if (
-            runtime_session_id
-            and runtime_session_id not in manager._cancellation_registry.runtime_by_session
-        ):
-            manager._cancellation_registry.runtime_by_session[runtime_session_id] = runtime
+        if runtime_session_id:
+            # An explicit session is an authority-bearing reference. Reject
+            # unknown or foreign ids before a backend can adopt or execute it.
+            manager._sessions.validate_session_access(runtime_session_id, request.task_id)
         exit_status: ExecutionExitStatus | None = None
         exit_code: int | None = None
         execution_metadata: dict[str, Any] = {}

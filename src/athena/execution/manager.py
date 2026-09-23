@@ -183,6 +183,7 @@ class ExecutionManager:
         env: dict[str, str] | None = None,
         workspace_root: str | None = None,
         network_policy: str | None = None,
+        resource_limits=None,
     ) -> str:
         return await self._sessions.create_session(
             task_id=task_id,
@@ -192,6 +193,7 @@ class ExecutionManager:
             env=env,
             workspace_root=workspace_root,
             network_policy=network_policy,
+            resource_limits=resource_limits,
         )
 
     async def reattach_session(self, record: Mapping[str, Any]) -> bool:
@@ -290,18 +292,7 @@ class ExecutionManager:
         Prevents a model from attaching itself to another task's runtime
         session by guessing its ID.
         """
-        # Direct task_sessions lookup
-        for _, known_sid in self._cancellation_registry.task_sessions.get(task_id, ()):
-            if known_sid == runtime_session_id:
-                return True
-        # Check adopted sessions from executions of this task
-        for _exec_id, (_, adopted_sid) in self._cancellation_registry.exec_runtimes.items():
-            if (
-                adopted_sid == runtime_session_id
-                and self._cancellation_registry.executions.get(_exec_id) == task_id
-            ):
-                return True
-        return False
+        return self._cancellation_registry.session_owners.get(runtime_session_id) == task_id
 
     def owns_process(
         self,

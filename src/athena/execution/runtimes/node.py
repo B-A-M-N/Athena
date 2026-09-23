@@ -89,6 +89,7 @@ class NodeRuntime(BaseRuntime):
         network_policy=None,
         writable_paths=None,
         read_only_paths=(),
+        resource_limits=None,
     ) -> "_NodeSession":
         sess = _NodeSession(
             env=env,
@@ -97,6 +98,7 @@ class NodeRuntime(BaseRuntime):
             network_policy=network_policy,
             writable_paths=writable_paths,
             read_only_paths=read_only_paths,
+            resource_limits=resource_limits,
         )
         sess.start()
         return sess
@@ -120,6 +122,7 @@ class _NodeSession:
         network_policy=None,
         writable_paths=None,
         read_only_paths=(),
+        resource_limits=None,
     ) -> None:
         self.env = env or {}
         self.cwd = cwd
@@ -127,6 +130,7 @@ class _NodeSession:
         self.network_policy = network_policy
         self.writable_paths = writable_paths
         self.read_only_paths = read_only_paths
+        self.resource_limits = resource_limits
         self.process: subprocess.Popen | None = None
         self.frames: "queue.Queue" = queue.Queue()
         self.lock = threading.Lock()
@@ -140,6 +144,7 @@ class _NodeSession:
             network_policy=self.network_policy,
             writable_paths=self.writable_paths,
             read_only_paths=self.read_only_paths,
+            resource_limits=self.resource_limits,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

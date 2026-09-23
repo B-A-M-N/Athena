@@ -16,7 +16,7 @@ import json
 import os
 import secrets
 import sys
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, AsyncIterator, Mapping
 
@@ -31,6 +31,19 @@ from athena.protocol.execution import (
 )
 
 __all__ = ["LocalRuntimeSupervisor", "SupervisedLocalBackend"]
+
+
+@dataclass(frozen=True)
+class _HostSession:
+    runtime: Any
+    underlying_id: str
+    runtime_name: str
+    task_id: str
+    cwd: str | None
+    env: Mapping[str, str]
+    workspace_root: str | None
+    network_policy: str | None
+    resource_limits: Mapping[str, Any] | None
 
 
 def _event_record(event: ExecutionEvent) -> dict[str, Any]:
@@ -84,7 +97,7 @@ class _RuntimeHost:
         }
         if NodeRuntime is not None and NodeRuntime.available():
             self.runtimes["node"] = NodeRuntime()
-        self.sessions: dict[str, tuple[Any, str, str, str]] = {}
+        self.sessions: dict[str, _HostSession] = {}
         self._stop_event = asyncio.Event()
 
     async def run(self) -> None:
@@ -142,12 +155,22 @@ class _RuntimeHost:
                 env=dict(request.get("env") or {}),
                 workspace_root=request.get("workspace_root"),
                 network_policy=request.get("network_policy"),
+                resource_limits=(
+                    _decode_request(request).resource_limits
+                    if request.get("resource_limits")
+                    else None
+                ),
             )
-            self.sessions[session_id] = (
-                runtime,
-                str(underlying),
-                runtime_name,
-                str(request.get("task_id") or ""),
+            self.sessions[session_id] = _HostSession(
+                runtime=runtime,
+                underlying_id=str(underlying),
+                runtime_name=runtime_name,
+                task_id=str(request.get("task_id") or ""),
+                cwd=request.get("cwd"),
+                env=dict(request.get("env") or {}),
+                workspace_root=request.get("workspace_root"),
+                network_policy=request.get("network_policy"),
+                resource_limits=dict(request.get("resource_limits") or {}) or None,
             )
             return {"kind": "response", "session_id": session_id}
         if operation == "ping":
@@ -161,7 +184,13 @@ class _RuntimeHost:
             self._stop_event.set()
             return {"kind": "response", "stopping": True}
         if operation == "describe":
-            runtime, underlying, runtime_name, task_id = self._session(str(request["session_id"]))
+            record = self._session(str(request["session_id"]), request.get("task_id"))
+            runtime, underlying, runtime_name, task_id = (
+                record.runtime,
+                record.underlying_id,
+                record.runtime_name,
+                record.task_id,
+            )
             session = getattr(runtime, "_sessions", {}).get(underlying)
             process = getattr(session, "process", None)
             pid = getattr(process, "pid", None)
@@ -179,20 +208,37 @@ class _RuntimeHost:
                 "process_identity": f"{pid}:{start_identity}" if pid else None,
             }
         if operation == "close":
-            runtime, underlying, _runtime_name, _task_id = self._session(str(request["session_id"]))
+            record = self._session(str(request["session_id"]), request.get("task_id"))
+            runtime, underlying = record.runtime, record.underlying_id
             await runtime.close(underlying)
             self.sessions.pop(str(request["session_id"]), None)
             return {"kind": "response", "closed": True}
         if operation == "interrupt":
-            runtime, _underlying, _runtime_name, _task_id = self._session(
-                str(request["session_id"])
-            )
+            record = self._session(str(request["session_id"]), request.get("task_id"))
+            runtime = record.runtime
             await runtime.interrupt(str(request["execution_id"]))
             return {"kind": "response", "interrupted": True}
         if operation == "execute":
             session_id = str(request["session_id"])
-            runtime, underlying, _runtime_name, _task_id = self._session(session_id)
             wire_request = _decode_request(dict(request["request"]))
+            record = self._session(session_id, wire_request.task_id)
+            if wire_request.runtime != record.runtime_name:
+                raise PermissionError("runtime identity cannot be changed for an existing session")
+            if wire_request.cwd is not None and wire_request.cwd != record.cwd:
+                raise PermissionError("working directory cannot be changed for an existing session")
+            if wire_request.env and dict(wire_request.env) != dict(record.env):
+                raise PermissionError("environment cannot be changed for an existing session")
+            if wire_request.workspace_root is not None and wire_request.workspace_root != record.workspace_root:
+                raise PermissionError("workspace identity cannot be changed for an existing session")
+            requested_network = getattr(wire_request.network_policy, "value", wire_request.network_policy)
+            if requested_network is not None and requested_network != record.network_policy:
+                raise PermissionError("network policy cannot be changed for an existing session")
+            requested_limits = (
+                asdict(wire_request.resource_limits) if wire_request.resource_limits else None
+            )
+            if requested_limits is not None and requested_limits != record.resource_limits:
+                raise PermissionError("resource limits cannot be changed for an existing session")
+            runtime, underlying = record.runtime, record.underlying_id
             wire_request = replace(wire_request, runtime_session_id=underlying, backend="local")
             async for event in runtime.execute(wire_request, str(request["execution_id"])):
                 writer.write(
@@ -202,10 +248,14 @@ class _RuntimeHost:
             return {"kind": "done"}
         raise ValueError(f"unknown runtime host operation: {operation}")
 
-    def _session(self, session_id: str):
+    def _session(self, session_id: str, task_id: object = None) -> _HostSession:
         value = self.sessions.get(session_id)
         if value is None:
             raise KeyError(f"unknown runtime session: {session_id}")
+        if task_id is not None and str(task_id) != value.task_id:
+            raise PermissionError(
+                f"runtime session {session_id} belongs to task {value.task_id}, not {task_id}"
+            )
         return value
 
 
@@ -386,7 +436,15 @@ class SupervisedLocalBackend(ExecutionBackend):
         )
 
     async def create_session(
-        self, *, task_id, runtime, cwd=None, env=None, workspace_root=None, network_policy=None
+        self,
+        *,
+        task_id,
+        runtime,
+        cwd=None,
+        env=None,
+        workspace_root=None,
+        network_policy=None,
+        resource_limits=None,
     ):
         await self.supervisor.start()
         session_id = f"local-host:{task_id}:{runtime}:{secrets.token_hex(8)}"
@@ -400,6 +458,7 @@ class SupervisedLocalBackend(ExecutionBackend):
                 "env": dict(env or {}),
                 "workspace_root": workspace_root,
                 "network_policy": getattr(network_policy, "value", network_policy),
+                "resource_limits": asdict(resource_limits) if resource_limits else None,
             }
         )
         self._sessions[session_id] = str(runtime)
@@ -430,6 +489,7 @@ class SupervisedLocalBackend(ExecutionBackend):
                 env=request.env,
                 workspace_root=request.workspace_root,
                 network_policy=request.network_policy,
+                resource_limits=request.resource_limits,
             )
             request = replace(request, runtime_session_id=session_id)
         elif session_id not in self._sessions:

@@ -21,6 +21,11 @@ from functools import lru_cache
 from typing import Any
 
 try:
+    import resource
+except ImportError:  # pragma: no cover - Windows does not expose POSIX rlimits
+    resource = None
+
+try:
     import psutil  # type: ignore
 except Exception:  # pragma: no cover - psutil is optional
     psutil = None
@@ -33,8 +38,9 @@ class ProcessKillOutcome:
     Cleanup may stay best-effort, but shutdown must KNOW when a tree could
     not be proven dead — silence is how orphaned processes survive a
     release gate. ``proven_dead`` is True only when the root was observed
-    exited (or was already dead); ``survivors`` lists pids that were still
-    alive after the escalation ladder.
+    exited (or was already dead) and every descendant captured before
+    termination was also proven dead; ``survivors`` lists owned pids that
+    remained alive after the escalation ladder.
     """
 
     proven_dead: bool
@@ -73,6 +79,7 @@ def spawn_owned(
     read_only_paths: tuple[str, ...] = (),
     toolchain_paths: tuple[str, ...] = (),
     writable_toolchain_paths: tuple[str, ...] = (),
+    resource_limits: Any = None,
     **popen_kwargs: object,
 ) -> "subprocess.Popen[str]":
     """Spawn ``argv`` in its own process group so the whole tree can be killed.
@@ -107,6 +114,11 @@ def spawn_owned(
                 toolchain_bins.append(parent)
         if toolchain_bins:
             my_env["PATH"] = ":".join(dict.fromkeys([*toolchain_bins, my_env.get("PATH", "")]))
+    normalized_network_policy = getattr(network_policy, "value", network_policy)
+    if normalized_network_policy not in (None, "allow") and sandbox_root is None:
+        raise RuntimeError(
+            "network policy requires a workspace sandbox; refusing unrestricted execution"
+        )
     if sandbox_root is not None:
         # Some locked-down hosts already apply an inherited seccomp filter
         # which rejects AF_INET/AF_INET6 sockets.  Bubblewrap cannot create a
@@ -116,8 +128,8 @@ def spawn_owned(
         # filter and only skipping the redundant namespace setup.  If the
         # host can create network sockets, a denied policy still requires the
         # normal isolated namespace below.
-        effective_network_policy = network_policy
-        if network_policy and network_policy != "allow" and _network_syscalls_denied():
+        effective_network_policy = normalized_network_policy
+        if normalized_network_policy and normalized_network_policy != "allow" and _network_syscalls_denied():
             effective_network_policy = "allow"
         argv = sandbox_argv(
             argv,
@@ -137,6 +149,15 @@ def spawn_owned(
         # The process now starts in the namespace's path.  Passing the host
         # cwd to Popen would be both redundant and misleading.
         cwd = None
+    existing_preexec = popen_kwargs.pop("preexec_fn", None)
+    if resource_limits is not None or existing_preexec is not None:
+        def _preexec() -> None:
+            if resource_limits is not None:
+                _apply_resource_limits(resource_limits)
+            if existing_preexec is not None:
+                existing_preexec()
+
+        popen_kwargs["preexec_fn"] = _preexec
     kwargs: dict = {"env": my_env}
     if cwd is not None:
         kwargs["cwd"] = cwd
@@ -144,6 +165,36 @@ def spawn_owned(
         kwargs["start_new_session"] = True
     kwargs.update(popen_kwargs)
     return subprocess.Popen(argv, **kwargs)
+
+
+def _apply_resource_limits(limits: Any) -> None:
+    """Apply hard local-process limits before the runtime image starts."""
+    if resource is None or os.name == "nt":
+        raise RuntimeError("local resource limits are unavailable on this platform")
+    values = {
+        "max_memory_mb": getattr(limits, "max_memory_mb", None),
+        "max_cpu_seconds": getattr(limits, "max_cpu_seconds", None),
+        "max_processes": getattr(limits, "max_processes", None),
+    }
+    for name, value in values.items():
+        if value is not None and (isinstance(value, bool) or int(value) < 1):
+            raise ValueError(f"{name} must be a positive integer")
+    resource_limits = (
+        ("max_memory_mb", resource.RLIMIT_AS, int(values["max_memory_mb"]) * 1024 * 1024)
+        if values["max_memory_mb"] is not None
+        else None,
+        ("max_cpu_seconds", resource.RLIMIT_CPU, int(values["max_cpu_seconds"]))
+        if values["max_cpu_seconds"] is not None
+        else None,
+        ("max_processes", resource.RLIMIT_NPROC, int(values["max_processes"]))
+        if values["max_processes"] is not None and hasattr(resource, "RLIMIT_NPROC")
+        else None,
+    )
+    for name, kind, value in (item for item in resource_limits if item is not None):
+        _soft, hard = resource.getrlimit(kind)
+        if hard != resource.RLIM_INFINITY and value > hard:
+            raise ValueError(f"{name} exceeds the host hard limit")
+        resource.setrlimit(kind, (value, value))
 
 
 def sandbox_argv(
@@ -394,6 +445,46 @@ def child_pids(root_pid: int) -> list[int]:
         return []
 
 
+def _capture_owned_processes(root_pid: int) -> dict[int, str | None]:
+    """Capture root/descendant identities before the root can disappear."""
+    pids = {root_pid, *child_pids(root_pid)}
+    return {pid: process_start_identity(pid) for pid in pids if pid > 0}
+
+
+def _process_alive(pid: int, start_identity: str | None) -> bool:
+    if pid <= 0:
+        return False
+    if start_identity is not None and process_start_identity(pid) != start_identity:
+        return False
+    if psutil is not None:
+        try:
+            process = psutil.Process(pid)
+            return process.is_running() and process.status() not in {
+                psutil.STATUS_ZOMBIE,
+                psutil.STATUS_DEAD,
+            }
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            return False
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+def _wait_for_owned_exit(
+    captured: dict[int, str | None], *, timeout: float
+) -> tuple[int, ...]:
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        survivors = tuple(
+            pid for pid, identity in captured.items() if _process_alive(pid, identity)
+        )
+        if not survivors or time.monotonic() >= deadline:
+            return survivors
+        time.sleep(0.02)
+
+
 def _descendants(proc) -> list:
     try:
         return proc.children(recursive=True)
@@ -432,8 +523,16 @@ def kill_tree(process: "subprocess.Popen", *, timeout: float = 3.0) -> ProcessKi
     root survived the escalation ladder, so shutdown can report it instead
     of the failure hiding in a log line.
     """
+    captured = _capture_owned_processes(process.pid)
     if process.poll() is not None:
-        return ProcessKillOutcome(proven_dead=True, already_dead=True)
+        survivors = tuple(
+            pid for pid, identity in captured.items() if pid != process.pid and _process_alive(pid, identity)
+        )
+        return ProcessKillOutcome(
+            proven_dead=not survivors,
+            survivors=survivors,
+            already_dead=True,
+        )
     pgid = process_group_id(process)
     if os.name == "nt":
         try:
@@ -442,7 +541,10 @@ def kill_tree(process: "subprocess.Popen", *, timeout: float = 3.0) -> ProcessKi
             pass
         _reap(process, 5.0)
         dead = process.poll() is not None
-        return ProcessKillOutcome(proven_dead=dead)
+        survivors = tuple(
+            pid for pid, identity in captured.items() if pid != process.pid and _process_alive(pid, identity)
+        )
+        return ProcessKillOutcome(proven_dead=dead and not survivors, survivors=survivors)
 
     assert pgid is not None  # POSIX + live process (checked above) implies a pgid
     try:
@@ -466,26 +568,33 @@ def kill_tree(process: "subprocess.Popen", *, timeout: float = 3.0) -> ProcessKi
             pass
         except Exception:
             pass
-        for pid in child_pids(process.pid):
-            try:
+    # A detached descendant is no longer in the root's process group and the
+    # root may already have exited by the time the escalation branch runs.
+    # Signal every identity captured before termination independently.
+    for pid in captured:
+        if pid == process.pid:
+            continue
+        try:
+            if _process_alive(pid, captured[pid]):
                 os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            except Exception:
-                pass
+        except ProcessLookupError:
+            pass
+        except Exception:
+            pass
 
     _reap(process, timeout=5.0)
-    for pid in child_pids(process.pid):
+    for pid in captured:
+        if pid == process.pid:
+            continue
         try:
-            os.waitpid(pid, 0)
+            if _process_alive(pid, captured[pid]):
+                os.waitpid(pid, 0)
         except (ChildProcessError, ProcessLookupError):
             pass
 
     dead = process.poll() is not None
-    survivors: tuple[int, ...] = ()
-    if not dead:
-        survivors = tuple(child_pids(process.pid))
-    return ProcessKillOutcome(proven_dead=dead, survivors=survivors)
+    survivors = _wait_for_owned_exit(captured, timeout=min(timeout, 1.0))
+    return ProcessKillOutcome(proven_dead=dead and not survivors, survivors=survivors)
 
 
 async def kill_tree_async(process: Any, *, timeout: float = 3.0) -> ProcessKillOutcome:
@@ -497,8 +606,18 @@ async def kill_tree_async(process: Any, *, timeout: float = 3.0) -> ProcessKillO
     outcome (P1-11): ``proven_dead`` only when the root was observed exited.
     """
     if process is None or process.returncode is not None:
-        return ProcessKillOutcome(proven_dead=True, already_dead=True)
+        pid = int(getattr(process, "pid", 0) or 0)
+        captured = _capture_owned_processes(pid) if pid else {}
+        survivors = tuple(
+            child for child, identity in captured.items() if _process_alive(child, identity)
+        )
+        return ProcessKillOutcome(
+            proven_dead=not survivors,
+            survivors=survivors,
+            already_dead=True,
+        )
     pid = int(process.pid)
+    captured = _capture_owned_processes(pid)
     if os.name == "nt":
         try:
             process.kill()
@@ -543,7 +662,18 @@ async def kill_tree_async(process: Any, *, timeout: float = 3.0) -> ProcessKillO
         except ProcessLookupError:
             pass
         await _wait_async_process(process, timeout=5.0)
-    return ProcessKillOutcome(proven_dead=process.returncode is not None)
+    for child, identity in captured.items():
+        if child == pid or not _process_alive(child, identity):
+            continue
+        try:
+            os.kill(child, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    survivors = _wait_for_owned_exit(captured, timeout=min(timeout, 1.0))
+    return ProcessKillOutcome(
+        proven_dead=process.returncode is not None and not survivors,
+        survivors=survivors,
+    )
 
 
 async def _wait_async_process(process: Any, *, timeout: float) -> None:

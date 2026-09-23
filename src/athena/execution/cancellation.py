@@ -48,6 +48,10 @@ class CancellationRegistry:
         self.exec_runtimes: dict[str, tuple[Any, str | None]] = {}
         self.task_sessions: dict[str, list[tuple[Any, str]]] = {}
         self.runtime_by_session: dict[str, Any] = {}
+        # The runtime object and task-session list are cleanup indexes, not
+        # authorization facts. Keep ownership explicit at the same boundary
+        # that records every live/adopted session.
+        self.session_owners: dict[str, str] = {}
         self.pending_session_persistence: dict[str, tuple[str, Any]] = {}
         self.pending_runtime_cancellations: dict[str, list[Any]] = {}
         self.confirmed_runtime_cancellations: dict[str, set[int]] = {}
@@ -98,6 +102,7 @@ class CancellationRegistry:
             )
             raise
         self.runtime_by_session.pop(runtime_session_id, None)
+        self.session_owners.pop(runtime_session_id, None)
         for task_id, sessions in list(self.task_sessions.items()):
             remaining = [
                 (candidate, sid) for candidate, sid in sessions if sid != runtime_session_id
@@ -190,6 +195,7 @@ class CancellationRegistry:
                 errors.append(exc)
                 continue
             self.runtime_by_session.pop(sid, None)
+            self.session_owners.pop(sid, None)
             closed_sessions.append(sid)
 
         if remaining:

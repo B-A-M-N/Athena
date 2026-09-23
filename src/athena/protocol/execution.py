@@ -107,6 +107,7 @@ class Runtime(Protocol):
         env: Mapping[str, str] | None = None,
         workspace_root: str | None = None,
         network_policy: NetworkPolicy | str | None = None,
+        resource_limits: ExecutionLimits | None = None,
     ) -> str: ...
 
     def execute(
@@ -135,6 +136,7 @@ class ExecutionBackend(Protocol):
         env: Mapping[str, str] | None,
         workspace_root: str | None = None,
         network_policy: NetworkPolicy | str | None = None,
+        resource_limits: ExecutionLimits | None = None,
     ) -> str: ...
 
     def execute(self, request: ExecutionRequest) -> AsyncIterator[ExecutionEvent]: ...

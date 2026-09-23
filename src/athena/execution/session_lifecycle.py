@@ -44,6 +44,18 @@ class ExecutionSessionCoordinator:
         self._lookup_backend = lookup_backend
         self._persist_session_start = persist_session_start
 
+    def validate_session_access(self, runtime_session_id: str, task_id: str) -> Any:
+        """Return an owned session runtime or reject before execution starts."""
+        owner = self._registry.session_owners.get(runtime_session_id)
+        runtime = self._registry.runtime_by_session.get(runtime_session_id)
+        if runtime is None or owner is None:
+            raise PermissionError(f"unknown runtime session {runtime_session_id}")
+        if owner != task_id:
+            raise PermissionError(
+                f"runtime session {runtime_session_id} belongs to task {owner}, not {task_id}"
+            )
+        return runtime
+
     async def create_session(
         self,
         *,
@@ -54,6 +66,7 @@ class ExecutionSessionCoordinator:
         env: dict[str, str] | None = None,
         workspace_root: str | None = None,
         network_policy: str | None = None,
+        resource_limits: Any = None,
     ) -> str:
         self._registry.cancel_requested_tasks.discard(task_id)
         selected_backend = self._select_backend(backend)
@@ -65,9 +78,11 @@ class ExecutionSessionCoordinator:
                 env=env,
                 workspace_root=workspace_root,
                 network_policy=network_policy,
+                resource_limits=resource_limits,
             )
             self._registry.task_sessions.setdefault(task_id, []).append((selected_backend, sid))
             self._registry.runtime_by_session[sid] = selected_backend
+            self._registry.session_owners[sid] = task_id
             identity: dict[str, Any] = {}
             describe = getattr(selected_backend, "describe_session", None)
             if callable(describe):
@@ -104,6 +119,8 @@ class ExecutionSessionCoordinator:
             kwargs["workspace_root"] = workspace_root
         if network_policy is not None:
             kwargs["network_policy"] = network_policy
+        if resource_limits is not None:
+            kwargs["resource_limits"] = resource_limits
         try:
             signature = inspect.signature(runtime_impl.create_session)
             kwargs = {key: value for key, value in kwargs.items() if key in signature.parameters}
@@ -115,6 +132,7 @@ class ExecutionSessionCoordinator:
             sid = cast(str, runtime_impl.create_session(**kwargs))
         self._registry.task_sessions.setdefault(task_id, []).append((runtime_impl, sid))
         self._registry.runtime_by_session[sid] = runtime_impl
+        self._registry.session_owners[sid] = task_id
         try:
             await self._persist_session_start(
                 sid,
@@ -144,12 +162,20 @@ class ExecutionSessionCoordinator:
             return False
         session_id = str(record.get("id") or "")
         task_id = str(record.get("task_id") or "")
+        if not session_id or not task_id:
+            raise ValueError("runtime session record must contain id and task_id")
+        known_owner = self._registry.session_owners.get(session_id)
+        if known_owner is not None and known_owner != task_id:
+            raise PermissionError(
+                f"runtime session {session_id} belongs to task {known_owner}, not {task_id}"
+            )
         attached_id = await reattach(record)
         if str(attached_id) != session_id:
             raise RuntimeError(
                 f"backend {backend_name!r} returned unexpected runtime session id {attached_id!r}"
             )
         self._registry.runtime_by_session[session_id] = backend
+        self._registry.session_owners[session_id] = task_id
         rooms = self._registry.task_sessions.setdefault(task_id, [])
         if not any(sid == session_id for _runtime, sid in rooms):
             rooms.append((backend, session_id))
@@ -168,6 +194,11 @@ class ExecutionSessionCoordinator:
     ) -> None:
         """Persist and register a runtime-emitted session identity."""
         if runtime_session_id in self._registry.runtime_by_session:
+            owner = self._registry.session_owners.get(runtime_session_id)
+            if owner != task_id:
+                raise PermissionError(
+                    f"runtime session {runtime_session_id} belongs to task {owner}, not {task_id}"
+                )
             return
         try:
             await self._persist_session_start(
@@ -182,6 +213,7 @@ class ExecutionSessionCoordinator:
             await self.destroy_unpersisted_session(runtime, runtime_session_id, task_id)
             raise
         self._registry.runtime_by_session[runtime_session_id] = runtime
+        self._registry.session_owners[runtime_session_id] = task_id
         rooms = self._registry.task_sessions.setdefault(task_id, [])
         if not any(sid == runtime_session_id for _runtime, sid in rooms):
             rooms.append((runtime, runtime_session_id))
@@ -204,6 +236,7 @@ class ExecutionSessionCoordinator:
                     exc,
                 )
         self._registry.runtime_by_session.pop(session_id, None)
+        self._registry.session_owners.pop(session_id, None)
         rooms = [
             (candidate, sid)
             for candidate, sid in self._registry.task_sessions.get(task_id, [])
