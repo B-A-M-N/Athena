@@ -500,7 +500,12 @@ def intersect_capability_policies(
     b = _effective_capability_policy(right)
     a_visible = set(a.allow) | set(a.ask)
     b_visible = set(b.allow) | set(b.ask)
-    visible = _intersect_unrestricted_sets(a_visible, b_visible)
+    canceled_left_authority = bool(raw_left.allow or raw_left.ask) and not a_visible
+    canceled_right_authority = bool(raw_right.allow or raw_right.ask) and not b_visible
+    if canceled_left_authority or canceled_right_authority:
+        visible = set()
+    else:
+        visible = _intersect_unrestricted_sets(a_visible, b_visible)
     ask = (set(a.ask) | set(b.ask)) & visible
     allow = visible - ask
     deny = set(a.deny) | set(b.deny)
@@ -509,8 +514,6 @@ def intersect_capability_policies(
     if "*" in deny:
         allow.clear()
         ask.clear()
-    canceled_left_authority = bool(raw_left.allow or raw_left.ask) and not a_visible
-    canceled_right_authority = bool(raw_right.allow or raw_right.ask) and not b_visible
     if (
         not allow
         and not ask
@@ -533,6 +536,7 @@ def capability_policy_covers(
     lower: CapabilityPolicy | Mapping[str, Any] | None,
 ) -> bool:
     """Return whether ``lower`` is contained by the ``upper`` ceiling."""
+    raw_upper = _policy_parts(upper)
     raw_lower = _policy_parts(lower)
     a = _effective_capability_policy(upper)
     b = _effective_capability_policy(lower)
@@ -553,6 +557,15 @@ def capability_policy_covers(
         or bool(raw_lower.allow or raw_lower.ask)
         and not lower_visible
     )
+    upper_is_empty = (
+        _NO_CAPABILITY_INTERSECTION in upper_allow
+        or _NO_CAPABILITY_INTERSECTION in upper_ask
+        or "*" in a.deny
+        or bool(raw_upper.allow or raw_upper.ask)
+        and not upper_visible
+    )
+    if upper_is_empty and not lower_is_empty:
+        return False
     # Empty allow/ask is the protocol's unrestricted value.  Once a policy
     # names an allow/ask ceiling, preserve the distinction: ASK is weaker than
     # ALLOW for a caller, but it cannot cover a stored autonomous ALLOW.
