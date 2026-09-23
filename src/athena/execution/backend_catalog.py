@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from athena.execution.backend import ExecutionBackend
+from athena.execution.conformance import passport_binding_errors
 
 __all__ = ["BackendCatalog"]
 
@@ -30,8 +31,26 @@ class BackendCatalog:
     def backends(self) -> dict[str, ExecutionBackend]:
         return self._backends
 
-    def set_passport(self, backend: str, passport: Mapping[str, Any]) -> None:
-        self._passports[backend] = dict(passport)
+    def set_passport(
+        self,
+        backend: str,
+        passport: Mapping[str, Any],
+        *,
+        expected_release_sha: str | None = None,
+        expected_release_run_id: str | None = None,
+        expected_environment: Mapping[str, Any] | None = None,
+    ) -> None:
+        record = dict(passport)
+        errors = passport_binding_errors(
+            record,
+            backend=backend,
+            expected_release_sha=expected_release_sha,
+            expected_release_run_id=expected_release_run_id,
+            expected_environment=expected_environment,
+        )
+        record["binding_status"] = "verified" if not errors else "unverified"
+        record["binding_errors"] = list(errors)
+        self._passports[backend] = record
 
     def get_passport(self, name: str) -> dict[str, Any] | None:
         return self._passports.get(name)
@@ -42,9 +61,12 @@ class BackendCatalog:
     def _proof_fields(self, name: str) -> dict[str, Any]:
         passport = self._passports.get(name)
         status = str(passport.get("status") or "") if passport else ""
+        binding_status = str(passport.get("binding_status") or "") if passport else ""
         return {
-            "proof_status": "verified" if status == "PASS" else "unverified",
+            "proof_status": "verified" if status == "PASS" and binding_status == "verified" else "unverified",
             "passport_status": status or None,
+            "passport_binding_status": binding_status or None,
+            "passport_binding_errors": list(passport.get("binding_errors") or ()) if passport else [],
         }
 
     def names(self) -> list[str]:

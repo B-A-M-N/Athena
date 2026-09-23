@@ -123,3 +123,38 @@ def test_execution_request_stdin_is_rejected_until_a_governed_input_contract_exi
     )
     with pytest.raises(ValueError, match="stdin is not supported"):
         manager.validate_execution_request(request)
+
+
+def test_backend_passport_is_unverified_without_runtime_binding_expectations():
+    manager = ExecutionManager()
+    passport = {
+        "kind": "athena_backend_passport",
+        "backend": "local",
+        "release_sha": "sha",
+        "release_run_id": "run",
+        "environment": {"platform": "fixture"},
+        "status": "PASS",
+        "expected_runtimes": ["python"],
+        "cells": [
+            {
+                "runtime": "python",
+                "passed": True,
+                "checks": ["execution"],
+                "unverified_claims": [],
+            }
+        ],
+    }
+    manager.set_backend_passport("local", passport)
+    row = next(item for item in manager.backend_status() if item["id"] == "local")
+    assert row["proof_status"] == "unverified"
+    assert row["passport_binding_status"] == "unverified"
+
+    manager.set_backend_passport(
+        "local",
+        passport,
+        expected_release_sha="sha",
+        expected_release_run_id="run",
+        expected_environment={"platform": "fixture"},
+    )
+    row = next(item for item in manager.backend_status() if item["id"] == "local")
+    assert row["proof_status"] == "verified"

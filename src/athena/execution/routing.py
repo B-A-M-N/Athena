@@ -31,12 +31,26 @@ class ExecutionRouting:
     def set_local_backend(self, backend: ExecutionBackend | None) -> None:
         self.local_backend = backend
 
-    def set_backend_passport(self, backend: str, passport: dict[str, Any]) -> None:
+    def set_backend_passport(
+        self,
+        backend: str,
+        passport: dict[str, Any],
+        *,
+        expected_release_sha: str | None = None,
+        expected_release_run_id: str | None = None,
+        expected_environment: dict[str, Any] | None = None,
+    ) -> None:
         if passport.get("kind") != "athena_backend_passport":
             raise ValueError("backend passport has an unsupported kind")
         if str(passport.get("backend") or "") != str(backend):
             raise ValueError("backend passport identity does not match backend")
-        self.catalog.set_passport(str(backend), passport)
+        self.catalog.set_passport(
+            str(backend),
+            passport,
+            expected_release_sha=expected_release_sha,
+            expected_release_run_id=expected_release_run_id,
+            expected_environment=expected_environment,
+        )
 
     def register_runtime(self, runtime: Runtime) -> None:
         name = getattr(runtime, "name", None)

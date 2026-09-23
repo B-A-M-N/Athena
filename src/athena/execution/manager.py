@@ -106,9 +106,23 @@ class ExecutionManager:
         """Select an operator-owned local backend such as the runtime host."""
         self._routing.set_local_backend(backend)
 
-    def set_backend_passport(self, backend: str, passport: Mapping[str, Any]) -> None:
+    def set_backend_passport(
+        self,
+        backend: str,
+        passport: Mapping[str, Any],
+        *,
+        expected_release_sha: str | None = None,
+        expected_release_run_id: str | None = None,
+        expected_environment: Mapping[str, Any] | None = None,
+    ) -> None:
         """Bind a release-bound behavioral passport to a backend inventory row."""
-        self._routing.set_backend_passport(backend, dict(passport))
+        self._routing.set_backend_passport(
+            backend,
+            dict(passport),
+            expected_release_sha=expected_release_sha,
+            expected_release_run_id=expected_release_run_id,
+            expected_environment=dict(expected_environment or {}) or None,
+        )
 
     def set_recovery_sink(self, sink) -> None:
         """Bind the task-state recovery authority after construction."""
