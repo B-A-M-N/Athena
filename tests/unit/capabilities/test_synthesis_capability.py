@@ -1030,3 +1030,264 @@ async def test_candidate_can_be_rehydrated_and_promoted_after_restart(tmp_path):
     assert durable.validation_state == "PROMOTED"
     assert durable.validation_cases
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_generated_tool_unfamiliar_failure_repair_and_restart_reuse_qualification(tmp_path):
+    """Exercise generated-tool repair and durable reuse through the real seams."""
+    db_path = tmp_path / "generated-tool-qualification.db"
+    db = Database(str(db_path))
+    registry = CapabilityRegistry()
+    store = GeneratedCapabilityStore(db)
+    fabric = CapabilityFabric(registry, store=store)
+    engine = SynthesisEngine()
+    engine.bind_proof_sink(fabric.update_generated_proof)
+    capability = SynthesisCapability(engine, fabric)
+    registry.register(capability)
+    dispatcher = CapabilityDispatcher(
+        registry,
+        PolicyEngine("autonomous"),
+        fabric=fabric,
+    )
+    engine.bind_dispatcher(dispatcher)
+    workspace = WorkspaceSpec(id="generated-repo", root=str(tmp_path / "workspace"))
+    (tmp_path / "workspace").mkdir()
+    context = SimpleNamespace(workspace=workspace, principal_id="qualifier")
+
+    created = await dispatcher.dispatch(
+        CapabilityRequest(
+            capability_id="synthesis",
+            task_id="task-generated-qualification",
+            call_id="create-generated-qualification",
+            origin=CapabilityRequestOrigin.MODEL,
+            arguments={
+                "operation": "create",
+                "name": "known_or_broken",
+                "description": "Recognizes a narrow input and fails safely otherwise.",
+                "code": (
+                    "def run(args):\n"
+                    "    if args.get('kind') == 'known':\n"
+                    "        return {'value': 1}\n"
+                    "    return {'value': 'unfamiliar'}\n"
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "required": ["kind"],
+                    "properties": {"kind": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+                "output_schema": {
+                    "type": "object",
+                    "required": ["value"],
+                    "properties": {"value": {"type": "integer"}},
+                    "additionalProperties": False,
+                },
+                "validation_cases": [{"args": {"kind": "known"}, "expect_output": {"value": 1}}],
+            },
+        ),
+        workspace=workspace,
+    )
+    assert created.status is CapabilityResultStatus.OK, created.error
+    first_id = json.loads(created.output)["capability_id"]
+    first_executor = fabric.executor_for(first_id, task_id="task-generated-qualification")
+    first_call_ids = []
+    for index, (session_id, kind) in enumerate(
+        (("session-one", "known"), ("session-two", "known"), ("session-two", "known")), start=1
+    ):
+        call_id = f"initial-live-{index}"
+        first_call_ids.append(call_id)
+        initial = await first_executor.invoke(
+            CapabilityRequest(
+                capability_id=first_id,
+                task_id="task-generated-qualification",
+                session_id=session_id,
+                call_id=call_id,
+                arguments={"kind": kind},
+            ),
+            context=context,
+        )
+        assert initial.status is CapabilityResultStatus.OK, initial.error
+    for call_id in first_call_ids:
+        await engine.observe_event(
+            make_event(
+                "CapabilityCompleted",
+                {"call_id": call_id, "capability_id": first_id},
+                task_id="task-generated-qualification",
+            )
+        )
+        await engine.observe_event(
+            make_event(
+                "VerificationCompleted",
+                {"passed": True},
+                task_id="task-generated-qualification",
+            )
+        )
+    first_promoted = await capability.invoke(
+        CapabilityRequest(
+            capability_id="synthesis",
+            task_id="task-generated-qualification",
+            call_id="promote-original-generated",
+            origin=CapabilityRequestOrigin.USER_DIRECT,
+            arguments={
+                "operation": "promote",
+                "capability_id": first_id,
+                "scope": "project",
+            },
+        ),
+        context=context,
+    )
+    assert first_promoted.status is CapabilityResultStatus.OK, first_promoted.error
+    await fabric.flush()
+    assert fabric.has(first_id, project_id=workspace.id)
+
+    unfamiliar = await dispatcher.dispatch(
+        CapabilityRequest(
+            capability_id=first_id,
+            task_id="task-generated-qualification",
+            call_id="unfamiliar-generated-call",
+            origin=CapabilityRequestOrigin.MODEL,
+            arguments={"kind": "changed"},
+        ),
+        workspace=workspace,
+    )
+    assert unfamiliar.status is CapabilityResultStatus.FAILED
+    failure = unfamiliar.metadata["generated_failure"]
+    assert failure["failure_class"] == "contract_mismatch"
+    assert failure["repairable"] is True
+    assert failure["repair_operation"] == "synthesis.repair"
+
+    repaired = await dispatcher.dispatch(
+        CapabilityRequest(
+            capability_id="synthesis",
+            task_id="task-generated-qualification",
+            call_id="repair-generated-call",
+            origin=CapabilityRequestOrigin.MODEL,
+            arguments={
+                "operation": "repair",
+                "capability_id": first_id,
+                "name": "known_or_broken_v2",
+                "description": "Recognizes the changed input after repair.",
+                "code": (
+                    "def run(args):\n"
+                    "    return {'value': 1 if args.get('kind') in {'known', 'changed'} else 0}\n"
+                ),
+                "validation_cases": [{"args": {"kind": "changed"}, "expect_output": {"value": 1}}],
+            },
+        ),
+        workspace=workspace,
+    )
+    assert repaired.status is CapabilityResultStatus.OK, repaired.error
+    repaired_id = json.loads(repaired.output)["capability_id"]
+    assert repaired_id != first_id
+    assert json.loads(repaired.output)["proof"]["supersedes"] == [first_id]
+
+    executor = fabric.executor_for(repaired_id, task_id="task-generated-qualification")
+    call_ids = []
+    for index, kind in enumerate(("known", "changed", "third"), start=1):
+        call_id = f"repaired-live-{index}"
+        call_ids.append(call_id)
+        live = await executor.invoke(
+            CapabilityRequest(
+                capability_id=repaired_id,
+                task_id="task-generated-qualification",
+                call_id=call_id,
+                arguments={"kind": kind},
+            ),
+            context=context,
+        )
+        assert live.status is CapabilityResultStatus.OK, live.error
+        assert json.loads(live.output)["value"] == (0 if kind == "third" else 1)
+
+    for call_id in call_ids:
+        await engine.observe_event(
+            make_event(
+                "CapabilityCompleted",
+                {"call_id": call_id, "capability_id": repaired_id},
+                task_id="task-generated-qualification",
+            )
+        )
+        await engine.observe_event(
+            make_event(
+                "VerificationCompleted",
+                {"passed": True},
+                task_id="task-generated-qualification",
+            )
+        )
+    second_task_id = "task-generated-qualification"
+    second_session_id = "session-generated-qualification-second"
+    second_executor = fabric.executor_for(repaired_id, task_id=second_task_id)
+    second_call = await second_executor.invoke(
+        CapabilityRequest(
+            capability_id=repaired_id,
+            task_id=second_task_id,
+            session_id=second_session_id,
+            call_id="repaired-second-context",
+            arguments={"kind": "second-context"},
+        ),
+        context=context,
+    )
+    assert second_call.status is CapabilityResultStatus.OK, second_call.error
+    await engine.observe_event(
+        make_event(
+            "CapabilityCompleted",
+            {"call_id": "repaired-second-context", "capability_id": repaired_id},
+            task_id=second_task_id,
+        )
+    )
+    await engine.observe_event(
+        make_event(
+            "VerificationCompleted",
+            {"passed": True},
+            task_id=second_task_id,
+        )
+    )
+
+    promoted = await capability.invoke(
+        CapabilityRequest(
+            capability_id="synthesis",
+            task_id="task-generated-qualification",
+            call_id="promote-generated-qualification",
+            origin=CapabilityRequestOrigin.USER_DIRECT,
+            arguments={
+                "operation": "promote",
+                "capability_id": repaired_id,
+                "scope": "project",
+            },
+        ),
+        context=context,
+    )
+    assert promoted.status is CapabilityResultStatus.OK, promoted.error
+    await fabric.flush()
+    assert fabric.has(repaired_id, project_id="generated-repo")
+
+    await db.close()
+    restarted_db = Database(str(db_path))
+    restarted_store = GeneratedCapabilityStore(restarted_db)
+    restarted_fabric = CapabilityFabric(CapabilityRegistry(), store=restarted_store)
+    restarted_engine = SynthesisEngine()
+    loaded = await restarted_fabric.load_persisted(
+        lambda generated: restarted_engine.restore_executor(
+            generated,
+            proof_sink=restarted_fabric.update_generated_proof,
+            workspace_root=workspace.root,
+        ),
+        project_id=workspace.id,
+        user_id="qualifier",
+    )
+    assert loaded == [repaired_id]
+    assert restarted_fabric.has(repaired_id, project_id=workspace.id)
+    restarted_executor = restarted_fabric.executor_for(
+        repaired_id, project_id=workspace.id, user_id="qualifier"
+    )
+    reused = await restarted_executor.invoke(
+        CapabilityRequest(
+            capability_id=repaired_id,
+            task_id="task-after-restart",
+            call_id="reused-after-restart",
+            arguments={"kind": "after-restart"},
+        ),
+        context=context,
+    )
+    assert reused.status is CapabilityResultStatus.OK, reused.error
+    assert json.loads(reused.output) == {"value": 0}
+    await restarted_db.close()
