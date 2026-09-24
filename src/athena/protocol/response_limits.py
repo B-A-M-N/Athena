@@ -65,11 +65,7 @@ def merge_streamed_content(
         merged.append(block)
     if not saw_terminal_block:
         insert_at = next(
-            (
-                index
-                for index, block in enumerate(merged)
-                if isinstance(block, CapabilityCallBlock)
-            ),
+            (index for index, block in enumerate(merged) if isinstance(block, CapabilityCallBlock)),
             len(merged),
         )
         merged[insert_at:insert_at] = [block_type(text=part) for part in parts]

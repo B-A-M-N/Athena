@@ -54,7 +54,9 @@ async def register_core_capabilities(
     if ports.failure_memory is not None:
         registry.register(DiagnosticsCapability(ports.failure_memory))
     registry.register(MemoryCapability(memory))
-    registry.register(SkillsCapability(skills_store))
+    skills_capability = SkillsCapability(skills_store)
+    skills_capability.bind_events(ports.require_events())
+    registry.register(skills_capability)
     from athena.capabilities.session_search import SessionSearchCapability
 
     registry.register(SessionSearchCapability(ports.store_messages))

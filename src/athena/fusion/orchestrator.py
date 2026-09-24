@@ -43,12 +43,13 @@ from typing import Any
 
 from athena.causal.checkpoint import CheckpointManager
 from athena.fusion.comparison import ComparisonLifecycle
+from athena.fusion.semantic_snapshot import SemanticSnapshot
+from athena.fusion.branch_synthesis import BranchSynthesisMechanism
+from athena.fusion.invariants import InvariantProbeMechanism
 from athena.fusion.ports import FusionPorts
 from athena.fusion.selection import CandidateSelectionStore
 from athena.causal.fork import TaskForker
-from athena.protocol.capabilities import CapabilityRequestOrigin
 from athena.protocol.failure import RecoveryDiagnostic
-from athena.protocol.ids import new_id
 
 __all__ = ["ExperimentResult", "FusionOrchestrator"]
 
@@ -101,9 +102,14 @@ class FusionOrchestrator:
             self._workflow_store = typed_ports.workflow_store
             self._synthesis = typed_ports.synthesis
             self._dispatcher = typed_ports.dispatcher
+            self._verification_environment = typed_ports.verification_environment
+            self._verification_environment_resolver = typed_ports.verification_environment_resolver
+            self._budgets = typed_ports.budget_provider
             self._world_state_store = typed_ports.world_state_store
             self._default_workspace = typed_ports.default_workspace
-            self._world_state_factory = typed_ports.world_state_factory
+            self._world_state_factory = (
+                typed_ports.world_state_provider or typed_ports.world_state_factory
+            )
             self._synthesis_ref = typed_ports.synthesis_ref
             fork_ports = typed_ports.fork
             self.forker = TaskForker(ports=fork_ports, checkpoint_manager=self.checkpoints)
@@ -117,7 +123,18 @@ class FusionOrchestrator:
             self._store_tasks = ports.get("store_tasks")
             self._default_workspace = ports.get("default_workspace")
             self._world_state_factory = ports.get("world_state_factory")
+            self._synthesis = ports.get("synthesis")
             self._synthesis_ref = ports.get("synthesis_ref")
+            self._dispatcher = ports.get("dispatcher")
+            self._verification_environment = ports.get("verification_environment")
+            self._verification_environment_resolver = ports.get("verification_environment_resolver")
+            self._budgets = ports.get("budget_provider")
+            self._world_state_store = ports.get("world_state_store")
+            self._fabric = ports.get("fabric")
+            self._workflow_store = ports.get("workflow_store")
+            self._store_events = ports.get("event_store")
+            self._store_runtime_sessions = ports.get("runtime_session_store")
+            self._context_block_store = ports.get("context_block_store")
         else:
             if service is None:
                 raise ValueError("FusionOrchestrator requires service or ports")
@@ -137,18 +154,66 @@ class FusionOrchestrator:
                     )
                 )
             self.forker = TaskForker(service=service, checkpoint_manager=self.checkpoints)
-            self._store_tasks = None
-            self._default_workspace = None
+            self._store_tasks = getattr(service, "_store_tasks", None)
+            self._default_workspace = getattr(service, "_default_workspace", None)
             self._world_state_factory = None
+            self._synthesis = getattr(service, "_synthesis", None)
             self._synthesis_ref = None
+            self._dispatcher = getattr(service, "_dispatcher", None)
+            self._verification_environment = getattr(service, "_verification_environment", None)
+            self._verification_environment_resolver = None
+            self._budgets = getattr(service, "_budgets", None)
+            self._world_state_store = getattr(service, "_world_state_store", None)
+            self._fabric = getattr(service, "_fabric", None)
+            self._workflow_store = getattr(service, "_workflow_store", None)
+            self._store_events = getattr(service, "_store_events", None)
+            self._store_runtime_sessions = getattr(service, "_store_runtime_sessions", None)
+            self._context_block_store = getattr(service, "_context_block_store", None)
+        if typed_ports is None and ports is None:
+            self._reality_coordinator = getattr(service, "_reality_coordinator", None)
+            self._reality_gate = getattr(service, "_reality_gate", None)
+        elif typed_ports is not None:
+            self._reality_coordinator = typed_ports.reality_coordinator
+            self._reality_gate = typed_ports.reality_gate
+        else:
+            port_map = ports or {}
+            self._reality_coordinator = port_map.get("reality_coordinator")
+            self._reality_gate = port_map.get("reality_gate")
         state_root = str(getattr(self.shadow, "_state_root", "") or "/tmp/athena-fusion-selection")
         self.selection_store = CandidateSelectionStore(state_root)
+        self._task_resolver = self._resolve_task
+        self._world_state_provider = self._resolve_world_state
+        self._configured_default_workspace = self._default_workspace
+        self._default_workspace = self._fallback_workspace
+        self._semantic_state = SemanticSnapshot(
+            shadow=self.shadow,
+            task_store=self._store_tasks,
+            event_store=self._store_events,
+            runtime_session_store=self._store_runtime_sessions,
+            context_block_store=self._context_block_store,
+            fabric=self._fabric,
+            workflow_store=self._workflow_store,
+            world_state_store=self._world_state_store,
+            world_state_provider=(
+                self._world_state_factory if self.service is None else self.service.world_state
+            ),
+        )
+        self._branch_synthesis = BranchSynthesisMechanism(
+            shadow=self.shadow,
+            synthesis=self._synthesis,
+            dispatcher=self._dispatcher,
+            fabric=self._fabric,
+            verification_environment=self._verification_environment,
+            verification_environment_resolver=self._verification_environment_resolver,
+            synthesis_ref=self._synthesis_ref,
+        )
+        self._invariant_probes = InvariantProbeMechanism(
+            dispatcher=self._dispatcher,
+            world_state_store=self._world_state_store,
+        )
 
-    async def _task_for(self, task_id: str):
-        """Resolve a TaskSpec from the ports task store or the legacy service."""
+    async def _resolve_task(self, task_id: str):
         store = self._store_tasks
-        if store is None:
-            store = getattr(self.service, "_store_tasks", None) if self.service else None
         if task_id and store:
             try:
                 row = await store.get(task_id)
@@ -160,17 +225,27 @@ class FusionOrchestrator:
                 _logger.warning("task lookup for %s failed: %s", task_id, exc)
         return None
 
+    def _resolve_world_state(self, task_id: str):
+        if self._world_state_factory is not None:
+            return self._world_state_factory(task_id)
+        if self.service is not None:
+            return self.service.world_state(task_id)
+        raise RuntimeError("FusionOrchestrator has no world-state provider")
+
+    def _fallback_workspace(self, _task_id: str | None = None):
+        return self.__dict__.get("_configured_default_workspace")
+
+    async def _task_for(self, task_id: str):
+        """Resolve a TaskSpec through the explicit task-store boundary."""
+        return await self._task_resolver(task_id)
+
     def _workspace_for_async(self, task_id: str):
         """Legacy workspace resolution for the service path."""
         return self._workspace_for(task_id)
 
     def _world_state(self, task_id: str):
-        """Resolve world state from ports or legacy service."""
-        if self._world_state_factory is not None:
-            return self._world_state_factory(task_id)
-        if self.service is not None:
-            return self.service.world_state(task_id)
-        raise RuntimeError("FusionOrchestrator has no service bound for world_state")
+        """Resolve world state through the explicit provider boundary."""
+        return self._world_state_provider(task_id)
 
     # ------------------------------------------------------------------
     # 1+3+4: speculative experiment with invariant gate and claims
@@ -193,11 +268,7 @@ class FusionOrchestrator:
         ws = (
             task.workspace
             if task is not None and task.workspace is not None
-            else (
-                getattr(self.service, "_default_workspace", None)
-                if self.service
-                else self._default_workspace
-            )
+            else self._fallback_workspace(task_id)
         )
         result = ExperimentResult()
         started = time.monotonic()
@@ -246,7 +317,9 @@ class FusionOrchestrator:
         canonical_verifier = (
             self.ports.candidate_verifier
             if self.ports is not None and self.ports.candidate_verifier is not None
-            else getattr(self.service, "_reality_coordinator", None)
+            else self.ports.reality_coordinator
+            if self.ports is not None
+            else self._reality_coordinator
         )
         if task is None or canonical_verifier is None:
             verification = [
@@ -259,11 +332,7 @@ class FusionOrchestrator:
             criteria_present = False
             all_ok = False
         else:
-            gate = (
-                self.ports.reality_gate
-                if self.ports is not None and self.ports.reality_gate is not None
-                else getattr(self.service, "_reality_gate", None)
-            )
+            gate = self.ports.reality_gate if self.ports is not None else self._reality_gate
             deactivate = getattr(gate, "deactivate_branch", None)
             if (
                 callable(deactivate)
@@ -307,7 +376,7 @@ class FusionOrchestrator:
             all_ok = criteria_present and all(item.get("passed") for item in real_proof)
         invariant_report: dict = {}
         if all_ok:
-            invariant_set = self._build_invariants(
+            invariant_set = self._invariant_probes.build(
                 invariants,
                 branch=branch,
                 profile=profile,
@@ -378,7 +447,7 @@ class FusionOrchestrator:
         """Attach typed evidence for kernel-owned recovery decisions."""
         budget = getattr(task, "resource_budget", None) if task is not None else None
         budget_record = None
-        budget_tracker = getattr(self.service, "_budgets", None) if self.service else None
+        budget_tracker = self._budgets
         remaining = None
         if budget_tracker is not None and task is not None:
             remaining_fn = getattr(budget_tracker, "remaining", None)
@@ -433,6 +502,8 @@ class FusionOrchestrator:
         proposals: list[list[dict]],
         invariants: list[dict] | None = None,
         profile: str | None = None,
+        parallel: bool = False,
+        max_parallel: int = 2,
     ) -> dict[str, Any]:
         """Run bounded alternatives; retained proof feeds exact selection."""
         return await ComparisonLifecycle(self).compare(
@@ -440,6 +511,8 @@ class FusionOrchestrator:
             proposals=proposals,
             invariants=invariants,
             profile=profile,
+            parallel=parallel,
+            max_parallel=max_parallel,
         )
 
     async def select_candidate(self, comparison_id: str, branch_id: str) -> dict:
@@ -511,167 +584,11 @@ class FusionOrchestrator:
         task_id: str,
         workspace_root: str,
     ) -> dict[str, Any]:
-        """Build a bounded, JSON-safe semantic state envelope."""
-        task: dict[str, Any] | None = None
-        store_tasks = getattr(self.service, "_store_tasks", None)
-        if store_tasks is not None:
-            try:
-                row = await store_tasks.get(task_id)
-                if row is not None:
-                    task = {
-                        key: row.get(key)
-                        for key in (
-                            "id",
-                            "status",
-                            "objective",
-                            "session_id",
-                            "parent_task_id",
-                            "acceptance_criteria",
-                            "context_refs",
-                            "workspace",
-                            "capability_policy",
-                            "model_policy",
-                            "resource_budget",
-                            "deadline",
-                            "delivery",
-                        )
-                        if key in row
-                    }
-            except (OSError, RuntimeError, TypeError, ValueError) as exc:
-                _logger.warning("semantic checkpoint task snapshot failed: %s", exc)
-
-        events: dict[str, Any] = {"last_sequence": 0, "recent_types": []}
-        event_store = getattr(self.service, "_store_events", None)
-        if event_store is not None:
-            try:
-                timeline = await event_store.list_for_task(task_id)
-                events = {
-                    "last_sequence": max(
-                        (int(event.sequence or 0) for event in timeline),
-                        default=0,
-                    ),
-                    "recent_types": [str(event.type) for event in timeline[-20:]],
-                }
-            except (OSError, RuntimeError, TypeError, ValueError) as exc:
-                _logger.warning("semantic checkpoint event snapshot failed: %s", exc)
-
-        world_state: dict[str, Any] = {}
-        world_state_provider = getattr(self.service, "world_state", None)
-        if callable(world_state_provider):
-            try:
-                world_state = await world_state_provider(task_id).snapshot(
-                    workspace_root=workspace_root
-                )
-            except (OSError, RuntimeError, TypeError, ValueError) as exc:
-                _logger.warning("semantic checkpoint world snapshot failed: %s", exc)
-
-        runtimes: list[dict[str, Any]] = []
-        runtime_store = getattr(self.service, "_store_runtime_sessions", None)
-        if runtime_store is not None:
-            try:
-                for row in await runtime_store.list_for_task(task_id):
-                    runtimes.append(
-                        {
-                            key: row.get(key)
-                            for key in (
-                                "id",
-                                "backend",
-                                "runtime",
-                                "cwd",
-                                "pid",
-                                "is_alive",
-                                "started_at",
-                                "last_heartbeat",
-                                "ended_at",
-                            )
-                            if key in row
-                        }
-                    )
-            except (OSError, RuntimeError, TypeError, ValueError) as exc:
-                _logger.warning("semantic checkpoint runtime snapshot failed: %s", exc)
-
-        contexts: list[dict[str, Any]] = []
-        context_store = getattr(self.service, "_context_block_store", None)
-        if context_store is not None:
-            try:
-                blocks = await context_store.list(
-                    scopes=(("task", task_id),),
-                    attached_only=False,
-                )
-                contexts = [
-                    {
-                        "id": block.id,
-                        "version": block.version,
-                        "label": block.label,
-                        "scope": block.scope,
-                        "scope_id": block.scope_id,
-                        "attached": block.attached,
-                    }
-                    for block in blocks
-                ]
-            except (OSError, RuntimeError, TypeError, ValueError) as exc:
-                _logger.warning("semantic checkpoint context snapshot failed: %s", exc)
-
-        affordances: dict[str, Any] = {"capabilities": [], "workflows": []}
-        fabric = getattr(self.service, "_fabric", None)
-        if fabric is not None:
-            try:
-                affordances["capabilities"] = [
-                    {
-                        "id": record.get("id"),
-                        "scope": record.get("scope"),
-                        "lifecycle_state": record.get("lifecycle_state"),
-                        "code_hash": record.get("code_hash"),
-                        "schema_hash": record.get("schema_hash"),
-                    }
-                    for record in fabric.created_this_task(task_id)
-                ]
-            except (OSError, RuntimeError, TypeError, ValueError) as exc:
-                _logger.warning("semantic checkpoint affordance snapshot failed: %s", exc)
-        workflow_store = getattr(self.service, "_workflow_store", None)
-        if workflow_store is not None:
-            try:
-                workflows = await workflow_store.list(task_id=task_id)
-                affordances["workflows"] = [
-                    {
-                        "id": workflow.id,
-                        "version": workflow.version,
-                        "scope": workflow.scope.value,
-                        "lifecycle_state": workflow.lifecycle_state,
-                        "step_count": len(workflow.steps),
-                    }
-                    for workflow in workflows
-                ]
-            except (OSError, RuntimeError, TypeError, ValueError) as exc:
-                _logger.warning("semantic checkpoint workflow snapshot failed: %s", exc)
-
-        branches = []
-        try:
-            branches = [
-                {
-                    "id": branch.id,
-                    "status": branch.status,
-                    "commit_state": branch.commit_state,
-                    "checkpoint_id": branch.checkpoint_id,
-                }
-                for branch in self.shadow.list_branches()
-                if branch.task_id == task_id
-            ]
-        except (OSError, RuntimeError, TypeError, ValueError) as exc:
-            _logger.warning("semantic checkpoint branch snapshot failed: %s", exc)
-
-        from athena.protocol.messages import utcnow
-
-        return {
-            "captured_at": utcnow().isoformat(),
-            "task": task,
-            "event_boundary": events,
-            "world_state": world_state,
-            "attached_context": contexts,
-            "runtime_sessions": runtimes,
-            "affordances": affordances,
-            "shadow_branches": branches,
-        }
+        """Delegate descriptive checkpoint evidence to its projection owner."""
+        return await self._semantic_state.capture(
+            task_id=task_id,
+            workspace_root=workspace_root,
+        )
 
     async def synthesize_from_branch(
         self,
@@ -684,50 +601,22 @@ class FusionOrchestrator:
         effects: set,
         task_id: str | None,
         validation_cases: list[dict],
+        branch_id: str | None = None,
+        workspace: Any | None = None,
     ) -> dict:
-        """Synthesize a capability validated INSIDE a shadow context.
-
-        The branch provenance becomes part of the proof carried by the
-        resulting skill candidate.
-        """
-        from athena.synthesis.engine import SynthesisEngine
-
-        engine = getattr(self.service, "_synthesis", None)
-        if engine is None:
-            engine = SynthesisEngine()
-            # Services create the shared engine during startup. This fallback
-            # keeps the orchestrator usable with lightweight test doubles.
-            if self.service is not None:
-                if hasattr(self, "_synthesis_ref") and self._synthesis_ref is not None:
-                    self._synthesis_ref.set(engine)
-                else:
-                    self.service._synthesis = engine
-        dispatcher = getattr(self.service, "_dispatcher", None) if self.service else None
-        engine.bind_dispatcher(dispatcher)
-
-        cap = engine.synthesize(
+        """Delegate branch-bound synthesis to the explicit admission mechanism."""
+        return await self._branch_synthesis.run(
+            registry,
             name=name,
             description=description,
             code=code,
             input_schema=input_schema,
             effects=effects,
             task_id=task_id,
-            provenance={"origin": "shadow_experiment"},
+            validation_cases=validation_cases,
+            branch_id=branch_id,
+            workspace=workspace,
         )
-        cap = await engine.validate(cap, validation_cases)
-        # Generated machinery belongs in the effective task overlay.  Falling
-        # back to the supplied global registry remains supported for older
-        # callers/tests, but the service path never exposes it globally.
-        surface = getattr(self.service, "_fabric", None) or registry
-        admitted = engine.register_ephemeral(surface, cap)
-        candidate = engine.to_skill_candidate(cap.id) if cap.validation.get("all_passed") else None
-        return {
-            "capability_id": cap.id,
-            "admitted": admitted,
-            "validation": cap.validation,
-            "proof": engine.proof_for(cap.id),
-            "skill_candidate_proposed": candidate is not None,
-        }
 
     # ------------------------------------------------------------------
     # Internals
@@ -766,126 +655,14 @@ class FusionOrchestrator:
                 exc,
             )
 
-    async def _task_for_legacy(self, task_id: str):
-        store = self._store_tasks
-        if store is None and self.service:
-            store = getattr(self.service, "_store_tasks", None)
-        if task_id and store:
-            try:
-                row = await store.get(task_id)
-                if row:
-                    from athena.kernel.lifecycle import deserialize_task
-
-                    return deserialize_task(dict(row))
-            except Exception as exc:  # noqa: BLE001 - workspace fallback keeps orchestration available
-                _logger.warning("task lookup for %s failed: %s", task_id, exc)
-        return None
-
     async def _workspace_for(self, task_id: str):
         task = await self._task_for(task_id)
         if task is not None and task.workspace is not None:
             return task.workspace
-        if self._default_workspace is not None:
-            return self._default_workspace
-        if self.service is not None:
-            return getattr(self.service, "_default_workspace", None)
-        raise RuntimeError("FusionOrchestrator has no service bound for default workspace")
-
-    async def _dispatch_probe(
-        self, code: str, workspace, profile: str | None, task_id: str | None = None
-    ) -> tuple[bool, str]:
-        """Run one probe through the capability/policy path (item 16).
-
-        Dispatches an ``execute`` request bound to the given (shadow)
-        workspace so probes pass policy like every other operation instead
-        of bypassing via raw subprocess.
-        """
-        from athena.protocol.continuations import SuspendedCall
-        from athena.protocol.capabilities import CapabilityRequest
-
-        dispatcher = getattr(self.service, "_dispatcher", None)
-        if dispatcher is None:
-            raise RuntimeError("service has no capability dispatcher bound")
-        req = CapabilityRequest(
-            capability_id="execute",
-            arguments={"language": "shell", "code": code},
-            task_id=task_id,
-            call_id=new_id("call"),
-            origin=CapabilityRequestOrigin.TRUSTED_ORCHESTRATION,
-        )
-        result = await dispatcher.dispatch(req, workspace=workspace, profile=profile)
-        if isinstance(result, SuspendedCall):
-            return False, "probe requires approval; suspended"
-        if isinstance(result, Exception):
-            return False, str(result)
-        ok = getattr(result.status, "value", str(result.status)) == "ok"
-        detail = (getattr(result, "output", None) or "") + (getattr(result, "error", None) or "")
-        return ok, detail
-
-    def _rewrite_to_shadow(self, command: str, branch) -> str:
-        """Rewrite real paths to the sandbox-visible shadow mount.
-
-        Shadow verification runs through the ``shadow`` execution backend.
-        Inside its mount namespace the branch root is ``/workspace``; the
-        host-side temporary path is intentionally not visible.  Rewriting
-        only to the host shadow directory makes an absolute probe look right
-        in the parent process but fail inside the actual sandbox.
-        """
-        real_root = os.path.realpath(branch.base_workspace.root)
-        shadow_root = os.path.realpath(branch.shadow_workspace.root)
-        if real_root == shadow_root:
-            return command
-        return command.replace(real_root, "/workspace")
-
-    def _build_invariants(
-        self,
-        specs: list[dict] | None,
-        *,
-        branch=None,
-        profile: str | None = None,
-        task_id: str | None = None,
-    ):
-        """Build an InvariantSet from declarative or callable specs.
-
-        Declarative spec: {"description", "command"} — the probe runs that
-        command inside the shadow workspace via the dispatcher (same
-        capability/policy path as everything else).
-        """
-        from athena.worldstate import InvariantSet
-
-        inv = InvariantSet(
-            task_id=task_id,
-            store=getattr(self.service, "_world_state_store", None),
-        )
-        for spec in specs or []:
-            probe = spec.get("probe")
-            if probe is not None:
-                raise ValueError(
-                    "fusion invariants must use declarative command specs; "
-                    "arbitrary Python probes are not durable"
-                )
-            if probe is None and spec.get("command") and branch is not None:
-                code = self._rewrite_to_shadow(spec["command"], branch)
-
-                async def cmd_probe(cmd=code):
-                    ok, _ = await self._dispatch_probe(
-                        cmd, branch.shadow_workspace, profile, task_id=task_id
-                    )
-                    return ok
-
-                probe = cmd_probe
-            if probe is None:
-                raise ValueError(f"invariant spec needs 'command' or 'probe': {spec!r}")
-            inv.add(
-                spec["description"],
-                probe,
-                definition={
-                    "type": "command",
-                    "command": spec.get("command"),
-                    "required": bool(spec.get("required", True)),
-                },
-            )
-        return inv
+        workspace = self._fallback_workspace(task_id)
+        if workspace is not None:
+            return workspace
+        raise RuntimeError("FusionOrchestrator has no default workspace configured")
 
     async def _fail_path(
         self,

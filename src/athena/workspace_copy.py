@@ -199,9 +199,7 @@ async def rmtree_async(path: str | Path, *, ignore_errors: bool = False) -> None
     await run_blocking(shutil.rmtree, path, ignore_errors=ignore_errors)
 
 
-def _enforce_copy_budget(
-    source: Path, *, max_files: int | None, max_bytes: int | None
-) -> None:
+def _enforce_copy_budget(source: Path, *, max_files: int | None, max_bytes: int | None) -> None:
     """Reject oversized staging trees before creating destination files."""
     if max_files is None and max_bytes is None:
         return
@@ -219,7 +217,9 @@ def _enforce_copy_budget(
             if max_files is not None and files > max_files:
                 raise ValueError(f"workspace copy exceeds max_files={max_files}")
             try:
-                total_bytes += path.stat().st_size if not path.is_symlink() else len(os.readlink(path))
+                total_bytes += (
+                    path.stat().st_size if not path.is_symlink() else len(os.readlink(path))
+                )
             except OSError as exc:
                 raise ValueError(f"workspace copy cannot inspect {path}") from exc
             if max_bytes is not None and total_bytes > max_bytes:

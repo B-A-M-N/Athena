@@ -200,9 +200,7 @@ class ExecutionManager:
                 "ExecutionRequest.stdin is not supported by the canonical runtime API; "
                 "use the task-owned interactive stdin operation"
             )
-        self._validate_resource_limits(
-            request.backend, request.runtime, request.resource_limits
-        )
+        self._validate_resource_limits(request.backend, request.runtime, request.resource_limits)
 
     def _validate_resource_limits(self, backend: str, runtime: str, resource_limits) -> None:
         if resource_limits is None:
@@ -211,15 +209,11 @@ class ExecutionManager:
         if selected_backend is not None:
             capabilities = selected_backend.capabilities()
             if not bool(getattr(capabilities, "resource_limits", False)):
-                raise RuntimeError(
-                    f"backend {backend!r} does not enforce resource limits"
-                )
+                raise RuntimeError(f"backend {backend!r} does not enforce resource limits")
             return
         runtime_impl = self._resolve(runtime)
         if not bool(getattr(runtime_impl, "supports_resource_limits", False)):
-            raise RuntimeError(
-                f"runtime {runtime!r} does not enforce resource limits"
-            )
+            raise RuntimeError(f"runtime {runtime!r} does not enforce resource limits")
 
     def has_live_runtime(self, task_id: str) -> bool:
         """Return whether this task currently owns an execution/session."""

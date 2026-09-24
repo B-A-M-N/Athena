@@ -347,8 +347,7 @@ async def test_openai_stream_matches_canonical_mixed_reasoning_and_tool_shape():
     provider = _provider()
     request = _user_request()
     sse = [
-        "data: "
-        + json.dumps({"choices": [{"delta": {"reasoning_content": "inspect first"}}]}),
+        "data: " + json.dumps({"choices": [{"delta": {"reasoning_content": "inspect first"}}]}),
         "data: " + json.dumps({"choices": [{"delta": {"content": "A"}}]}),
         "data: " + json.dumps({"choices": [{"delta": {"content": "B"}}]}),
         "data: "

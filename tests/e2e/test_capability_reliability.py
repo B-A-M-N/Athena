@@ -227,9 +227,7 @@ async def test_held_out_speculation_is_bounded_and_measurably_useful():
         "stale dependencies",
         "conflicting candidate changes",
     )
-    enabled = [
-        await _run_case(scenario=scenario, recovery_attempts=1) for scenario in scenarios
-    ]
+    enabled = [await _run_case(scenario=scenario, recovery_attempts=1) for scenario in scenarios]
     disabled = await _run_case(scenario=scenarios[0], recovery_attempts=0)
     no_benefit = await _run_case(
         scenario="no speculation benefit", recovery_attempts=1, no_benefit=True

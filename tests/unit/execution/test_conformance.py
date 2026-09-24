@@ -80,23 +80,17 @@ async def test_backend_passport_keeps_unverified_claims_non_passing():
 
 def test_empty_or_incomplete_backend_passports_fail_closed():
     assert (
-        BackendPassport.from_receipts(
-            [], release_sha="release-sha", expected_runtimes=()
-        ).status
+        BackendPassport.from_receipts([], release_sha="release-sha", expected_runtimes=()).status
         == "FAIL"
     )
-    receipt = ConformanceReceipt(
-        backend="fixture", runtime="python", checks=("execution",)
-    )
+    receipt = ConformanceReceipt(backend="fixture", runtime="python", checks=("execution",))
     assert (
         BackendPassport.from_receipts(
             [receipt], release_sha="release-sha", expected_runtimes=("python", "shell")
         ).status
         == "FAIL"
     )
-    duplicate = ConformanceReceipt(
-        backend="fixture", runtime="python", checks=("execution",)
-    )
+    duplicate = ConformanceReceipt(backend="fixture", runtime="python", checks=("execution",))
     assert (
         BackendPassport.from_receipts(
             [receipt, duplicate],
@@ -132,11 +126,14 @@ def test_proof_status_is_shared_by_receipts_and_operator_projection():
         checks=("execution",),
         metadata={"unverified_claims": ("network_containment",)},
     )
-    assert proof_status(
-        checks=receipt.checks,
-        failures=receipt.failures,
-        unverified_claims=receipt.unverified_claims,
-    ) == "unverified"
+    assert (
+        proof_status(
+            checks=receipt.checks,
+            failures=receipt.failures,
+            unverified_claims=receipt.unverified_claims,
+        )
+        == "unverified"
+    )
     assert receipt.passed is False
     assert receipt.to_record()["proof_status"] == "unverified"
 

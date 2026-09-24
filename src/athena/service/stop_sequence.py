@@ -17,6 +17,7 @@ from athena.service.blocking_shutdown import shutdown_blocking_workers
 
 _logger = logging.getLogger("athena.service")
 
+
 async def stop(ports: Any) -> None:
     if not ports.started and ports.db is None:
         return

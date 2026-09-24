@@ -141,3 +141,16 @@ service composition lifecycle.
 
 - `pytest tests/unit/service -q`
 - `./scripts/architecture-lint --quiet`
+- `reasoning_support.py` owns typed role-policy normalization and late-bound auxiliary summarizer/interpreter callbacks; `AthenaService` remains the single `ModelRouter` construction site and neither mechanism selects task actions or constructs the kernel loop.
+- `task_inspection.py` owns the read-only forensic event taxonomy projection; `AthenaService.inspect()` remains a compatibility entrypoint and the event log stays authoritative.
+- `verification_support.py` owns bounded event/execution/mutation/result/research/world-state evidence projection; acceptance authority remains with the canonical verifier and kernel.
+- `verification_support.py` also owns composite-verifier construction and persisted self-host verification-environment revalidation; the canonical verifier/kernel remain the decision owners.
+- `capability_profile_support.py` owns configured capability-profile validation for native/MCP/skill/pack/delegate requirements; startup remains the only admission caller.
+- `mutation_support.py` owns post-mutation project-index and task-world-state invalidation; durable claim state remains the world-state authority.
+- `affordance_support.py` owns task-scoped cleanup of generated overlays, scratch state, and workflow projections; finalization remains the task manager authority.
+- `task_observation.py` owns read-only task/session/result/event/job/workflow projections; `TaskAPI` remains intake/admission and durable stores remain authoritative.
+- `task_observation.py` owns read-only task/session/result/event/job/workflow projections; `TaskAPI` remains intake/admission and durable stores remain authoritative.
+- `user_turn_support.py` owns canonical durable user-turn persistence before enqueue; task intake/recovery remain the admission and lifecycle authorities.
+- `steering.py` owns ancestor authorization, steerable-status checks, durable steering enqueue, and worker notification; it does not reason or dispatch capabilities.
+- `resource_cleanup_support.py` owns operator retry of durable resource cleanup and pending-finalization commit evidence; task finalization remains authoritative.
+- `workspace_reader.py` owns bounded hierarchical AGENTS.md reading and snapshots for context compilation; it is read-only and does not admit work.

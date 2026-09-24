@@ -121,9 +121,7 @@ async def test_workflow_effects_are_resolved_from_owned_graph(tmp_path):
     capability = WorkflowCapability(_Store(workflow), _Dispatcher(), _Fabric())
     effects = await capability.resolve_operation_effects(
         {"operation": "run", "workflow_id": workflow.id},
-        workspace=WorkspaceSpec(
-            id="repo", root=str(tmp_path), network_policy=NetworkPolicy.DENY
-        ),
+        workspace=WorkspaceSpec(id="repo", root=str(tmp_path), network_policy=NetworkPolicy.DENY),
         task_id="task-offline",
         principal_id="agent",
     )
@@ -140,9 +138,7 @@ async def test_workflow_effects_are_resolved_from_owned_graph(tmp_path):
     )
     network_effects = await network_capability.resolve_operation_effects(
         {"operation": "run", "workflow_id": network_workflow.id},
-        workspace=WorkspaceSpec(
-            id="repo", root=str(tmp_path), network_policy=NetworkPolicy.DENY
-        ),
+        workspace=WorkspaceSpec(id="repo", root=str(tmp_path), network_policy=NetworkPolicy.DENY),
         task_id="task-offline",
         principal_id="agent",
     )

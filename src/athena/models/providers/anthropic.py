@@ -204,6 +204,7 @@ def _done_event(
 
 class AnthropicProvider(WireRequestBounds):
     """ModelProvider adapter for the Anthropic Messages API."""
+
     def __init__(
         self,
         *,

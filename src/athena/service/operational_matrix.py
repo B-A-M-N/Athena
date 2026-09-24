@@ -28,6 +28,7 @@ def behavioral_proof(passport: Any, runtime: Any) -> dict[str, Any]:
             }
     return {"status": "not_run"}
 
+
 def build_operational_matrix(service: Any) -> dict[str, Any]:
     ports = OperationalMatrixPorts(service)
     execution = ports.execution
@@ -64,9 +65,7 @@ def build_operational_matrix(service: Any) -> dict[str, Any]:
                     "network_policy_effects": dict(
                         capabilities.get("network_policy_effects") or {}
                     ),
-                    "runtime_lifetime": capabilities.get(
-                        "runtime_lifetime", "athena_process"
-                    ),
+                    "runtime_lifetime": capabilities.get("runtime_lifetime", "athena_process"),
                     "filesystem_containment": bool(
                         cell.get(
                             "filesystem_containment", capabilities.get("filesystem_containment")

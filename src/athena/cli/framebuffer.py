@@ -743,49 +743,10 @@ class OIFrameBuffer:
     def render_overlay(
         self, scene: OIScene, visual: OIVisualState, width: int, height: int
     ) -> FrameBuffer | None:
-        """Encode a clipped transparent Buddy layer for partial presentation.
+        """Encode the transparent Buddy layer through its presentation owner."""
+        from athena.cli.framebuffer_overlay import BuddyOverlayRenderer
 
-        The static CRT remains resident in the host terminal. A stable overlay
-        image id lets Kitty discard the previous Buddy placement before the new
-        clipped rectangle is placed, so movement cannot leave stale pixels.
-        """
-        if Image is None:
-            return None
-        width, height = max(int(width), 80), max(int(height), 60)
-        if visual.semantic_state == "hidden":
-            return FrameBuffer(
-                b"",
-                width,
-                height,
-                layer="overlay",
-                base_key=(width, height, self._scene_key(scene)),
-            )
-        position = self._buddy_position(scene, visual, width, height)
-        if position is None:
-            return FrameBuffer(
-                b"",
-                width,
-                height,
-                layer="overlay",
-                base_key=(width, height, self._scene_key(scene)),
-            )
-        left, top = position
-        world = self._world.render(visual, status=scene.status)
-        encoded = io.BytesIO()
-        world.save(encoded, format="PNG", optimize=False, compress_level=1)
-        return FrameBuffer(
-            encoded.getvalue(),
-            width,
-            height,
-            dirty_region=(
-                left,
-                top,
-                self.BUDDY_WORLD_WIDTH,
-                self.BUDDY_WORLD_HEIGHT,
-            ),
-            layer="overlay",
-            base_key=(width, height, self._scene_key(scene)),
-        )
+        return BuddyOverlayRenderer(self).render(scene, visual, width, height)
 
 
 __all__ = ["FrameBuffer", "OIFrameBuffer", "pillow_available"]

@@ -216,7 +216,9 @@ class _NodeSession:
                 raise BrokenPipeError("node worker stdin is unavailable")
             process.stdin.write(f"{len(message)}\n{message}")
             process.stdin.flush()
-        except Exception:  # rationale: worker I/O loss is converted to an observable execution event
+        except (
+            Exception
+        ):  # rationale: worker I/O loss is converted to an observable execution event
             yield ExecutionEvent(
                 type=ExecutionEventType.STDERR,
                 execution_id=current,

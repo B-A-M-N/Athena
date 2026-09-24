@@ -105,9 +105,7 @@ async def test_failed_skill_reuse_is_attributed_and_targets_exact_revision():
                     capability_id="fs",
                     arguments={"operation": "read", "path": "release.toml"},
                 ),
-                CapabilityResultBlock(
-                    call_id="read", capability_id="fs", ok=True, output="config"
-                ),
+                CapabilityResultBlock(call_id="read", capability_id="fs", ok=True, output="config"),
                 CapabilityCallBlock(
                     call_id="check",
                     capability_id="execute",
@@ -128,7 +126,11 @@ async def test_failed_skill_reuse_is_attributed_and_targets_exact_revision():
                 SimpleNamespace(
                     type="SkillContextSelected",
                     payload={"skills": [{"skill_id": "skill-release", "version": 1}]},
-                )
+                ),
+                SimpleNamespace(
+                    type="SkillApplied",
+                    payload={"skill_id": "skill-release", "version": 1},
+                ),
             ]
         ),
     )
@@ -168,6 +170,7 @@ async def test_failed_skill_reuse_is_attributed_and_targets_exact_revision():
     assert candidate.target_skill_version == 1
     assert candidate.draft.id == "skill-release"
     assert candidate.draft.version == 1
+
 
 @pytest.mark.asyncio
 async def test_single_successful_trace_waits_for_repeatability():

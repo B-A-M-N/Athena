@@ -149,7 +149,11 @@ def namespace_path(value: str, root: str) -> str:
     """Rewrite workspace-local PATH entries for the /workspace mount."""
     parts = []
     for item in value.split(os.pathsep):
-        parts.append("/workspace" + item[len(root) :] if item == root or item.startswith(root + os.sep) else item)
+        parts.append(
+            "/workspace" + item[len(root) :]
+            if item == root or item.startswith(root + os.sep)
+            else item
+        )
     return os.pathsep.join(parts)
 
 

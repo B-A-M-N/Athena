@@ -159,14 +159,10 @@ def process_alive(pid: int, start_identity: str | None) -> bool:
     return True
 
 
-def wait_for_owned_exit(
-    captured: dict[int, str | None], *, timeout: float
-) -> tuple[int, ...]:
+def wait_for_owned_exit(captured: dict[int, str | None], *, timeout: float) -> tuple[int, ...]:
     deadline = time.monotonic() + max(0.0, timeout)
     while True:
-        survivors = tuple(
-            pid for pid, identity in captured.items() if process_alive(pid, identity)
-        )
+        survivors = tuple(pid for pid, identity in captured.items() if process_alive(pid, identity))
         if not survivors or time.monotonic() >= deadline:
             return survivors
         time.sleep(0.02)

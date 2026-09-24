@@ -140,8 +140,14 @@ async def invoke_with_retries(
         token_estimator = ModelTokenEstimator.from_profile(model_profile)
         try:
             request, worst_cost, _remaining = await _preflight_request(
-                broker, task, request, selection_for_attempt, token_estimator,
-                effective_policy, provider, compiled_for_attempt
+                broker,
+                task,
+                request,
+                selection_for_attempt,
+                token_estimator,
+                effective_policy,
+                provider,
+                compiled_for_attempt,
             )
         except ContextOverflow as exc:
             last_err = exc
@@ -149,8 +155,7 @@ async def invoke_with_retries(
                 raise
             attempted.add(pair)
             selection_for_attempt, compiled_for_attempt = await prepare_fallback(
-                broker._k, task, compiled_for_attempt,
-                attempted=frozenset(attempted), error=exc
+                broker._k, task, compiled_for_attempt, attempted=frozenset(attempted), error=exc
             )
             continue
         from athena.kernel.inference_broker import _request_fingerprint

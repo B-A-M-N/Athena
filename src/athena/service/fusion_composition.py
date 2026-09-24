@@ -22,6 +22,9 @@ class FusionComposition:
     workflow_store: Any
     synthesis: Any
     dispatcher: Any
+    verification_environment_resolver: Any
+    budget_provider: Any
+    default_workspace: Any
     world_state_store: Any
     world_state_provider: Any
     reality_coordinator: Any
@@ -47,6 +50,9 @@ class FusionComposition:
                 workflow_store=self.workflow_store,
                 synthesis=self.synthesis,
                 dispatcher=self.dispatcher,
+                verification_environment_resolver=self.verification_environment_resolver,
+                budget_provider=self.budget_provider,
+                default_workspace=self.default_workspace,
                 world_state_store=self.world_state_store,
                 world_state_provider=self.world_state_provider,
                 reality_coordinator=self.reality_coordinator,

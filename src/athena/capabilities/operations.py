@@ -18,7 +18,12 @@ from typing import Any
 
 from athena.protocol.capabilities import CapabilityDescriptor, EffectClass
 
-__all__ = ["OPERATION_EFFECTS", "CapabilityEffectError", "native_descriptor", "resolve_operation_effects"]
+__all__ = [
+    "OPERATION_EFFECTS",
+    "CapabilityEffectError",
+    "native_descriptor",
+    "resolve_operation_effects",
+]
 
 
 class CapabilityEffectError(ValueError):
@@ -393,6 +398,14 @@ OPERATION_EFFECTS: dict[str, dict[str, frozenset[EffectClass]]] = {
         "checkpoint": frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
         "inspect_checkpoint": frozenset({EffectClass.READ_LOCAL}),
         "release_checkpoint": frozenset({EffectClass.WRITE_LOCAL}),
+        "synthesize": frozenset(
+            {
+                EffectClass.READ_LOCAL,
+                EffectClass.WRITE_LOCAL,
+                EffectClass.EXECUTE,
+                EffectClass.SPAWN_PROCESS,
+            }
+        ),
     },
     "truth": {
         "status": frozenset({EffectClass.READ_LOCAL}),

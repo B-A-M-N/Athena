@@ -152,9 +152,7 @@ def test_copy_workspace_tree_rewrites_safe_internal_symlinks(tmp_path):
     ("limit", "message"),
     [(("max_files", 1), "max_files"), (("max_bytes", 3), "max_bytes")],
 )
-async def test_async_workspace_copy_rejects_oversized_tree_before_staging(
-    tmp_path, limit, message
-):
+async def test_async_workspace_copy_rejects_oversized_tree_before_staging(tmp_path, limit, message):
     source = tmp_path / "workspace"
     source.mkdir()
     (source / "one.txt").write_text("one\n", encoding="utf-8")

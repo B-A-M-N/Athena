@@ -106,8 +106,7 @@ async def _measure(dispatcher: CapabilityDispatcher, workspace: WorkspaceSpec):
         dispatcher.dispatch(_request("short"), workspace=workspace),
     )
     assert all(
-        isinstance(result, CapabilityResult)
-        and result.status is CapabilityResultStatus.OK
+        isinstance(result, CapabilityResult) and result.status is CapabilityResultStatus.OK
         for result in results
     )
     return executor

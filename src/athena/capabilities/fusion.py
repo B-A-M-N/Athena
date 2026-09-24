@@ -47,6 +47,7 @@ class FusionCapability:
                         "checkpoint",
                         "inspect_checkpoint",
                         "release_checkpoint",
+                        "synthesize",
                     ],
                 },
                 "branch_id": {"type": "string", "minLength": 1, "maxLength": 128},
@@ -100,6 +101,8 @@ class FusionCapability:
                 "label": {"type": "string"},
                 "reason": {"type": "string"},
                 "changes_from_previous": {"type": "string", "minLength": 1, "maxLength": 2000},
+                "parallel": {"type": "boolean"},
+                "max_parallel": {"type": "integer", "minimum": 1, "maximum": 4},
             },
             "oneOf": [
                 {"properties": {"operation": {"const": "run"}}, "required": ["proposal"]},
@@ -119,6 +122,10 @@ class FusionCapability:
                 {
                     "properties": {"operation": {"const": "release_checkpoint"}},
                     "required": ["checkpoint_id"],
+                },
+                {
+                    "properties": {"operation": {"const": "synthesize"}},
+                    "required": ["branch_id"],
                 },
                 {"properties": {"operation": {"const": "checkpoint"}}},
             ],
@@ -185,6 +192,8 @@ class FusionCapability:
                     proposals=proposals,
                     invariants=[dict(item) for item in args.get("invariants") or ()],
                     profile=args.get("profile"),
+                    parallel=bool(args.get("parallel", False)),
+                    max_parallel=int(args.get("max_parallel") or 2),
                 )
                 return _result(
                     request,
@@ -197,7 +206,33 @@ class FusionCapability:
                             str(item.get("branch_id")): dict(item.get("comparative_evidence") or {})
                             for item in outcome.get("candidates", ())
                             if item.get("branch_id")
-                        }
+                        },
+                    },
+                )
+
+            if operation == "synthesize":
+                branch = _owned_branch(orchestrator, str(args.get("branch_id") or ""), task_id)
+                if branch is None:
+                    return _result(request, ok=False, error="branch not found")
+                outcome = await orchestrator.synthesize_from_branch(
+                    self._service._registry,
+                    name=str(args.get("name") or ""),
+                    description=str(args.get("description") or ""),
+                    code=str(args.get("code") or ""),
+                    input_schema=dict(args.get("input_schema") or {}),
+                    effects=set(args.get("effects") or set()),
+                    task_id=task_id,
+                    validation_cases=[dict(item) for item in args.get("validation_cases") or ()],
+                    branch_id=branch.id,
+                    workspace=branch.shadow_workspace,
+                )
+                return _result(
+                    request,
+                    output=json.dumps(outcome),
+                    metadata={
+                        "operation": operation,
+                        "branch_id": branch.id,
+                        "admitted": bool(outcome.get("admitted")),
                     },
                 )
 

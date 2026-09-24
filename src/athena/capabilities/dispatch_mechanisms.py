@@ -153,9 +153,7 @@ class DispatchOrdering(_Mechanism):
             "trial",
         }:
             envelope_identity = (
-                arguments.get("run_id")
-                or request.call_id
-                or arguments.get("workflow_id")
+                arguments.get("run_id") or request.call_id or arguments.get("workflow_id")
             )
             if envelope_identity:
                 envelope_key = (boundary, "workflow-envelope", str(envelope_identity))
@@ -245,10 +243,14 @@ class DispatchOrdering(_Mechanism):
         held = self._d._task_held_locks.setdefault(current, set())
 
         executor = getattr(prepared, "executor", None)
-        resource_keys = () if getattr(executor, "mediates_nested_dispatch", False) else (
-            prepared.resource_keys
-            if isinstance(prepared, PreparedCapabilityCall)
-            else self.resource_keys_for(request, workspace, effects, executor=executor)
+        resource_keys = (
+            ()
+            if getattr(executor, "mediates_nested_dispatch", False)
+            else (
+                prepared.resource_keys
+                if isinstance(prepared, PreparedCapabilityCall)
+                else self.resource_keys_for(request, workspace, effects, executor=executor)
+            )
         )
 
         async def invoke_with_locks():

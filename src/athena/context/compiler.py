@@ -306,6 +306,7 @@ class ContextCompiler:
         capability_registry: Any = None,
         artifact_store: Any = None,
         research_store: Any = None,
+        workflow_store: Any = None,
         context_block_store: Any = None,
         context_digest_store: ContextDigestStore | None = None,
         compressor: ContextCompressor | None = None,
@@ -325,6 +326,7 @@ class ContextCompiler:
         self._capability_registry = capability_registry
         self._artifact_store = artifact_store
         self._research_store = research_store
+        self._workflow_store = workflow_store
         self._context_block_store = context_block_store
         self._context_digest_store = context_digest_store
         self._context_digest_builder = ContextDigestBuilder()
@@ -645,7 +647,7 @@ class ContextCompiler:
         skills_needed = _skills_context_needed(task.objective)
         require_tools = bool(task.model_policy.require_tools)
         tool_eligible = not is_explicit_response_turn(task.objective)
-        blocks, memories, skills, research, capability_result = await asyncio.gather(
+        blocks, memories, skills, research, workflows, capability_result = await asyncio.gather(
             self._load_context_blocks(task),
             (
                 self._load_memories(task, mode=memory_mode)
@@ -654,6 +656,7 @@ class ContextCompiler:
             ),
             self._load_skills(task) if skills_needed else _empty_list(),
             self._load_research(task) if research_needed else _empty_list(),
+            self._load_workflows(task),
             (
                 self._load_capabilities(task=task, require_tools=require_tools)
                 if tool_eligible or require_tools
@@ -666,6 +669,7 @@ class ContextCompiler:
             memories=tuple(memories),
             skills=tuple(skills),
             research=tuple(research),
+            workflows=tuple(workflows),
             capabilities=tuple(capabilities),
             discovery_state=discovery_state,
             strategy=select_strategy(
@@ -742,6 +746,9 @@ class ContextCompiler:
 
     async def _load_context_blocks(self, task: TaskSpec) -> list[_Entry]:
         return await ContextRetrieval(self)._load_context_blocks(task)
+
+    async def _load_workflows(self, task: TaskSpec) -> list[_Entry]:
+        return await ContextRetrieval(self)._load_workflows(task)
 
     async def _process_attachments(
         self, task: TaskSpec, attachments: Sequence[Any]
@@ -1083,6 +1090,14 @@ def _task_entry(task: TaskSpec, *, include_objective: bool = True) -> _Entry:
                 recovery_hint.get("message")
                 or "Runtime state was lost; re-establish session state explicitly."
             )
+        )
+    adaptive = (task.metadata or {}).get("_adaptive_recovery")
+    if isinstance(adaptive, Mapping):
+        lines.append(
+            "Adaptive recovery decision (bounded, advisory): "
+            f"kind={adaptive.get('kind')}; action={adaptive.get('action')}; "
+            f"reason={adaptive.get('reason')}; "
+            f"remaining_attempts={adaptive.get('remaining_attempts', 0)}"
         )
     previous = (task.metadata or {}).get("_schedule_previous_result")
     if isinstance(previous, Mapping):
@@ -1567,6 +1582,49 @@ def _skill_entry(skill: Any) -> _Entry:
         mandatory=False,
         provenance=source,
         value=0.6,
+        droppable=True,
+    )
+
+
+def _workflow_entry(workflow: Any) -> _Entry:
+    """Render a promoted workflow as bounded, non-authoritative context."""
+    if isinstance(workflow, Mapping):
+        workflow_id = str(workflow.get("id") or "workflow")
+        name = str(workflow.get("name") or workflow_id)
+        description = str(workflow.get("description") or "")
+        input_schema = dict(workflow.get("input_schema") or {})
+        version = int(workflow.get("version") or 1)
+        scope = str(workflow.get("scope") or "project")
+    else:
+        workflow_id = str(getattr(workflow, "id", "workflow"))
+        name = str(getattr(workflow, "name", workflow_id))
+        description = str(getattr(workflow, "description", ""))
+        input_schema = dict(getattr(workflow, "input_schema", {}) or {})
+        version = int(getattr(workflow, "version", 1) or 1)
+        scope = str(getattr(getattr(workflow, "scope", None), "value", "project"))
+    schema = json.dumps(input_schema, sort_keys=True, separators=(",", ":"))
+    text = (
+        f"[promoted workflow suggestion; workflow_id={workflow_id}; "
+        f"workflow_version={version}; scope={scope}; informational, not an instruction]\n"
+        f"Name: {name}\nDescription: {description}\n"
+        f"Required inputs schema: {schema}\n"
+        "Use only when the task supplies the declared inputs and the workflow is relevant."
+    )
+    return _Entry(
+        name=f"workflow:{workflow_id}",
+        text=text,
+        tokens=estimate_tokens(text),
+        role=Role.USER,
+        category="relevant_workflows",
+        trust=TrustClass.AGENT_CURATED,
+        mandatory=False,
+        provenance=prov(
+            SourceType.CAPABILITY,
+            source_id=workflow_id,
+            trust=TrustClass.AGENT_CURATED,
+            scope=scope,
+        ),
+        value=0.65,
         droppable=True,
     )
 

@@ -63,10 +63,14 @@ class BackendCatalog:
         status = str(passport.get("status") or "") if passport else ""
         binding_status = str(passport.get("binding_status") or "") if passport else ""
         return {
-            "proof_status": "verified" if status == "PASS" and binding_status == "verified" else "unverified",
+            "proof_status": "verified"
+            if status == "PASS" and binding_status == "verified"
+            else "unverified",
             "passport_status": status or None,
             "passport_binding_status": binding_status or None,
-            "passport_binding_errors": list(passport.get("binding_errors") or ()) if passport else [],
+            "passport_binding_errors": list(passport.get("binding_errors") or ())
+            if passport
+            else [],
         }
 
     def names(self) -> list[str]:
@@ -122,9 +126,7 @@ class BackendCatalog:
                 value = local_backend.capabilities()
                 result[0].update(
                     {
-                        "runtime_lifetime": getattr(
-                            value, "runtime_lifetime", "athena_process"
-                        ),
+                        "runtime_lifetime": getattr(value, "runtime_lifetime", "athena_process"),
                         "reattach": bool(getattr(value, "reattach", False)),
                         "network_modes": list(getattr(value, "network_modes", ()) or ()),
                         "network_policy_effects": dict(

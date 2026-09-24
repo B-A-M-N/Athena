@@ -85,3 +85,23 @@ async def test_repeated_loads_replace_state_and_use_revision_cache(
     assert (await loader.load_active())[0].description == "changed skill"
     assert parses == 2
     assert loader.generation == 2
+
+
+async def test_refresh_reports_unchanged_version_content_conflict(skills_dir: Path):
+    skill_dir = skills_dir / "refreshable"
+    skill_dir.mkdir()
+    skill_path = skill_dir / "SKILL.md"
+    skill_path.write_text("---\nname: refreshable\ndescription: first\n---\nDo the first thing.\n")
+    loader = SkillLoader(search_paths=[skills_dir])
+    assert (await loader.load())[0].body == "Do the first thing."
+
+    skill_path.write_text(
+        "---\nname: refreshable\ndescription: second\n---\nDo the second thing.\n"
+    )
+    refreshed, conflicts = loader.refresh()
+
+    assert refreshed[0].body == "Do the second thing."
+    assert len(conflicts) == 1
+    assert conflicts[0]["name"] == "refreshable"
+    assert conflicts[0]["version"] == 1
+    assert conflicts[0]["reason"] == "unchanged_version_content_changed"

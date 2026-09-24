@@ -504,6 +504,7 @@ class WorkflowCapability:
         finally:
             await cancel_safe_cleanup(trial_root)
 
+
 def _result(request, *, ok=True, output="", error=None, metadata=None):
     if ok:
         return CapabilityResult(

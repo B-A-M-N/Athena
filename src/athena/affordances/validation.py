@@ -64,8 +64,10 @@ class SourceValidation:
         # cannot accidentally promote unvalidated code.
         required = {"parse", "interface", "security"}
         names = {check.name for check in self.checks}
-        return bool(self.checks) and required.issubset(names) and all(
-            check.status in {"passed", "skipped"} for check in self.checks
+        return (
+            bool(self.checks)
+            and required.issubset(names)
+            and all(check.status in {"passed", "skipped"} for check in self.checks)
         )
 
     @property

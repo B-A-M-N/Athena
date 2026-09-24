@@ -22,6 +22,7 @@ from athena.protocol.events import EventCategory, make_event
 from athena.protocol.ids import new_id
 from athena.protocol.messages import Provenance, SourceType, TrustClass, utcnow
 from athena.skills.models import Skill, SkillCandidate
+from athena.skills.candidate_lifecycle import SkillCandidateLifecycle
 from athena.skills.validator import SkillValidator
 from athena.state.database import Database
 
@@ -31,6 +32,7 @@ _STATE_ENABLED = "enabled"
 _STATE_DISABLED = "disabled"
 _STATE_ARCHIVED = "archived"
 _LIFEKEY = "athena.lifecycle"
+_SCOPE_RANK = {"task": 1, "project": 2, "user": 3, "global": 4, "system": 4}
 
 
 def _meta(skill: Skill) -> dict:
@@ -115,11 +117,32 @@ class SkillLifecycle:
         db: Database,
         *,
         events: Any = None,
+        tasks: Any = None,
         validator: SkillValidator | None = None,
+        refresh_event_sink: Any = None,
     ) -> None:
         self._db = db
         self._events = events
+        self._tasks = tasks
+        self._refresh_event_sink = refresh_event_sink
         self._validator = validator or SkillValidator()
+        self._candidates = SkillCandidateLifecycle(
+            db=db,
+            events=events,
+            tasks=tasks,
+            validator=self._validator,
+            emit=self._emit,
+            emit_candidate=self._emit_candidate,
+            get_skill=self.get,
+            install=self.install,
+            update=self.update,
+            draft_record=_candidate_draft_record,
+            record_codec=_candidate_record,
+            record_from_codec=_candidate_from_record,
+        )
+
+    async def _resolve_candidate_evidence(self, candidate: SkillCandidate) -> dict[str, Any]:
+        return await self._candidates.resolve_evidence(candidate)
 
     async def install(
         self,
@@ -250,116 +273,25 @@ class SkillLifecycle:
         task_id: str | None = None,
         lifecycle_state: str = "PENDING_REVIEW",
     ) -> str:
-        """Persist one reviewable skill draft without activating it.
-
-        Candidate content is stored separately from active skills.  This
-        makes the pending queue durable and inspectable while preserving the
-        existing explicit validation/promotion gate.
-        """
-        result = self._validator.validate_candidate(candidate)
-        if not result.ok:
-            lifecycle_state = "REJECTED"
-        now = utcnow().isoformat()
-        candidate_id = candidate.id
-        await self._db.execute(
-            "INSERT INTO skill_candidates("
-            "id, source_task_id, name, draft, rationale, evidence, confidence, "
-            "lifecycle_state, promoted_skill_id, target_skill_id, "
-            "target_skill_version, created_at, updated_at, metadata) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at, "
-            "lifecycle_state=CASE WHEN skill_candidates.lifecycle_state IN "
-            "('PROMOTED', 'DEPRECATED') THEN skill_candidates.lifecycle_state "
-            "ELSE excluded.lifecycle_state END",
-            (
-                candidate_id,
-                candidate.source_task_id,
-                candidate.propose_name,
-                json.dumps(_candidate_draft_record(candidate.draft), sort_keys=True),
-                candidate.rationale,
-                json.dumps(list(candidate.evidence), sort_keys=True),
-                float(candidate.confidence),
-                lifecycle_state,
-                candidate.target_skill,
-                candidate.target_skill_version,
-                now,
-                now,
-                json.dumps(
-                    {
-                        "task_id": task_id or candidate.source_task_id,
-                        "confidence_kind": "heuristic_proposal",
-                        "validation_errors": list(result.errors),
-                        "validation_warnings": list(result.warnings),
-                    },
-                    sort_keys=True,
-                ),
-            ),
+        return await self._candidates.record(
+            candidate, task_id=task_id, lifecycle_state=lifecycle_state
         )
-        await self._emit_candidate(
-            candidate,
-            accepted=False,
-            task_id=task_id,
-            candidate_id=candidate_id,
-            lifecycle_state=lifecycle_state,
-        )
-        return candidate_id
 
     async def list_candidates(self, *, include_reviewed: bool = False) -> List[dict[str, Any]]:
-        """List durable skill candidates for the shared operator review view."""
-        sql = "SELECT * FROM skill_candidates"
-        params: tuple[Any, ...] = ()
-        if not include_reviewed:
-            sql += " WHERE lifecycle_state IN ('PENDING_REVIEW', 'REJECTED')"
-        sql += " ORDER BY updated_at DESC, id"
-        rows = await self._db.fetch_all(sql, params)
-        return [_candidate_record(row) for row in rows]
+        return await self._candidates.list_candidates(include_reviewed=include_reviewed)
 
     async def get_candidate(self, candidate_id: str) -> dict[str, Any] | None:
-        row = await self._db.fetch_one(
-            "SELECT * FROM skill_candidates WHERE id = ?", (candidate_id,)
-        )
-        return _candidate_record(row) if row else None
+        return await self._candidates.get_candidate(candidate_id)
 
     async def discard_candidate(self, candidate_id: str) -> bool:
-        row = await self._db.fetch_one(
-            "SELECT lifecycle_state FROM skill_candidates WHERE id = ?", (candidate_id,)
-        )
-        if row is None or str(row.get("lifecycle_state")) not in {
-            "PENDING_REVIEW",
-            "REJECTED",
-        }:
-            return False
-        await self._db.execute(
-            "UPDATE skill_candidates SET lifecycle_state = 'DEPRECATED', updated_at = ? WHERE id = ?",
-            (utcnow().isoformat(), candidate_id),
-        )
-        return True
+        return await self._candidates.discard(candidate_id)
 
     async def promote_candidate(
-        self,
-        candidate_id: str,
-        *,
-        task_id: str | None = None,
-        authorized: bool = True,
+        self, candidate_id: str, *, task_id: str | None = None, authorized: bool = True
     ) -> str | None:
-        """Promote one stored candidate through the normal skill gate."""
-        row = await self._db.fetch_one(
-            "SELECT * FROM skill_candidates WHERE id = ?", (candidate_id,)
+        return await self._candidates.promote_candidate(
+            candidate_id, task_id=task_id, authorized=authorized
         )
-        if row is None:
-            return None
-        if str(row.get("lifecycle_state")) != "PENDING_REVIEW":
-            return None
-        candidate = _candidate_from_record(row)
-        skill_id = await self.promote(candidate, task_id=task_id, authorized=authorized)
-        if skill_id is None:
-            return None
-        await self._db.execute(
-            "UPDATE skill_candidates SET lifecycle_state = 'PROMOTED', "
-            "promoted_skill_id = ?, updated_at = ? WHERE id = ?",
-            (skill_id, utcnow().isoformat(), candidate_id),
-        )
-        return skill_id
 
     async def history(self, skill_id: str) -> List[dict]:
         return await self._db.fetch_all(
@@ -379,76 +311,9 @@ class SkillLifecycle:
         )
 
     async def promote(
-        self,
-        candidate: SkillCandidate,
-        *,
-        task_id: str | None = None,
-        authorized: bool = True,
+        self, candidate: SkillCandidate, *, task_id: str | None = None, authorized: bool = True
     ) -> str | None:
-        """Promote a validated candidate to an active skill (self-improvement).
-
-        ``authorized`` gates promotion by policy; when False, promotion is
-        refused and only a rejected candidate event is emitted (never silent).
-        """
-        if not authorized:
-            await self.record_candidate(candidate, task_id=task_id)
-            logger.warning("skill promotion blocked by policy for %s", candidate.propose_name)
-            return None
-
-        result = self._validator.validate_candidate(candidate)
-        if not result.ok:
-            await self._emit_candidate(candidate, accepted=False, task_id=task_id)
-            logger.warning("skill candidate invalid: %s", result.errors)
-            return None
-
-        draft = _with_trust(candidate.draft, TrustClass.AGENT_CURATED)
-        current = await self.get(candidate.target_skill) if candidate.target_skill else None
-        if candidate.target_skill and current is not None:
-            if (
-                candidate.target_skill_version is not None
-                and current.version != candidate.target_skill_version
-            ):
-                await self._emit_candidate(
-                    candidate,
-                    accepted=False,
-                    task_id=task_id,
-                    lifecycle_state="REVISION_CONFLICT",
-                )
-                logger.warning(
-                    "skill promotion target changed for %s: expected version %s, found %s",
-                    candidate.target_skill,
-                    candidate.target_skill_version,
-                    current.version,
-                )
-                return None
-            if candidate.target_skill_version is None:
-                await self._emit_candidate(
-                    candidate,
-                    accepted=False,
-                    task_id=task_id,
-                    lifecycle_state="REVISION_CONFLICT",
-                )
-                logger.warning(
-                    "skill promotion target has no expected version: %s", candidate.target_skill
-                )
-                return None
-            await self.update(candidate.target_skill, draft)
-            await self._emit_candidate(
-                candidate, accepted=True, skill_id=candidate.target_skill, task_id=task_id
-            )
-            return candidate.target_skill
-        if candidate.target_skill:
-            await self._emit_candidate(
-                candidate,
-                accepted=False,
-                task_id=task_id,
-                lifecycle_state="TARGET_MISSING",
-            )
-            logger.warning("skill promotion target no longer exists: %s", candidate.target_skill)
-            return None
-        skill_id = await self.install(draft, task_id=task_id)
-        await self._emit_candidate(candidate, accepted=True, skill_id=skill_id, task_id=task_id)
-        return skill_id
+        return await self._candidates.promote(candidate, task_id=task_id, authorized=authorized)
 
     async def search(self, query: str = "", *, limit: int = 10) -> List[Skill]:
         skills = await self.list(active_only=True)
@@ -714,6 +579,42 @@ class SkillStore:
         if self._lifecycle is not None:
             return await self._lifecycle.list(active_only=True)
         return await self._loader.load_active() if self._loader else []
+
+    async def refresh_file_backed(self) -> dict[str, Any]:
+        """Refresh file-backed skills without mutating the current turn.
+
+        The loader owns parsing and conflict detection. This facade only
+        reconciles newly discovered name/version pairs into the durable
+        lifecycle; unchanged-version content conflicts remain report-only.
+        """
+        if self._loader is None:
+            return {"status": "unavailable", "refreshed": 0, "installed": 0, "conflicts": []}
+        refreshed, conflicts = self._loader.refresh()
+        installed = 0
+        if self._lifecycle is not None:
+            existing = await self._lifecycle.list()
+            known = {(skill.name, skill.version) for skill in existing}
+            for skill in refreshed:
+                key = (skill.name, skill.version)
+                if key in known:
+                    continue
+                if any(
+                    conflict.get("name") == skill.name and conflict.get("version") == skill.version
+                    for conflict in conflicts
+                ):
+                    continue
+                await self._lifecycle.install(skill)
+                known.add(key)
+                installed += 1
+        result = {
+            "status": "conflicts" if conflicts else "refreshed",
+            "refreshed": len(refreshed),
+            "installed": installed,
+            "conflicts": conflicts,
+        }
+        if self._lifecycle is not None and self._lifecycle._refresh_event_sink is not None:
+            await self._lifecycle._refresh_event_sink(result)
+        return result
 
 
 __all__ = ["SkillLifecycle", "SkillStore"]

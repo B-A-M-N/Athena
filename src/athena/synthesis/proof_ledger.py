@@ -266,7 +266,9 @@ class ProofLedger:
                     "uses": cap.uses,
                     "successes": cap.successes,
                     "failures": cap.failures,
-                    "status": "verified" if cap.uses and cap.successes == cap.uses else "incomplete",
+                    "status": "verified"
+                    if cap.uses and cap.successes == cap.uses
+                    else "incomplete",
                 },
                 "contract_success": {
                     "status": "verified"

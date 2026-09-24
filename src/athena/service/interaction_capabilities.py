@@ -23,9 +23,7 @@ def _assert_optional_consistency(
     )
     state = str(health.get("state") or "unknown")
     if registered != (instance is not None):
-        raise RuntimeError(
-            f"{capability_id} registry/instance mismatch: registered={registered}"
-        )
+        raise RuntimeError(f"{capability_id} registry/instance mismatch: registered={registered}")
     if registered and state not in {"ready", "available", "configured"}:
         raise RuntimeError(f"{capability_id} registered with non-ready health: {state}")
 
@@ -210,9 +208,7 @@ async def register_interaction_capabilities(
         }
         _logger.info("browser capability unavailable: %s", exc)
 
-    _assert_optional_consistency(
-        registry, "computer", ports.computer, ports.computer_health
-    )
+    _assert_optional_consistency(registry, "computer", ports.computer, ports.computer_health)
     _assert_optional_consistency(registry, "browser", ports.browser, ports.browser_health)
 
 

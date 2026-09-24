@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -77,6 +78,116 @@ async def test_verified_fusion_candidate_awaits_reality_promotion(fused):
     assert result.verified is True
     assert result.claim_id is None
     assert not os.path.exists(os.path.join(ws.root, "candidate.py"))
+
+
+@pytest.mark.athena_scenario("C-03")
+async def test_composed_fusion_candidate_reaches_reality_commit_seam(fused):
+    """The real Fusion, Shadow, verifier, and Reality path commits once."""
+    svc, ws, task_id = fused
+    criteria = [
+        {
+            "id": "candidate-proof",
+            "description": "candidate contains the value",
+            "verification": {
+                "type": "file",
+                "path": "candidate.py",
+                "predicate": "contains:VALUE = 41",
+            },
+            "required": True,
+        }
+    ]
+    await svc._store_tasks._db.execute(
+        "UPDATE tasks SET acceptance_criteria = ? WHERE id = ?",
+        (json.dumps(criteria), task_id),
+    )
+    fusion = FusionOrchestrator(svc)
+    result = await fusion.run_experiment(
+        task_id=task_id,
+        proposal=[
+            {
+                "capability_id": "fs",
+                "arguments": {
+                    "operation": "write",
+                    "path": "candidate.py",
+                    "content": "VALUE = 41\n",
+                    "create_dirs": True,
+                },
+            }
+        ],
+        profile="autonomous",
+        auto_fork_on_failure=False,
+    )
+    assert result.status == "CANDIDATE_READY", result.error
+    branch = fusion.shadow.get_branch(result.branch_id)
+    assert branch is not None
+    task = await svc._task_manager.get(task_id)
+    svc._reality_gate.activate_branch(branch)
+    completion = await svc._reality_coordinator.prepare_completion(
+        task,
+        __import__(
+            "athena.kernel.termination", fromlist=["TerminationDecision"]
+        ).TerminationDecision(
+            terminal=True,
+            status=__import__("athena.protocol.tasks", fromlist=["TaskStatus"]).TaskStatus.COMPLETE,
+            reason="candidate accepted",
+        ),
+    )
+    assert completion.committed is True
+    assert (Path(ws.root) / "candidate.py").read_text(encoding="utf-8") == "VALUE = 41\n"
+
+
+async def test_m03_branch_synthesis_is_admitted_task_locally(fused):
+    svc, ws, task_id = fused
+    criteria = [
+        {
+            "id": "m03-source",
+            "description": "source branch proof",
+            "verification": {"type": "file", "path": "source.txt", "predicate": "contains:ready"},
+            "required": True,
+        }
+    ]
+    await svc._store_tasks._db.execute(
+        "UPDATE tasks SET acceptance_criteria = ? WHERE id = ?",
+        (json.dumps(criteria), task_id),
+    )
+    fusion = FusionOrchestrator(svc)
+    experiment = await fusion.run_experiment(
+        task_id=task_id,
+        proposal=[
+            {
+                "capability_id": "fs",
+                "arguments": {
+                    "operation": "write",
+                    "path": "source.txt",
+                    "content": "ready\n",
+                    "create_dirs": True,
+                },
+            }
+        ],
+        profile="autonomous",
+        auto_fork_on_failure=False,
+    )
+    assert experiment.status == "CANDIDATE_READY", experiment.error
+    outcome = await fusion.synthesize_from_branch(
+        svc._registry,
+        name="branch_transform",
+        description="Transforms a source value inside the branch.",
+        code="def run(args):\n    return {'value': args['value'].upper()}\n",
+        input_schema={
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+        effects={"READ_LOCAL"},
+        task_id=task_id,
+        validation_cases=[{"args": {"value": "ready"}, "expect_output": {"value": "READY"}}],
+        branch_id=experiment.branch_id,
+        workspace=fusion.shadow.get_branch(experiment.branch_id).shadow_workspace,
+    )
+    assert outcome["admitted"] is True
+    assert outcome["branch_id"] == experiment.branch_id
+    assert svc._fabric.has(outcome["capability_id"], task_id=task_id)
 
 
 async def test_invariant_violation_blocks_commit_after_canonical_proof(fused):
@@ -206,6 +317,59 @@ async def test_synthesized_capability_with_shadow_provenance(fused):
     assert outcome["admitted"] is True
     assert outcome["validation"]["all_passed"] is True
     assert outcome["skill_candidate_proposed"] is False  # uses < 2 so far
+
+
+async def test_synthesized_capability_binds_validation_to_exact_branch(fused):
+    svc, ws, task_id = fused
+    criteria = [
+        {
+            "id": "branch-file",
+            "description": "candidate exists in the branch",
+            "verification": {"type": "file", "path": "branch.txt"},
+            "required": True,
+        }
+    ]
+    await svc._store_tasks._db.execute(
+        "UPDATE tasks SET acceptance_criteria = ? WHERE id = ?",
+        (json.dumps(criteria), task_id),
+    )
+    fusion = FusionOrchestrator(svc)
+    experiment = await fusion.run_experiment(
+        task_id=task_id,
+        proposal=[
+            {
+                "capability_id": "fs",
+                "arguments": {
+                    "operation": "write",
+                    "path": "branch.txt",
+                    "content": "branch\n",
+                    "create_dirs": True,
+                },
+            }
+        ],
+        profile="autonomous",
+        auto_fork_on_failure=False,
+    )
+    assert experiment.status == "CANDIDATE_READY", experiment.error
+    branch = fusion.shadow.get_branch(experiment.branch_id)
+    assert branch is not None
+    before = await fusion.shadow.workspace_fingerprint(branch.shadow_workspace.root)
+    outcome = await fusion.synthesize_from_branch(
+        svc._registry,
+        name="branch_reader",
+        description="reads branch proof",
+        code="def run(args):\n    return {'ok': True}\n",
+        input_schema={"type": "object", "additionalProperties": False},
+        effects={"READ_LOCAL"},
+        task_id=task_id,
+        validation_cases=[{"args": {}, "expect_output": {"ok": True}}],
+        branch_id=branch.id,
+        workspace=branch.shadow_workspace,
+    )
+    assert outcome["branch_id"] == branch.id
+    assert outcome["workspace_fingerprint"] == before
+    assert outcome["verification_environment"] is None
+    assert outcome["admitted"] is True
 
 
 async def test_fusion_orchestrator_accepts_explicit_ports(tmp_path):

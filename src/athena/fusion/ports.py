@@ -57,6 +57,9 @@ class FusionPorts:
     synthesis: Any | None = None
     synthesis_ref: Any | None = None
     dispatcher: Any | None = None
+    verification_environment: Any | None = None
+    verification_environment_resolver: Callable[[Any], Any] | None = None
+    budget_provider: Any | None = None
     world_state_provider: Callable[[str], Any] | None = None
     default_workspace: Any | None = None
     world_state_store: Any | None = None

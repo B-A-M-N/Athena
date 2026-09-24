@@ -11,11 +11,12 @@ Precedence for a duplicated name+version (highest wins):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Any, Iterable, Iterator
 
 from athena.protocol.messages import Provenance, SourceType, TrustClass
 from athena.skills.models import Skill
@@ -48,6 +49,19 @@ _DEFAULT_SCOPE_TRUST = {
 }
 
 logger = logging.getLogger(__name__)
+
+
+def _content_hash(skill: Skill) -> str:
+    payload = "\x00".join(
+        (
+            skill.name,
+            skill.description,
+            *skill.triggers,
+            skill.body,
+            skill.scope,
+        )
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _parse_frontmatter_minimal(text: str) -> dict | None:
@@ -157,21 +171,8 @@ class SkillLoader:
         self._loaded = False
         self._revision = None
 
-    async def load(self) -> list[Skill]:
-        """Parse all skills, deduped by (name, version)."""
-        discovered = tuple(self._discovered_files())
-        revision = tuple(
-            (
-                str(path),
-                int(stat.st_mtime_ns),
-                int(stat.st_size),
-                int(getattr(stat, "st_ino", 0)),
-            )
-            for _rank, path, _scope, stat in discovered
-        )
-        if self._loaded and revision == self._revision:
-            return list(self._skills)
-
+    def _load_snapshot(self, discovered: tuple[tuple[int, Path, str, Any], ...]) -> list[Skill]:
+        """Build one parsed/validated snapshot from a discovery tuple."""
         seen: dict[tuple[str, int], Skill] = {}
         ranked: dict[tuple[str, int], int] = {}
         self.errors = []
@@ -193,6 +194,82 @@ class SkillLoader:
                 )
                 continue
             loaded.append(skill)
+        return loaded
+
+    def _discovery_snapshot(self) -> tuple[tuple[int, Path, str, Any], ...]:
+        return tuple(self._discovered_files())
+
+    @staticmethod
+    def _content_identity(skill: Skill) -> tuple[str, str, tuple[str, ...], str, str]:
+        return (
+            skill.name,
+            skill.description,
+            skill.triggers,
+            skill.body,
+            skill.scope,
+        )
+
+    def refresh(self) -> tuple[list[Skill], list[dict[str, object]]]:
+        """Re-read file-backed skills and report unchanged-version conflicts.
+
+        Refreshing is deliberately an explicit snapshot operation. A caller
+        receives the new parsed skills and can reconcile them into durable
+        lifecycle state; already-compiled task context is not mutated in
+        place. A changed body/description/trigger set with the same declared
+        ``(name, version)`` is reported instead of silently replacing the
+        content of an apparently stable version.
+        """
+        discovered = self._discovery_snapshot()
+        revision = tuple(
+            (
+                str(path),
+                int(stat.st_mtime_ns),
+                int(stat.st_size),
+                int(getattr(stat, "st_ino", 0)),
+            )
+            for _rank, path, _scope, stat in discovered
+        )
+        previous = {(skill.name, skill.version): skill for skill in self._skills}
+        loaded = self._load_snapshot(discovered)
+        current = {(skill.name, skill.version): skill for skill in loaded}
+        conflicts: list[dict[str, object]] = []
+        for key, old_skill in previous.items():
+            new_skill = current.get(key)
+            if new_skill is None or self._content_identity(old_skill) == self._content_identity(
+                new_skill
+            ):
+                continue
+            conflicts.append(
+                {
+                    "name": key[0],
+                    "version": key[1],
+                    "reason": "unchanged_version_content_changed",
+                    "previous_content_hash": _content_hash(old_skill),
+                    "current_content_hash": _content_hash(new_skill),
+                }
+            )
+        self._skills = loaded
+        self._loaded = True
+        self._revision = revision
+        self._generation += 1
+        return list(loaded), conflicts
+
+    async def load(self) -> list[Skill]:
+        """Parse all skills, deduped by (name, version)."""
+        discovered = self._discovery_snapshot()
+        revision = tuple(
+            (
+                str(path),
+                int(stat.st_mtime_ns),
+                int(stat.st_size),
+                int(getattr(stat, "st_ino", 0)),
+            )
+            for _rank, path, _scope, stat in discovered
+        )
+        if self._loaded and revision == self._revision:
+            return list(self._skills)
+
+        loaded = self._load_snapshot(discovered)
         self._skills = loaded
         self._loaded = True
         self._revision = revision

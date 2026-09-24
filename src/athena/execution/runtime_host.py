@@ -132,7 +132,9 @@ class _RuntimeHost:
             try:
                 writer.write((json.dumps({"kind": "error", "error": str(exc)}) + "\n").encode())
                 await writer.drain()
-            except Exception:  # rationale: a disconnected client cannot receive protocol error output
+            except (
+                Exception
+            ):  # rationale: a disconnected client cannot receive protocol error output
                 pass
         finally:
             writer.close()
@@ -228,9 +230,16 @@ class _RuntimeHost:
                 raise PermissionError("working directory cannot be changed for an existing session")
             if wire_request.env and dict(wire_request.env) != dict(record.env):
                 raise PermissionError("environment cannot be changed for an existing session")
-            if wire_request.workspace_root is not None and wire_request.workspace_root != record.workspace_root:
-                raise PermissionError("workspace identity cannot be changed for an existing session")
-            requested_network = getattr(wire_request.network_policy, "value", wire_request.network_policy)
+            if (
+                wire_request.workspace_root is not None
+                and wire_request.workspace_root != record.workspace_root
+            ):
+                raise PermissionError(
+                    "workspace identity cannot be changed for an existing session"
+                )
+            requested_network = getattr(
+                wire_request.network_policy, "value", wire_request.network_policy
+            )
             if requested_network is not None and requested_network != record.network_policy:
                 raise PermissionError("network policy cannot be changed for an existing session")
             requested_limits = (

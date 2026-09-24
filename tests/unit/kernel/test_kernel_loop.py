@@ -292,9 +292,9 @@ async def test_speculative_failure_gets_one_kernel_owned_changed_recovery_attemp
                     "capability_id": "fusion",
                     "arguments": {
                         "operation": "run",
-                        "proposal": [
-                            [{"capability_id": "fs", "arguments": {"path": "wrong.py"}}]
-                        ][0],
+                        "proposal": [[{"capability_id": "fs", "arguments": {"path": "wrong.py"}}]][
+                            0
+                        ],
                     },
                 },
                 "done": False,
@@ -324,7 +324,9 @@ async def test_speculative_failure_gets_one_kernel_owned_changed_recovery_attemp
                                     "failed_operation": [
                                         {"capability_id": "fs", "arguments": {"path": "wrong.py"}}
                                     ],
-                                    "verification_results": [{"passed": False, "name": "known test"}],
+                                    "verification_results": [
+                                        {"passed": False, "name": "known test"}
+                                    ],
                                     "violated_invariants": ["known test"],
                                     "workspace_changes": ["wrong.py"],
                                     "remaining_execution_budget": {"iterations": 47},

@@ -54,6 +54,7 @@ class AuthorityCompositionPorts:
     }
     _APPLICATION_OPERATIONS = {
         "sync_skills": "_sync_skills",
+        "refresh_skill_event": "_refresh_skill_event",
         "rehydrate_approval_grants": "_rehydrate_approval_grants",
         "forward_events": "_forward_events",
         "mutation_observer": "_on_mutation_completed",
@@ -94,7 +95,12 @@ class AuthorityComposer:
             search_paths=tuple(cfg.skills_paths),
             bundled_dir=bundled_skills,
         )
-        skill_lifecycle = SkillLifecycle(db, events=events)
+        skill_lifecycle = SkillLifecycle(
+            db,
+            events=events,
+            tasks=tasks,
+            refresh_event_sink=lambda result: self._ports.refresh_skill_event(result),
+        )
         skills_store = SkillStore(loader=skill_loader, lifecycle=skill_lifecycle)
         skill_discovery_status = "ok"
         try:

@@ -190,10 +190,10 @@ def spawn_owned(
         remove_process_cgroup(cgroup_path)
         cgroup_path = None
     if cgroup_path is not None:
-        setattr(process, "_athena_cgroup_path", cgroup_path)
+        process._athena_cgroup_path = cgroup_path  # type: ignore[attr-defined]
     if os.name != "nt":
         try:
-            setattr(process, "_athena_process_group_id", os.getpgid(process.pid))
+            process._athena_process_group_id = os.getpgid(process.pid)  # type: ignore[attr-defined]
         except ProcessLookupError:
             pass
     return process

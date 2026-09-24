@@ -15,6 +15,8 @@ context output. It does not reason, execute, or apply provider-specific policy.
 - Requirements and evidence predicates must remain neutral and not import kernel authority.
 - Provenance and boundedness are preserved through retrieval and compression.
 - Context compilation must not silently expand capability or model authority.
+- Promoted workflows are bounded, provenance-labeled suggestions; matching workflow descriptions and input schemas may enter ordinary context, but execution still validates required inputs and routes through the workflow capability.
+- Adaptive recovery projections are bounded advisory task context, never authorization or execution.
 
 ## Work Guidance
 

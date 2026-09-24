@@ -62,6 +62,7 @@ __all__ = ["InferenceBroker"]
 
 _logger = logging.getLogger("athena.kernel")
 
+
 @dataclass(frozen=True)
 class _AttemptBudget:
     remaining: dict[str, Any] | None

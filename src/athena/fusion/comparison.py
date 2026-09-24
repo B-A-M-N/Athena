@@ -7,6 +7,8 @@ remains the single entrypoint and never delegates authority to this helper.
 from __future__ import annotations
 
 import dataclasses
+import asyncio
+import time
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -28,6 +30,8 @@ class ComparisonLifecycle:
         proposals: list[list[dict]],
         invariants: list[dict] | None,
         profile: str | None,
+        parallel: bool = False,
+        max_parallel: int = 2,
     ) -> dict[str, Any]:
         orch = self._orchestrator
         if len(proposals) < 2:
@@ -37,24 +41,44 @@ class ComparisonLifecycle:
 
         candidates: list[dict[str, Any]] = []
         comparative_evidence: dict[str, dict] = {}
-        for index, proposal in enumerate(proposals):
+
+        def _run(index: int, proposal: list[dict]):
             if not proposal:
-                candidates.append(
-                    {
-                        "candidate_index": index,
-                        "status": "FAILED",
-                        "verified": False,
-                        "error": "proposal must be non-empty",
-                    }
-                )
-                continue
-            outcome = await orch.run_experiment(
+                return {
+                    "candidate_index": index,
+                    "status": "FAILED",
+                    "verified": False,
+                    "error": "proposal must be non-empty",
+                }
+            return orch.run_experiment(
                 task_id=task_id,
                 proposal=proposal,
                 invariants=invariants,
                 profile=profile,
                 auto_fork_on_failure=False,
             )
+
+        if parallel and len(proposals) > 1:
+            semaphore = asyncio.Semaphore(max(1, min(int(max_parallel), 4)))
+
+            async def _bounded(index: int, proposal: list[dict]):
+                async with semaphore:
+                    return await _run(index, proposal)
+
+            started = time.monotonic()
+            outcomes = await asyncio.gather(
+                *(_bounded(index, proposal) for index, proposal in enumerate(proposals))
+            )
+            elapsed_ms = round((time.monotonic() - started) * 1000, 3)
+        else:
+            outcomes = [await _run(index, proposal) for index, proposal in enumerate(proposals)]
+            elapsed_ms = None
+
+        for index, _proposal in enumerate(proposals):
+            outcome = outcomes[index]
+            if isinstance(outcome, dict):
+                candidates.append(outcome)
+                continue
             record = {"candidate_index": index, **dataclasses.asdict(outcome)}
             branch_id = str(outcome.branch_id or "")
             evidence = {
@@ -117,6 +141,8 @@ class ComparisonLifecycle:
             "comparison_id": comparison.comparison_id,
             "selection": "kernel_decision_required",
             "reality_mutated": False,
+            "parallel": bool(parallel),
+            "elapsed_ms": elapsed_ms,
         }
 
     async def select_candidate(self, comparison_id: str, branch_id: str) -> dict:

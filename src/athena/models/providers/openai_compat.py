@@ -197,6 +197,7 @@ def _response_metadata(
 
 class OpenAICompatProvider(WireRequestBounds):
     """ModelProvider adapter against the OpenAI chat/completions wire format."""
+
     def __init__(
         self,
         *,

@@ -36,3 +36,5 @@ Run synthesis capability tests, generated-discipline tests, Ruff, and
 | `executor.py` | Validated generated-capability invocation, failure classification, and proof/candidate persistence projection; it owns no validation or policy authority. |
 | `runtime.py` | Validated generated capability execution. |
 | `child_runtime.py` | Sandbox child-process lifecycle, framed IPC, and bounded retries. |
+
+- `validation_phases.py` owns explicit static, dependency, sandbox, and evidence phases; `Validator` coordinates those phases and does not become a second admission authority.

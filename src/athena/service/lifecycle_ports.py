@@ -79,6 +79,7 @@ class LifecyclePorts:
             "_validate_required_capabilities",
             "_reconcile_created_intake",
             "_sync_skills",
+            "_refresh_skill_event",
             "_poll_watches",
             "_mark_execution_uncertain",
             "_run_watch_observer",

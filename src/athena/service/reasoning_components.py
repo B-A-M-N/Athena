@@ -83,6 +83,7 @@ async def build_reasoning_components(
         capability_registry=fabric,
         artifact_store=ports.artifacts,
         research_store=ports.research_store,
+        workflow_store=ports.workflow_store,
         context_block_store=ports.context_block_store,
         context_digest_store=ContextDigestStore(db),
         summarizer=ports.make_model_summarizer(model_registry),

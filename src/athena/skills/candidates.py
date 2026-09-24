@@ -457,13 +457,18 @@ def _repeatable_procedure_evidence(
 
 def _evidence_refs(transcript: Sequence[Any]) -> list[str]:
     refs: list[str] = []
-    for item in transcript[:5]:
+    for item in transcript[:32]:
         ref = getattr(item, "id", None)
         if ref is None:
-            ref = getattr(item, "call_id", None)
+            for block in getattr(item, "blocks", ()) or ():
+                if getattr(block, "type", "") != "capability_result":
+                    continue
+                block_ref = getattr(block, "call_id", None)
+                if block_ref:
+                    refs.append(str(block_ref))
         if ref:
             refs.append(str(ref))
-    return refs
+    return list(dict.fromkeys(refs))[:16]
 
 
 __all__ = ["SkillCandidate", "candidates_from_task"]

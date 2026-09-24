@@ -214,6 +214,26 @@ async def test_runtime_recovery_hint_is_visible_in_resumed_context():
     )
 
 
+@pytest.mark.asyncio
+async def test_adaptive_recovery_decision_is_visible_as_advisory_context():
+    context = await ContextCompiler().compile(
+        _task(
+            metadata={
+                "_adaptive_recovery": {
+                    "kind": "implementation_repair",
+                    "action": "synthesis.repair",
+                    "reason": "implementation_failure",
+                    "remaining_attempts": 1,
+                }
+            }
+        )
+    )
+    assert any(
+        "Adaptive recovery decision" in message.text() and "synthesis.repair" in message.text()
+        for message in context.messages
+    )
+
+
 @pytest.mark.athena_claim("BHV-029")
 @pytest.mark.athena_evidence("test")
 async def test_to_request_includes_capabilities_when_registered():
@@ -452,6 +472,36 @@ class _RevisionedResearchStore:
         del query, kwargs
         self.calls += 1
         return []
+
+
+class _WorkflowStore:
+    def __init__(self):
+        from athena.protocol.affordances import AffordanceScope
+        from athena.workflows.models import Workflow, WorkflowStep
+
+        self.workflow = Workflow.create(
+            name="release checks",
+            description="Run the repeatable release procedure.",
+            steps=(WorkflowStep(id="read", capability_id="fs", arguments={}),),
+            scope=AffordanceScope.PROJECT,
+            project_scope="repo",
+            input_schema={"type": "object", "properties": {"path": {"type": "string"}}},
+            lifecycle_state="PROMOTED",
+        )
+
+    async def list(self, **kwargs):
+        del kwargs
+        return [self.workflow]
+
+
+async def test_compiler_offers_relevant_promoted_workflow_without_naming_it():
+    workflow_store = _WorkflowStore()
+    compiler = ContextCompiler(workflow_store=workflow_store)
+    context = await compiler.compile(_task(objective="run the release checks for this repository"))
+    text = "\n".join(message.text() for message in context.messages)
+    assert "promoted workflow suggestion" in text
+    assert workflow_store.workflow.id in text
+    assert "Required inputs schema" in text
 
 
 async def test_compiler_retrieves_scoped_research_as_external_evidence():

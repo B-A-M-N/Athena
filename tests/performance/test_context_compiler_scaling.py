@@ -62,9 +62,7 @@ async def test_incremental_admission_retains_same_hard_context_as_naive_ordering
     hard_items = required + corpus[1:4] + corpus[-2:]
     budget = estimate_tokens("\n\n".join(item.text for item in hard_items)) + 1
 
-    kept, _record, _omitted = await compiler._bound_and_compress(
-        required, corpus, budget
-    )
+    kept, _record, _omitted = await compiler._bound_and_compress(required, corpus, budget)
     hard_names = {item.name for item in required}
     hard_names.update(item.name for item in corpus[1:4])
     hard_names.update(item.name for item in corpus[-2:])

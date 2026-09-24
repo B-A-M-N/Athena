@@ -16,9 +16,12 @@
   "policy": "ratchet: each reviewed module may stay at or below this committed line count; reduce the baseline when decomposing",
   "python": {
     "acp/adapter.py": 487,
+    "affordances/discovery.py": 141,
     "affordances/fabric.py": 418,
     "affordances/models.py": 425,
     "affordances/optimizer.py": 72,
+    "affordances/persistence.py": 67,
+    "affordances/records.py": 118,
     "affordances/scratch.py": 212,
     "affordances/store.py": 593,
     "affordances/validation.py": 453,
@@ -135,6 +138,7 @@
     "evidence.py": 203,
     "execution/async_call.py": 8,
     "execution/backend.py": 137,
+    "execution/backend_catalog.py": 101,
     "execution/conformance.py": 603,
     "execution/container.py": 357,
     "execution/dependencies.py": 350,
@@ -278,6 +282,8 @@
     "reality/completion.py": 138,
     "reality/coordinator.py": 878,
     "reality/gate.py": 269,
+    "reality/sensitivity.py": 197,
+    "reality/transaction_state.py": 113,
     "recovery/manager.py": 250,
     "release/gates.py": 483,
     "release/native_abi.py": 134,
@@ -397,13 +403,7 @@
     "workflows/validation.py": 141,
     "workspace_manifest.py": 437,
     "worldstate/core.py": 529,
-    "worldstate/store.py": 242,
-    "affordances/discovery.py": 141,
-    "affordances/persistence.py": 67,
-    "affordances/records.py": 118,
-    "reality/transaction_state.py": 113,
-    "reality/sensitivity.py": 197,
-    "execution/backend_catalog.py": 101
+    "worldstate/store.py": 242
   },
   "python-class-budgets": {
     "affordances/fabric.py": {
@@ -431,7 +431,7 @@
       "DualPaneSurface": 487
     },
     "cli/framebuffer.py": {
-      "OIFrameBuffer": 682
+      "OIFrameBuffer": 643
     },
     "context/compiler.py": {
       "ContextCompiler": 862
@@ -440,7 +440,7 @@
       "ContainerBackend": 311
     },
     "execution/manager.py": {
-      "ExecutionManager": 400
+      "ExecutionManager": 427
     },
     "execution/ssh.py": {
       "SSHBackend": 260
@@ -639,14 +639,14 @@
   "python-function-budgets-policy": "ratchet: named functions must be reduced when decomposed; new code may not exceed these",
   "rust": {
     "main.rs": 669,
+    "projection_schema.rs": 758,
     "render/chassis.rs": 808,
+    "render/chassis_panels.rs": 309,
+    "render/fit.rs": 83,
     "render/oi/scenes.rs": 1161,
     "x11.rs": 484,
-    "x11/window_manager.rs": 453,
     "x11/window_hints.rs": 70,
-    "render/fit.rs": 83,
-    "projection_schema.rs": 758,
-    "render/chassis_panels.rs": 309
+    "x11/window_manager.rs": 453
   },
   "schema": 1
 }

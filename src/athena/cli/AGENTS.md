@@ -33,3 +33,4 @@ adapters. Shared projection semantics belong to `athena.presentation`.
   projection state, or task semantics.
 - `dual_pane_lifecycle.py` owns terminal open/close and Glass animation
   invalidation through callbacks; it does not own projection or task state.
+- `framebuffer_overlay.py` owns transparent Buddy-layer PNG encoding; `framebuffer.py` retains static scene, motion-layer, and cache ownership.

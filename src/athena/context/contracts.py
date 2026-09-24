@@ -81,6 +81,7 @@ class ContextStaticContext:
     memories: tuple[Any, ...] = ()
     skills: tuple[Any, ...] = ()
     research: tuple[ContextEntry, ...] = ()
+    workflows: tuple[ContextEntry, ...] = ()
     capabilities: tuple[CapabilityDescriptor, ...] = ()
     discovery_state: str = "not_required"
     strategy: StrategyGuidance = field(

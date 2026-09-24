@@ -86,9 +86,7 @@ async def bound_and_compress(
     older: list[ContextEntry] = []
     for index, entry in enumerate(transcript):
         verbatim = (
-            index >= fence
-            or index in cap_protected
-            or entry.category in _PROTECTED_CATEGORIES
+            index >= fence or index in cap_protected or entry.category in _PROTECTED_CATEGORIES
         )
         (protected if verbatim else older).append(entry)
 
@@ -167,9 +165,7 @@ def _merged_provenance(entries: Sequence[ContextEntry]):
     return merge_provenance(provenances)
 
 
-def _entry_group_cache_key(
-    entries: Sequence[ContextEntry], *, task: TaskSpec | None = None
-) -> str:
+def _entry_group_cache_key(entries: Sequence[ContextEntry], *, task: TaskSpec | None = None) -> str:
     metadata = dict(getattr(task, "metadata", {}) or {}) if task is not None else {}
     identity = {
         "entries": [

@@ -15,6 +15,7 @@ import hashlib
 import inspect
 import json
 import logging
+import re
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from athena.context.instructions import (
@@ -76,6 +77,12 @@ def _skill_entry(skill):
     from athena.context.compiler import _skill_entry as fn
 
     return fn(skill)
+
+
+def _workflow_entry(workflow):
+    from athena.context.compiler import _workflow_entry as fn
+
+    return fn(workflow)
 
 
 class ContextRetrieval:
@@ -164,6 +171,41 @@ class ContextRetrieval:
                     session_id=task.session_id,
                 ) from exc
         return []
+
+    async def _load_workflows(self, task: TaskSpec) -> list[_Entry]:
+        """Discover promoted workflows relevant to an ordinary task."""
+        store = self._c._workflow_store
+        if store is None or not task.objective.strip():
+            return []
+        try:
+            workflows = await store.list(
+                task_id=task.id,
+                project_id=task.workspace.id if task.workspace else None,
+                user_id=self._c._principal_id,
+            )
+        except Exception as exc:
+            self._c._record_degradation("workflows", exc)
+            return []
+        terms = {
+            token
+            for token in re.findall(r"[a-zA-Z0-9][a-zA-Z0-9_-]{1,}", task.objective.lower())
+            if len(token) > 2
+        }
+        entries: list[_Entry] = []
+        for workflow in workflows or ():
+            if not getattr(workflow, "enabled", True):
+                continue
+            if getattr(workflow, "lifecycle_state", "ACTIVE") not in {"ACTIVE", "PROMOTED"}:
+                continue
+            haystack = " ".join(
+                (getattr(workflow, "name", ""), getattr(workflow, "description", ""))
+            ).lower()
+            if terms and not any(token in haystack for token in terms):
+                continue
+            entries.append(_workflow_entry(workflow))
+            if len(entries) >= 4:
+                break
+        return entries
 
     async def _load_memories(
         self, task: TaskSpec, *, mode: "MemoryRetrievalMode" | None = None
@@ -595,6 +637,8 @@ class ContextRetrieval:
             out.append(_memory_entry(rec))
         for s in static.skills:
             out.append(_skill_entry(s))
+        for workflow in static.workflows:
+            out.append(_workflow_entry(workflow))
         out.extend(static.research)
         return out
 

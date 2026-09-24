@@ -53,6 +53,11 @@ class SkillsCapability:
 
     def __init__(self, skills_store=None) -> None:
         self.skills_store = skills_store
+        self._events = None
+
+    def bind_events(self, events) -> None:
+        """Bind durable usage evidence without changing lifecycle authority."""
+        self._events = events
 
     async def invoke(
         self, request: CapabilityRequest, *, context=None, **kwargs
@@ -84,11 +89,22 @@ class SkillsCapability:
                 arguments=args.get("arguments") or {},
                 task_id=request.task_id,
             )
+            record = _skill_record(outcome)
+            if self._events is not None:
+                await self._events.append_event(
+                    "SkillApplied",
+                    {
+                        "skill_id": record.get("id", ""),
+                        "version": record.get("version", 1),
+                        "arguments": dict(args.get("arguments") or {}),
+                    },
+                    task_id=request.task_id,
+                )
             return CapabilityResult(
                 call_id,
                 request.capability_id,
                 CapabilityResultStatus.OK,
-                output=json.dumps(_skill_record(outcome), sort_keys=True),
+                output=json.dumps(record, sort_keys=True),
             )
         return _failed(
             request,

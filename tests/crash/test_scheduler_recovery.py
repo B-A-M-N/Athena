@@ -85,7 +85,12 @@ async def test_job_not_fired_before_stop_fires_after_restart(make_durable_servic
     due = _due_iso()
     token = new_id("session")
 
-    svc1 = await make_durable_service(durable_db_path, scripts=None)
+    # The fake provider's default response is intentionally incomplete.  The
+    # occurrence-recovery assertion below is independent of model execution, so
+    # provide a successful terminal response and keep the test focused on
+    # durable schedule claiming and restart behavior.
+    scripts = [{"match": {"user_contains": "SCHED_FIRED_OK"}, "respond": {"text": "scheduled"}}]
+    svc1 = await make_durable_service(durable_db_path, scripts=scripts)
     await svc1._store_schedules.upsert_job(
         job_id,
         "never-fired",
@@ -100,7 +105,7 @@ async def test_job_not_fired_before_stop_fires_after_restart(make_durable_servic
 
     assert await _read_run(durable_db_path, job_id) is None
 
-    svc2 = await make_durable_service(durable_db_path, scripts=None)
+    svc2 = await make_durable_service(durable_db_path, scripts=scripts)
     fired = await svc2._scheduler.tick()
     assert fired == 1
     run = await _read_run(durable_db_path, job_id)

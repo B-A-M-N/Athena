@@ -68,6 +68,9 @@ class KnowledgePipeline:
         transcript = _task_transcript(task, await self._transcript(task))
         successful_calls = _successful_ordinary_calls(transcript)
         selected_skills = await self._selected_skill_versions(task)
+        used_skills = await self._used_skill_versions(task, selected_skills)
+        if selected_skills and not used_skills:
+            selected_skills = ()
         if selected_skills:
             await self._record_skill_outcomes(
                 task,
@@ -75,8 +78,10 @@ class KnowledgePipeline:
                 selected_skills,
                 passed=status == "COMPLETE",
             )
-        if status == "FAILED" and selected_skills and _skill_learning_eligible(
-            task, transcript, successful_calls
+        if (
+            status == "FAILED"
+            and selected_skills
+            and _skill_learning_eligible(task, transcript, successful_calls)
         ):
             # A failed reuse is refinement evidence, not a reason to replace
             # the active skill. The candidate lifecycle validates/preserves
@@ -279,6 +284,33 @@ class KnowledgePipeline:
                     selected.append(ref)
         return tuple(selected)
 
+    async def _used_skill_versions(
+        self, task: Any, selected: tuple[tuple[str, int], ...]
+    ) -> tuple[tuple[str, int], ...]:
+        if not selected or self._events is None:
+            return ()
+        selected_ids = {skill_id for skill_id, _ in selected}
+        try:
+            events = await self._events.list_for_task(getattr(task, "id", ""))
+        except Exception as exc:
+            _logger.warning("skill usage evidence lookup failed: %s", exc)
+            return ()
+        used: set[tuple[str, int]] = set()
+        for event in events:
+            if getattr(event, "type", None) != "SkillApplied":
+                continue
+            payload = getattr(event, "payload", {}) or {}
+            skill_id = str(payload.get("skill_id") or "")
+            if skill_id not in selected_ids:
+                continue
+            try:
+                version = int(payload.get("version") or 0)
+            except (TypeError, ValueError):
+                continue
+            if (skill_id, version) in selected:
+                used.add((skill_id, version))
+        return tuple(item for item in selected if item in used)
+
     async def _record_skill_outcomes(
         self,
         task: Any,
@@ -294,9 +326,7 @@ class KnowledgePipeline:
                 getattr(result, "status", None), "value", getattr(result, "status", "")
             ),
             "summary": str(getattr(result, "summary", "") or "")[:1000],
-            "unresolved": [
-                str(item) for item in (getattr(result, "unresolved", ()) or ())[:8]
-            ],
+            "unresolved": [str(item) for item in (getattr(result, "unresolved", ()) or ())[:8]],
         }
         for skill_id, version in selected:
             try:
@@ -489,9 +519,7 @@ class KnowledgePipeline:
                 drafts = []
                 for target in targets:
                     drafts.extend(
-                        await candidates_from_task(
-                            task, transcript, result, target_skill=target
-                        )
+                        await candidates_from_task(task, transcript, result, target_skill=target)
                     )
             else:
                 drafts = await candidates_from_task(task, transcript, result)

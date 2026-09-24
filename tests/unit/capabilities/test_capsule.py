@@ -216,9 +216,7 @@ async def test_capsule_effects_include_network_for_reachable_network_step(tmp_pa
             "proof": {},
         }
     )
-    capability = ProcedureCapsuleCapability(
-        _Workflows(), _NetworkFabric(), SynthesisEngine()
-    )
+    capability = ProcedureCapsuleCapability(_Workflows(), _NetworkFabric(), SynthesisEngine())
 
     effects = await capability.resolve_operation_effects(
         {"operation": "run", "capsule": capsule},

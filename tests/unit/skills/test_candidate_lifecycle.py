@@ -4,6 +4,8 @@ from athena.protocol.messages import TrustClass
 from athena.skills.lifecycle import SkillLifecycle
 from athena.skills.models import Skill, SkillCandidate
 from athena.state.database import Database
+from athena.state.events import EventStore
+from athena.state.tasks import TaskStore
 
 
 def _candidate() -> SkillCandidate:
@@ -19,7 +21,7 @@ def _candidate() -> SkillCandidate:
         source_task_id="task-source",
         target_skill=None,
         rationale="The task used a repeatable verified procedure.",
-        evidence=("event-1", "receipt-1"),
+        evidence=("event-1",),
         confidence=0.86,
     )
 
@@ -27,18 +29,25 @@ def _candidate() -> SkillCandidate:
 async def test_skill_candidate_survives_restart_and_requires_explicit_promotion(tmp_path):
     db_path = tmp_path / "athena.db"
     first_db = Database(str(db_path))
-    first = SkillLifecycle(first_db)
+    first_events = EventStore(first_db)
+    first_tasks = TaskStore(first_db)
+    first = SkillLifecycle(first_db, events=first_events, tasks=first_tasks)
+    await first_tasks.insert_task("task-source", None, None, "source task")
+    event = await first_events.append_event(
+        "VerificationCompleted", {"status": "passed"}, task_id="task-source"
+    )
     candidate = _candidate()
+    object.__setattr__(candidate, "evidence", (event.id,))
 
     assert await first.promote(candidate, task_id="task-source", authorized=False) is None
     pending = await first.list_candidates()
     assert [row["id"] for row in pending] == [candidate.id]
     assert pending[0]["lifecycle_state"] == "PENDING_REVIEW"
-    assert pending[0]["evidence"] == ["event-1", "receipt-1"]
+    assert pending[0]["evidence"] == [event.id]
     await first_db.close()
 
     second_db = Database(str(db_path))
-    second = SkillLifecycle(second_db)
+    second = SkillLifecycle(second_db, events=EventStore(second_db), tasks=TaskStore(second_db))
     try:
         restored = await second.get_candidate(candidate.id)
         assert restored is not None
@@ -58,10 +67,34 @@ async def test_skill_candidate_survives_restart_and_requires_explicit_promotion(
         await second_db.close()
 
 
+async def test_file_backed_refresh_emits_durable_audit_record(tmp_path):
+    from athena.skills.lifecycle import SkillStore
+    from athena.skills.loader import SkillLoader
+
+    db = Database(str(tmp_path / "refresh.db"))
+    events = []
+
+    async def sink(result):
+        events.append(result)
+
+    lifecycle = SkillLifecycle(db, refresh_event_sink=sink)
+    store = SkillStore(loader=SkillLoader(), lifecycle=lifecycle)
+    result = await store.refresh_file_backed()
+    assert result["status"] == "refreshed"
+    assert events == [result]
+    await db.close()
+
+
 async def test_skill_refinement_target_and_version_survive_restart(tmp_path):
     db_path = tmp_path / "athena.db"
     first_db = Database(str(db_path))
-    first = SkillLifecycle(first_db)
+    first_events = EventStore(first_db)
+    first_tasks = TaskStore(first_db)
+    first = SkillLifecycle(first_db, events=first_events, tasks=first_tasks)
+    await first_tasks.insert_task("task-refine", None, None, "refinement task")
+    event = await first_events.append_event(
+        "VerificationCompleted", {"status": "passed"}, task_id="task-refine"
+    )
     skill_id = await first.install(
         Skill(
             id="",
@@ -84,14 +117,14 @@ async def test_skill_refinement_target_and_version_survive_restart(tmp_path):
         source_task_id="task-refine",
         target_skill=skill_id,
         target_skill_version=current.version,
-        evidence=("receipt-2",),
+        evidence=(event.id,),
         confidence=0.9,
     )
     await first.record_candidate(candidate)
     await first_db.close()
 
     second_db = Database(str(db_path))
-    second = SkillLifecycle(second_db)
+    second = SkillLifecycle(second_db, events=EventStore(second_db), tasks=TaskStore(second_db))
     try:
         restored = await second.get_candidate(candidate.id)
         assert restored is not None
@@ -132,6 +165,51 @@ async def test_skill_refinement_rejects_intervening_target_update(tmp_path):
         assert unchanged is not None
         assert unchanged.body == "intervening"
         assert unchanged.version == current.version + 1
+    finally:
+        await db.close()
+
+
+async def test_skill_scope_widening_requires_multiple_observed_environments(tmp_path):
+    db = Database(str(tmp_path / "widening.db"))
+    events = EventStore(db)
+    tasks = TaskStore(db)
+    lifecycle = SkillLifecycle(db, events=events, tasks=tasks)
+    try:
+        await tasks.insert_task("task-source", None, None, "source")
+        event = await events.append_event(
+            "VerificationCompleted",
+            {"workspace_id": "repo-one", "status": "passed"},
+            task_id="task-source",
+        )
+        await events.append_event(
+            "VerificationCompleted",
+            {"workspace_id": "repo-two", "status": "passed"},
+            task_id="task-source",
+        )
+        skill_id = await lifecycle.install(
+            Skill(id="", name="project-skill", description="Project", body="v1", scope="project")
+        )
+        current = await lifecycle.get(skill_id)
+        assert current is not None
+        candidate = SkillCandidate(
+            draft=Skill(
+                id=skill_id,
+                name="project-skill",
+                description="Project",
+                body="v2",
+                scope="user",
+                version=current.version,
+            ),
+            source_task_id="task-source",
+            target_skill=skill_id,
+            target_skill_version=current.version,
+            evidence=(event.id,),
+            confidence=0.9,
+        )
+        assert await lifecycle.promote(candidate) is None
+        unchanged = await lifecycle.get(skill_id)
+        assert unchanged is not None
+        assert unchanged.scope == "project"
     finally:
         await db.close()
 

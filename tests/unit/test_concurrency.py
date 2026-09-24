@@ -102,7 +102,9 @@ async def test_run_blocking_cancellation_bounds_worker_admission(count: int) -> 
     release.set()
     done, pending = await asyncio.wait(tasks, timeout=5)
     assert not pending, "cancelled waiters and released workers must drain promptly"
-    results = [task.exception() if not task.cancelled() else asyncio.CancelledError() for task in done]
+    results = [
+        task.exception() if not task.cancelled() else asyncio.CancelledError() for task in done
+    ]
     assert all(isinstance(result, (asyncio.CancelledError, type(None))) for result in results)
 
 
@@ -125,9 +127,7 @@ async def test_run_blocking_keeps_long_waiters_from_exhausting_short_capacity() 
             with state_lock:
                 active -= 1
 
-    long_tasks = [
-        asyncio.create_task(run_blocking(long_blocked, _pool="long")) for _ in range(10)
-    ]
+    long_tasks = [asyncio.create_task(run_blocking(long_blocked, _pool="long")) for _ in range(10)]
     for _ in range(1000):
         if started.is_set():
             break
