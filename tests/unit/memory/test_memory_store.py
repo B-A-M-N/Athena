@@ -424,3 +424,55 @@ async def test_promoted_candidate_preserves_canonical_metadata_and_scope_retriev
     metadata = json.loads(raw["metadata"])
     assert metadata["_athena:scope_id"] == "principal-1"
     assert metadata["_athena:provenance"]["source_id"] == "task-1"
+
+
+async def test_trusted_relevant_memory_survives_restart_and_rejects_false_prior(tmp_path):
+    """Qualify relevant retrieval and conflict rejection across a real restart."""
+    db_path = tmp_path / "memory-qualification.db"
+    first_db = Database(str(db_path))
+    first_store = MemoryStore(first_db)
+    trusted = MemoryRecord(
+        id="mem-trusted-policy",
+        kind=MemoryKind.SEMANTIC,
+        scope=MemoryScope.PROJECT,
+        content="The project release policy requires signed artifacts.",
+        summary="release policy",
+        subject="release policy",
+        trust=TrustClass.AUTHORITY,
+        metadata={"scope_id": "project-memory-qualification"},
+    )
+    false_prior = MemoryRecord(
+        id="mem-false-policy",
+        kind=MemoryKind.SEMANTIC,
+        scope=MemoryScope.PROJECT,
+        content="The project release policy allows unsigned artifacts.",
+        summary="release policy",
+        subject="release policy",
+        trust=TrustClass.UNTRUSTED,
+        metadata={"scope_id": "project-memory-qualification"},
+    )
+
+    saved = await first_store.save_with_outcome(trusted)
+    assert saved.status == "CREATED"
+    rejected = await first_store.save_with_outcome(false_prior)
+    assert rejected.status == "REJECTED"
+    assert rejected.reason
+    assert await first_store.get("mem-false-policy") is None
+    found = await first_store.search(
+        "release policy signed artifacts",
+        scope=MemoryScope.PROJECT,
+        limit=5,
+    )
+    assert [item.id for item in found] == ["mem-trusted-policy"]
+    await first_db.close()
+
+    second_db = Database(str(db_path))
+    second_store = MemoryStore(second_db)
+    restored = await second_store.search(
+        "release policy signed artifacts",
+        scope=MemoryScope.PROJECT,
+        limit=5,
+    )
+    assert [item.id for item in restored] == ["mem-trusted-policy"]
+    assert (await second_store.get("mem-false-policy")) is None
+    await second_db.close()
