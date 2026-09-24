@@ -335,6 +335,7 @@ class SkillLifecycle:
         failure: Mapping[str, Any] | None = None,
         task_class: str = "unknown",
         environment_fingerprint: str = "",
+        materially_contributed: bool | None = None,
     ) -> dict[str, Any]:
         """Record a terminal outcome for one exact skill revision.
 
@@ -394,8 +395,8 @@ class SkillLifecycle:
             "INSERT INTO skill_evidence("
             "id, skill_id, version, task_id, task_class, "
             "environment_fingerprint, evidence_kind, outcome, passed, "
-            "cancelled, verified, payload, created_at) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "cancelled, verified, materially_contributed, payload, created_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 new_id("skill_evidence"),
                 skill_id,
@@ -408,6 +409,7 @@ class SkillLifecycle:
                 None if cancelled else passed,
                 cancelled,
                 verified,
+                materially_contributed,
                 json.dumps({"failure": dict(failure or {})}, sort_keys=True),
                 utcnow().isoformat(),
             ),
@@ -432,6 +434,7 @@ class SkillLifecycle:
             "passed": None if cancelled else passed,
             "cancelled": cancelled,
             "verified": verified,
+            "materially_contributed": materially_contributed,
             "refinement_required": evidence["refinement_required"],
             "reliability": evidence["reliability"],
         }

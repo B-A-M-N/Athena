@@ -80,7 +80,7 @@ class SkillSelector:
         evidence so later reuse can distinguish selection from application.
         """
         context = task_context or {}
-        if limit <= 0 or not task_objective:
+        if not task_objective:
             return (), []
         objective_tokens = set(self._tokens(task_objective))
         task_class = classify_task_class(task_objective)
@@ -92,9 +92,9 @@ class SkillSelector:
             if not applicable:
                 continue
             score = self._score(skill, objective_tokens)
-            if score < self.min_score:
-                continue
-            scored.append((score, skill))
+            eligible = score >= self.min_score
+            if eligible:
+                scored.append((score, skill))
             records.append(
                 SkillSelectionRecord(
                     skill_id=skill.id,
@@ -104,7 +104,11 @@ class SkillSelector:
                     score=score,
                     applicable=True,
                     selected=False,
-                    reason="deterministic applicability plus relevance score",
+                    reason=(
+                        "deterministic applicability plus relevance score"
+                        if eligible
+                        else "applicable but below selection threshold"
+                    ),
                     evidence=self._evidence(skill, objective_tokens, score),
                 )
             )

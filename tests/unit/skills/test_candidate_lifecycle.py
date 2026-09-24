@@ -280,11 +280,13 @@ async def test_skill_evidence_records_opportunity_application_and_cancellation(t
             failure={"status": "CANCELLED"},
             task_class="debugging",
             environment_fingerprint="env_test",
+            materially_contributed=None,
         )
         assert outcome["cancelled"] is True
         assert outcome["passed"] is None
         rows = await db.fetch_all(
-            "SELECT evidence_kind, outcome, task_class, environment_fingerprint, cancelled "
+            "SELECT evidence_kind, outcome, task_class, environment_fingerprint, cancelled, "
+            "materially_contributed "
             "FROM skill_evidence WHERE task_id = ? ORDER BY created_at, id",
             ("task-evidence",),
         )
@@ -292,5 +294,6 @@ async def test_skill_evidence_records_opportunity_application_and_cancellation(t
         assert rows[0]["task_class"] == "debugging"
         assert rows[0]["environment_fingerprint"] == "env_test"
         assert rows[1]["cancelled"] == 1
+        assert rows[1]["materially_contributed"] is None
     finally:
         await db.close()

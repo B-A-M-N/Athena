@@ -131,3 +131,16 @@ async def test_observed_failures_demote_a_plausible_skill():
     assert [item.id for item in selected] == ["neutral"]
     assert records[0].evidence
     assert "failed_reuses:4" in records[0].evidence
+
+
+async def test_applicable_but_unselected_skill_remains_opportunity_evidence():
+    skill = _skill("release", "Release artifact", ["release"])
+    records, selected = await SkillSelector().select_with_evidence(
+        task_objective="release artifact",
+        available=[skill],
+        limit=0,
+        task_context={"project_id": "repo"},
+    )
+    assert selected == []
+    assert records[0].applicable is True
+    assert records[0].selected is False
