@@ -81,6 +81,43 @@ _MAX_DIGEST_FIELD_TEXT = 600
 
 
 @dataclass(frozen=True)
+class StrategySelectionRecord:
+    """Evidence for the kernel's advisory strategy choice.
+
+    The record compares speculative and sequential routes against the same
+    bounded task evidence. It is a measurement record, not authority to run
+    either route or promote a candidate.
+    """
+
+    selected_route: str
+    selected_by: str
+    uncertainty: str
+    viable_alternatives: tuple[str, ...]
+    estimated_validation_cost: float
+    available_budget: Mapping[str, Any]
+    rollback_feasible: bool
+    critical_path_effect: str
+    workspace_baseline: Mapping[str, Any]
+    acceptance_criteria: tuple[str, ...]
+    evidence: tuple[str, ...] = ()
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "selected_route": self.selected_route,
+            "selected_by": self.selected_by,
+            "uncertainty": self.uncertainty,
+            "viable_alternatives": list(self.viable_alternatives),
+            "estimated_validation_cost": round(float(self.estimated_validation_cost), 6),
+            "available_budget": dict(self.available_budget),
+            "rollback_feasible": self.rollback_feasible,
+            "critical_path_effect": self.critical_path_effect,
+            "workspace_baseline": dict(self.workspace_baseline),
+            "acceptance_criteria": list(self.acceptance_criteria),
+            "evidence": list(self.evidence),
+        }
+
+
+@dataclass(frozen=True)
 class ContextDigest:
     """Bounded, durable context state shared by compilers and repositories."""
 
@@ -230,6 +267,7 @@ def provenance_from_mapping(data: Mapping[str, Any]) -> Provenance:
 __all__ = [
     "ContextBlock",
     "ContextDigest",
+    "StrategySelectionRecord",
     "ContextDigestStore",
     "provenance_from_mapping",
     "row_to_digest",

@@ -219,3 +219,25 @@ def test_continuations_inherit_evidence_obligation():
     ):
         guidance = select_strategy(prompt, ("fs", "git", "execute"))
         assert guidance.completion_mode == "observable_work_required", prompt
+
+
+def test_strategy_selection_record_is_tied_to_baseline_and_acceptance():
+    from athena.protocol.tasks import Criterion, TaskSpec, WorkspaceSpec
+    from athena.strategy import build_strategy_selection_record
+
+    guidance = select_strategy("run a shadow experiment", ("fusion", "execute"))
+    task = TaskSpec(
+        id="task-strategy-record",
+        objective="run a shadow experiment",
+        workspace=WorkspaceSpec(id="repo", root="/tmp/repo", revision="rev-1"),
+        acceptance_criteria=(Criterion(id="proof", description="candidate passes"),),
+    )
+    record = build_strategy_selection_record(guidance, task=task)
+    payload = record.to_record()
+    assert payload["selected_route"] == guidance.route
+    assert payload["selected_by"] == "deterministic_advisory_strategy"
+    assert payload["viable_alternatives"]
+    assert payload["workspace_baseline"]["workspace_id"] == "repo"
+    assert payload["workspace_baseline"]["workspace_revision"] == "rev-1"
+    assert payload["acceptance_criteria"] == ["proof:True"]
+    assert "work_requirement:" in " ".join(payload["evidence"])

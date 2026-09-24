@@ -79,10 +79,13 @@ class SkillSelector:
         below the limit.  The context compiler persists these decisions as
         evidence so later reuse can distinguish selection from application.
         """
-        context = task_context or {}
+        context = dict(task_context or {})
+        context.setdefault("objective", task_objective)
         if not task_objective:
             return (), []
         objective_tokens = set(self._tokens(task_objective))
+        objective_intents = classify_intents(task_objective)
+        benchmark_only = context.get("_skill_benchmark") is True
         task_class = classify_task_class(task_objective)
         environment = environment_fingerprint(context)
         scored: list[tuple[float, Skill]] = []
@@ -91,7 +94,7 @@ class SkillSelector:
             applicable = self._applicable(skill, context)
             if not applicable:
                 continue
-            score = self._score(skill, objective_tokens)
+            score = self._score(skill, objective_tokens, objective_intents)
             eligible = score >= self.min_score
             if eligible:
                 scored.append((score, skill))
@@ -109,11 +112,22 @@ class SkillSelector:
                         if eligible
                         else "applicable but below selection threshold"
                     ),
-                    evidence=self._evidence(skill, objective_tokens, score),
+                    evidence=self._evidence(skill, objective_tokens, objective_intents, score),
                 )
             )
         scored.sort(key=lambda t: t[0], reverse=True)
-        selected_skills = [skill for _score, skill in scored[:limit]]
+        if benchmark_only:
+            relevant_threshold = float(context.get("benchmark_relevance_threshold") or 0.0)
+            selected_skills = [skill for score, skill in scored if score >= relevant_threshold][
+                :limit
+            ]
+            selected_skills = [
+                skill
+                for skill in selected_skills
+                if not (set(self._incompatible_intents(skill)) & objective_intents)
+            ]
+        else:
+            selected_skills = [skill for _score, skill in scored[:limit]]
         selected_ids = {(skill.id, int(skill.version or 1)) for skill in selected_skills}
         records = [
             record.__class__(
@@ -126,7 +140,13 @@ class SkillSelector:
         ]
         return tuple(records), selected_skills
 
-    def _evidence(self, skill: Skill, objective_tokens: set[str], score: float) -> tuple[str, ...]:
+    def _evidence(
+        self,
+        skill: Skill,
+        objective_tokens: set[str],
+        objective_intents: frozenset[str],
+        score: float,
+    ) -> tuple[str, ...]:
         trigger_hits = tuple(
             trigger
             for trigger in skill.triggers
@@ -138,10 +158,14 @@ class SkillSelector:
             evidence.append(f"verified_reuses:{int(metadata['verified_reuses'])}")
         if metadata.get("failed_reuses"):
             evidence.append(f"failed_reuses:{int(metadata['failed_reuses'])}")
+        intent_matches = self._intent_matches(skill, objective_intents)
+        evidence.extend(f"intent_matches:{intent}" for intent in sorted(intent_matches))
         evidence.append(f"score:{score:.6f}")
         return tuple(evidence)
 
-    def _score(self, skill: Skill, objective_tokens: set[str]) -> float:
+    def _score(
+        self, skill: Skill, objective_tokens: set[str], objective_intents: frozenset[str]
+    ) -> float:
         score = 0.0
         skill_tokens = set(self._tokens(skill.description))
         for trigger in skill.triggers:
@@ -155,7 +179,42 @@ class SkillSelector:
         # must reduce preference, otherwise a plausible but repeatedly harmful
         # skill remains selected forever.
         score -= min(float(evidence.get("failed_reuses") or 0), 4.0) * 0.75
+        score += 2.0 if self._intent_matches(skill, objective_intents) else 0.0
         return score
+
+    @classmethod
+    def _applicability(cls, skill: Skill) -> Mapping[str, Any]:
+        meta = cls._athena_metadata(skill)
+        applicability = meta.get("applicability")
+        return applicability if isinstance(applicability, Mapping) else {}
+
+    @classmethod
+    def _declared_intents(cls, skill: Skill) -> frozenset[str]:
+        applicability = cls._applicability(skill)
+        values = applicability.get("supported_intents") or cls._athena_metadata(skill).get(
+            "supported_intents"
+        )
+        return frozenset(str(value).casefold() for value in (values or ()))
+
+    @classmethod
+    def _incompatible_intents(cls, skill: Skill) -> frozenset[str]:
+        applicability = cls._applicability(skill)
+        values = applicability.get("incompatible_intents") or cls._athena_metadata(skill).get(
+            "incompatible_intents"
+        )
+        return frozenset(str(value).casefold() for value in (values or ()))
+
+    @classmethod
+    def _effective_intents(cls, skill: Skill) -> frozenset[str]:
+        declared = cls._declared_intents(skill)
+        if declared:
+            return declared
+        text = " ".join((skill.name, skill.description, *skill.triggers))
+        return classify_intents(text)
+
+    @classmethod
+    def _intent_matches(cls, skill: Skill, objective_intents: frozenset[str]) -> frozenset[str]:
+        return cls._effective_intents(skill) & objective_intents
 
     @staticmethod
     def _athena_metadata(skill: Skill) -> Mapping[str, Any]:
@@ -181,9 +240,19 @@ class SkillSelector:
             return False
         if owner and not principal:
             return False
-        applicability = meta.get("applicability")
-        if not isinstance(applicability, Mapping):
-            applicability = {}
+        applicability = cls._applicability(skill)
+        objective_intents = classify_intents(str(context.get("objective") or ""))
+        if objective_intents & cls._incompatible_intents(skill):
+            return False
+        supported_intents = cls._declared_intents(skill)
+        if objective_intents and supported_intents and not (objective_intents & supported_intents):
+            return False
+        if (
+            cls._incompatible_intents(skill)
+            and objective_intents
+            and cls._incompatible_intents(skill) & objective_intents
+        ):
+            return False
         required = applicability.get("required_capabilities") or meta.get("required_capabilities")
         available = set(str(value) for value in (context.get("available_capabilities") or ()))
         if required and not set(str(value) for value in required).issubset(available):
@@ -214,7 +283,11 @@ class SkillSelector:
         objective_terms = set(cls._tokens(str(context.get("objective") or "")))
         if failure_terms & objective_terms:
             return False
-        return True
+        return not (
+            set(cls._incompatible_intents(skill)) & objective_intents
+            or context.get("incompatible_intents")
+            and set(context.get("incompatible_intents") or ()) & objective_intents
+        )
 
     @staticmethod
     def _trigger_score(trigger: str, objective_tokens: set[str]) -> float:
@@ -230,6 +303,62 @@ class SkillSelector:
     @staticmethod
     def _tokens(text: str) -> list[str]:
         return [w.lower() for w in _TOKEN_RE.findall(text or "") if w.lower() not in _SKIPWORDS]
+
+
+_INTENT_MARKERS = (
+    (
+        "deployment",
+        frozenset(
+            {
+                "deploy",
+                "deployment",
+                "deploying",
+                "rollout",
+                "ship",
+                "cluster",
+                "kubernetes",
+                "service",
+            }
+        ),
+    ),
+    (
+        "release",
+        frozenset({"release", "publish", "artifact", "package", "version", "build", "ship"}),
+    ),
+    (
+        "debugging",
+        frozenset({"debug", "bug", "fix", "repair", "error", "failing", "test", "broken"}),
+    ),
+    (
+        "research",
+        frozenset({"research", "investigate", "source", "evidence", "compare", "comparison"}),
+    ),
+    (
+        "database",
+        frozenset(
+            {
+                "database",
+                "postgres",
+                "relational",
+                "store",
+                "schema",
+                "table",
+                "migration",
+                "upgrade",
+            }
+        ),
+    ),
+    (
+        "maintenance",
+        frozenset({"refactor", "maintain", "migrate", "cleanup", "document", "documentation"}),
+    ),
+)
+
+
+def classify_intents(objective: str) -> frozenset[str]:
+    """Classify a task into bounded intent labels without a model call."""
+    tokens = set(SkillSelector._tokens(objective))
+    return frozenset(intent for intent, markers in _INTENT_MARKERS if tokens.intersection(markers))
 
 
 _TASK_CLASS_MARKERS = (
@@ -269,4 +398,9 @@ def environment_fingerprint(context: Mapping[str, Any]) -> str:
     return f"env_{digest}"
 
 
-__all__ = ["SkillSelector", "classify_task_class", "environment_fingerprint"]
+__all__ = [
+    "SkillSelector",
+    "classify_intents",
+    "classify_task_class",
+    "environment_fingerprint",
+]

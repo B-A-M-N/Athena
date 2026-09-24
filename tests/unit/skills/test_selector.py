@@ -144,3 +144,49 @@ async def test_applicable_but_unselected_skill_remains_opportunity_evidence():
     assert selected == []
     assert records[0].applicable is True
     assert records[0].selected is False
+
+
+async def test_selector_recognizes_intent_paraphrases_without_keyword_match():
+    skill = _skill(
+        "deployment",
+        "Apply the service rollout procedure",
+        ["rollout"],
+        metadata={
+            "athena": {
+                "applicability": {
+                    "supported_intents": ["deployment"],
+                }
+            }
+        },
+    )
+    records, selected = await SkillSelector().select_with_evidence(
+        task_objective="ship the application to the cluster",
+        available=[skill],
+        limit=1,
+        task_context={"project_id": "repo"},
+    )
+    assert [item.id for item in selected] == ["deployment"]
+    assert "intent_matches:deployment" in records[0].evidence
+
+
+async def test_selector_rejects_incompatible_intent_even_when_words_overlap():
+    skill = _skill(
+        "production-deploy",
+        "Deploy the production service",
+        ["deploy", "production"],
+        metadata={
+            "athena": {
+                "applicability": {
+                    "incompatible_intents": ["debugging"],
+                }
+            }
+        },
+    )
+    records, selected = await SkillSelector().select_with_evidence(
+        task_objective="fix the broken service",
+        available=[skill],
+        limit=1,
+        task_context={"project_id": "repo"},
+    )
+    assert selected == []
+    assert records == ()

@@ -13,3 +13,7 @@ This package provides neutral comparison corpora, fixed cases, and deterministic
 ## Verification
 
 - Run evaluation harness tests plus `./scripts/architecture-lint --quiet`.
+
+### Skill Selection Evaluation
+
+- `skill_selection.py` owns held-out paraphrase/adversarial fixtures and outcome comparison; it does not activate skills or alter selection policy.

@@ -90,6 +90,7 @@ class ContextStaticContext:
     memories: tuple[Any, ...] = ()
     skills: tuple[Any, ...] = ()
     skill_selection_records: tuple[Any, ...] = ()
+    strategy_selection_record: Any | None = None
     research: tuple[ContextEntry, ...] = ()
     workflows: tuple[ContextEntry, ...] = ()
     capabilities: tuple[CapabilityDescriptor, ...] = ()

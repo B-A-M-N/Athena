@@ -88,7 +88,18 @@ class ContextSupport:
 
     async def _emit_context_evidence(self, task: Any, compiled: Any) -> None:
         strategy = compiled.strategy
-        await self._emit("StrategySelected", strategy.to_dict(), task)
+        await self._emit(
+            "StrategySelected",
+            {
+                **strategy.to_dict(),
+                "selection_record": (
+                    compiled.strategy_selection_record.to_record()
+                    if compiled.strategy_selection_record is not None
+                    else None
+                ),
+            },
+            task,
+        )
         if compiled.degradations:
             await self._emit(
                 "DiagnosticsProduced",

@@ -38,7 +38,7 @@ from athena.context.contracts import (
     MemoryRetrievalMode,
     SkillRetrieval,
 )
-from athena.protocol.context import ContextDigestStore
+from athena.protocol.context import ContextDigestStore, StrategySelectionRecord
 from athena.context.digest_builder import ContextDigestBuilder
 from athena.context.instructions import (
     INSTRUCTION_ORDER,
@@ -126,6 +126,7 @@ class CompiledContext:
             route="respond", rationale="No external action or evidence acquisition is required."
         )
     )
+    strategy_selection_record: StrategySelectionRecord | None = None
     # Optional-context sources that raised during this compile (P1-6).
     # Empty means every consulted store answered — not that data exists.
     degradations: tuple[ContextDegradation, ...] = ()
@@ -509,6 +510,7 @@ class ContextCompiler:
             capability_definitions=capabilities,
             cache_prefix_messages=messages[:stable_count],
             strategy=static.strategy,
+            strategy_selection_record=static.strategy_selection_record,
             degradations=self._drain_degradations(),
             selected_skill_versions=tuple(
                 (str(getattr(skill, "id", "")), int(getattr(skill, "version", 1) or 1))
@@ -674,6 +676,15 @@ class ContextCompiler:
             ),
         )
         capabilities, strategy_evidence, discovery_state = capability_result
+        guidance = select_strategy(
+            task.objective,
+            strategy_evidence,
+            discovery_state=discovery_state,
+            require_tools=require_tools,
+        )
+        from athena.strategy import build_strategy_selection_record
+
+        strategy_record = build_strategy_selection_record(guidance, task=task)
         static = _StaticContext(
             context_blocks=tuple(blocks),
             memories=tuple(memories),
@@ -683,12 +694,8 @@ class ContextCompiler:
             workflows=tuple(workflows),
             capabilities=tuple(capabilities),
             discovery_state=discovery_state,
-            strategy=select_strategy(
-                task.objective,
-                strategy_evidence,
-                discovery_state=discovery_state,
-                require_tools=require_tools,
-            ),
+            strategy=guidance,
+            strategy_selection_record=strategy_record,
         )
         if key is not None:
             self._static_cache[key] = static

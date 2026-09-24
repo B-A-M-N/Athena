@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from collections.abc import Iterable, Mapping
+import hashlib
+import json
 import re
 from typing import Any
+
+from athena.protocol.context import StrategySelectionRecord
 
 RESPONSE_ONLY = "response_only"
 OBSERVABLE_WORK_REQUIRED = "observable_work_required"
@@ -1046,6 +1050,71 @@ def select_strategy(
         work_requirement=work_requirement,
     )
     return guidance
+
+
+def build_strategy_selection_record(
+    guidance: StrategyGuidance,
+    *,
+    task: Any,
+    cost_per_validation: float = 0.25,
+) -> StrategySelectionRecord:
+    """Describe the advisory route choice against the current task boundary.
+
+    This function records evidence only. ``select_strategy`` remains the
+    deterministic advisory selector, AgentKernel remains the action authority,
+    and a Fusion experiment still requires its own candidate verification and
+    RealityCoordinator promotion.
+    """
+    workspace = getattr(task, "workspace", None)
+    baseline = {
+        "workspace_id": str(getattr(workspace, "id", "") or ""),
+        "workspace_revision": str(getattr(workspace, "revision", "") or ""),
+    }
+    budget = getattr(task, "resource_budget", None)
+    budget_record: dict[str, Any] = {}
+    if budget is not None:
+        to_record = getattr(budget, "to_record", None)
+        budget_record = dict(to_record() if callable(to_record) else vars(budget))
+        budget_record = {key: str(value) for key, value in budget_record.items()}
+    criteria = tuple(
+        f"{criterion.id}:{criterion.required}"
+        for criterion in (getattr(task, "acceptance_criteria", ()) or ())
+    )
+    complexity = guidance.work_requirement in {SPECULATIVE_CHANGE, "complex_coding"}
+    mutation = guidance.work_requirement in {PERSISTENT_MUTATION, SPECULATIVE_CHANGE}
+    uncertainty = "high" if complexity else "medium" if mutation else "low"
+    alternatives = ("sequential", "speculative") if mutation else ("sequential",)
+    validation_cost = 1.0 if mutation else 0.0
+    rollback = bool(mutation and workspace is not None)
+    critical_path = "isolated_validation_before_critical_path" if mutation else "none"
+    digest_payload = {
+        "task_id": str(getattr(task, "id", "") or ""),
+        "workspace_baseline": baseline,
+        "acceptance_criteria": criteria,
+        "selected_route": guidance.route,
+        "work_requirement": guidance.work_requirement,
+    }
+    baseline_id = hashlib.sha256(
+        json.dumps(digest_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:24]
+    return StrategySelectionRecord(
+        selected_route=guidance.route,
+        selected_by="deterministic_advisory_strategy",
+        uncertainty=uncertainty,
+        viable_alternatives=alternatives,
+        estimated_validation_cost=validation_cost * max(0.0, float(cost_per_validation)),
+        available_budget=budget_record,
+        rollback_feasible=rollback,
+        critical_path_effect=critical_path,
+        workspace_baseline={**baseline, "baseline_id": baseline_id},
+        acceptance_criteria=criteria,
+        evidence=(
+            f"work_requirement:{guidance.work_requirement}",
+            f"route:{guidance.route}",
+            f"acceptance_count:{len(criteria)}",
+            f"rollback_feasible:{rollback}",
+        ),
+    )
 
 
 def _work_requirement(objective: str, intent: TurnIntent, missing_affordance: str | None) -> str:

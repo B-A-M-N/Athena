@@ -1282,4 +1282,8 @@ async def test_to_skill_candidate_requires_diverse_repeated_success():
     candidate = engine.to_skill_candidate(cap.id)
     assert candidate is not None
     assert candidate.draft.name == "greeter"
-    assert len(candidate.evidence) == 2
+    assert len(candidate.evidence) >= 2
+    assert any("capability_id:" in item for item in candidate.evidence)
+    generated = candidate.draft.metadata["athena"]["generated_capability"]
+    assert generated["capability_id"] == cap.id
+    assert generated["revision"] == cap.revision

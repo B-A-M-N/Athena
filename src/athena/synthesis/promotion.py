@@ -326,12 +326,40 @@ class Promotion:
         from athena.skills.candidates import SkillCandidate
         from athena.skills.models import Skill
 
+        provenance = dict(cap.provenance or {})
+        provenance.update(
+            {
+                "capability_id": cap.id,
+                "capability_revision": cap.revision,
+                "capability_family": cap.family_id,
+                "branch_id": provenance.get("branch_id"),
+                "workspace_fingerprint": provenance.get("workspace_fingerprint"),
+                "task_id": cap.task_id,
+            }
+        )
         skill = Skill(
             id=new_id("skill"),
             name=cap.name,
             description=cap.description,
             body=f"```python\n{cap.code}\n```",
             version=1,
+            metadata={
+                "provenance": "generated_capability",
+                "athena": {
+                    "generated_capability": {
+                        "capability_id": cap.id,
+                        "revision": cap.revision,
+                        "family_id": cap.family_id,
+                        "branch_id": provenance.get("branch_id"),
+                        "workspace_fingerprint": provenance.get("workspace_fingerprint"),
+                    },
+                    "evidence": {
+                        "proposal_confidence": min(0.4 + 0.2 * cap.successes, 0.95),
+                        "semantic_status": "candidate_proposal",
+                    },
+                    "provenance": provenance,
+                },
+            },
         )
         return SkillCandidate(
             draft=skill,
@@ -344,6 +372,10 @@ class Promotion:
                     f"{cap.validation.get('cases_total')} sandbox cases"
                 ),
                 f"{cap.successes}/{cap.uses} live invocations succeeded",
+                f"capability_id:{cap.id}",
+                f"capability_revision:{cap.revision}",
+                f"branch_id:{provenance.get('branch_id') or 'none'}",
+                f"workspace_fingerprint:{provenance.get('workspace_fingerprint') or 'none'}",
             ),
             confidence=min(0.4 + 0.2 * cap.successes, 0.95),
         )

@@ -14,6 +14,7 @@ This package coordinates speculative branches, claims, checkpoints, forks, and p
 - `synthesize_from_branch()` requires an exact verified branch/workspace identity for branch-bound callers, validates against that workspace, and persists branch/workspace/environment provenance; task-local synthesis remains on the canonical dispatcher path.
 - The composed acceptance seam covers real Fusion execution followed by RealityCoordinator verification and commit; controlled Fusion-result fixtures are not sufficient evidence for that release gate.
 - Parallel comparison is opt-in and bounded to four concurrent isolated candidates; selection, stale-base checks, and reality promotion remain serialized.
+- Branch-bound generated capability and skill-candidate records retain capability revision, branch, workspace fingerprint, and task identity; they are never silently reattached to another candidate.
 
 ## Verification
 

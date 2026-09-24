@@ -100,12 +100,24 @@ class BranchSynthesisMechanism:
         surface = self._fabric or registry
         admitted = engine.register_ephemeral(surface, cap)
         candidate = engine.to_skill_candidate(cap.id) if cap.validation.get("all_passed") else None
+        candidate_record = None
+        if candidate is not None:
+            candidate_record = {
+                "candidate_id": candidate.id,
+                "source_task_id": candidate.source_task_id,
+                "capability_id": cap.id,
+                "capability_revision": cap.revision,
+                "branch_id": branch.id if branch is not None else None,
+                "workspace_fingerprint": workspace_fingerprint,
+                "skill_version": candidate.draft.version,
+            }
         return {
             "capability_id": cap.id,
             "admitted": admitted,
             "validation": cap.validation,
             "proof": engine.proof_for(cap.id),
             "skill_candidate_proposed": candidate is not None,
+            "skill_candidate_identity": candidate_record,
             "branch_id": branch.id if branch is not None else None,
             "workspace_fingerprint": workspace_fingerprint,
             "verification_environment": environment_record,

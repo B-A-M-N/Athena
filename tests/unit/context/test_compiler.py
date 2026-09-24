@@ -531,3 +531,17 @@ async def test_compiler_reuses_revisioned_static_context_until_store_changes():
     research.generation += 1
     await compiler.compile(task)
     assert research.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_compile_exposes_strategy_selection_record_for_kernel_evidence():
+    task = _task(
+        objective="run a shadow experiment", workspace=WorkspaceSpec(id="repo", root="/tmp/repo")
+    )
+    context = await ContextCompiler().compile(task)
+    record = context.strategy_selection_record
+    assert record is not None
+    payload = record.to_record()
+    assert payload["selected_by"] == "deterministic_advisory_strategy"
+    assert payload["workspace_baseline"]["workspace_id"] == "repo"
+    assert "sequential" in payload["viable_alternatives"]

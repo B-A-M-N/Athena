@@ -15,6 +15,7 @@ This package owns durable skill content, selection, validation, candidate review
 - Triggering emits exact `SkillApplied` ID/version evidence; context selection alone is availability, not successful use or failure.
 - Selection evidence is typed and records task class, environment fingerprint, applicability, and exact revision; outcome evidence separately records application, verification, failure, and cancellation. Proposal confidence is never empirical reliability.
 - Observed failures reduce deterministic selection preference; only lifecycle promotion can change an active skill revision or scope.
+- Relevance uses a bounded deterministic intent stage (`supported_intents` and `incompatible_intents`) before lexical ranking; no embedding or model reranker is admitted without measured need.
 
 ## Verification
 
