@@ -88,10 +88,43 @@ class SkillCandidate:
 
 
 @dataclass(frozen=True)
+class SkillSelectionRecord:
+    """One deterministic skill selection decision and its evidence.
+
+    This is selection evidence, not a claim that the skill caused the task
+    outcome.  The task class and environment fingerprint make reuse evidence
+    comparable across held-out tasks without storing task content.
+    """
+
+    skill_id: str
+    version: int
+    task_class: str
+    environment_fingerprint: str
+    score: float
+    applicable: bool
+    selected: bool
+    reason: str
+    evidence: tuple[str, ...] = ()
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "skill_id": self.skill_id,
+            "version": self.version,
+            "task_class": self.task_class,
+            "environment_fingerprint": self.environment_fingerprint,
+            "score": round(float(self.score), 6),
+            "applicable": self.applicable,
+            "selected": self.selected,
+            "reason": self.reason,
+            "evidence": list(self.evidence),
+        }
+
+
+@dataclass(frozen=True)
 class ValidationResult:
     ok: bool
     errors: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
 
 
-__all__ = ["Skill", "SkillCandidate", "ValidationResult"]
+__all__ = ["Skill", "SkillCandidate", "SkillSelectionRecord", "ValidationResult"]

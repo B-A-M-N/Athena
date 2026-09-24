@@ -245,3 +245,52 @@ async def test_skill_outcome_is_attributed_to_exact_version(tmp_path):
         assert evidence["outcomes"][0]["task_id"] == "task-failed"
     finally:
         await db.close()
+
+
+async def test_skill_evidence_records_opportunity_application_and_cancellation(tmp_path):
+    db = Database(str(tmp_path / "athena-evidence.db"))
+    lifecycle = SkillLifecycle(db)
+    try:
+        skill_id = await lifecycle.install(
+            Skill(id="", name="evidence-skill", description="Evidence", body="v1")
+        )
+        await lifecycle.record_selection_evidence(
+            [
+                {
+                    "skill_id": skill_id,
+                    "version": 1,
+                    "task_class": "debugging",
+                    "environment_fingerprint": "env_test",
+                    "score": 2.0,
+                    "applicable": True,
+                    "selected": True,
+                    "reason": "exact trigger",
+                    "evidence": ["trigger_matches:debug"],
+                }
+            ],
+            task_id="task-evidence",
+        )
+        current = await lifecycle.get(skill_id)
+        assert current is not None
+        outcome = await lifecycle.record_outcome(
+            skill_id,
+            version=1,
+            passed=True,
+            task_id="task-evidence",
+            failure={"status": "CANCELLED"},
+            task_class="debugging",
+            environment_fingerprint="env_test",
+        )
+        assert outcome["cancelled"] is True
+        assert outcome["passed"] is None
+        rows = await db.fetch_all(
+            "SELECT evidence_kind, outcome, task_class, environment_fingerprint, cancelled "
+            "FROM skill_evidence WHERE task_id = ? ORDER BY created_at, id",
+            ("task-evidence",),
+        )
+        assert [row["evidence_kind"] for row in rows] == ["selection", "outcome"]
+        assert rows[0]["task_class"] == "debugging"
+        assert rows[0]["environment_fingerprint"] == "env_test"
+        assert rows[1]["cancelled"] == 1
+    finally:
+        await db.close()

@@ -13,6 +13,8 @@ This package owns durable skill content, selection, validation, candidate review
 - `SkillLifecycle` resolves cited candidate evidence against durable task/event records before promotion; invented or missing references remain unproven and fail closed.
 - A refinement that widens scope requires multiple resolved observations across at least two observed environments; it cannot silently promote project evidence to user scope.
 - Triggering emits exact `SkillApplied` ID/version evidence; context selection alone is availability, not successful use or failure.
+- Selection evidence is typed and records task class, environment fingerprint, applicability, and exact revision; outcome evidence separately records application, verification, failure, and cancellation. Proposal confidence is never empirical reliability.
+- Observed failures reduce deterministic selection preference; only lifecycle promotion can change an active skill revision or scope.
 
 ## Verification
 

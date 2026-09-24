@@ -266,6 +266,176 @@ class SkillLifecycle:
         )
         return True
 
+    async def record_selection_evidence(
+        self,
+        records: List[dict[str, Any]],
+        *,
+        task_id: str,
+    ) -> int:
+        """Persist deterministic skill opportunities and selections.
+
+        Selection evidence is append-only and contains no task transcript or
+        tool arguments.  It is a qualification record, never an authority to
+        activate a skill.
+        """
+        count = 0
+        for record in records:
+            skill_id = str(record.get("skill_id") or "").strip()
+            if not skill_id:
+                continue
+            try:
+                version = int(record.get("version") or 1)
+            except (TypeError, ValueError):
+                continue
+            payload = {
+                "record_kind": "skill_selection",
+                "skill_id": skill_id,
+                "version": version,
+                "task_id": str(task_id),
+                "task_class": str(record.get("task_class") or "general"),
+                "environment_fingerprint": str(record.get("environment_fingerprint") or ""),
+                "score": float(record.get("score") or 0.0),
+                "applicable": bool(record.get("applicable")),
+                "selected": bool(record.get("selected")),
+                "reason": str(record.get("reason") or ""),
+                "evidence": [str(item) for item in (record.get("evidence") or ())],
+            }
+            await self._db.execute(
+                "INSERT INTO skill_evidence("
+                "id, skill_id, version, task_id, task_class, "
+                "environment_fingerprint, evidence_kind, outcome, passed, "
+                "cancelled, verified, payload, created_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    new_id("skill_evidence"),
+                    skill_id,
+                    version,
+                    str(task_id),
+                    payload["task_class"],
+                    payload["environment_fingerprint"],
+                    "selection",
+                    "selected" if payload["selected"] else "eligible",
+                    None,
+                    False,
+                    None,
+                    json.dumps(payload, sort_keys=True),
+                    utcnow().isoformat(),
+                ),
+            )
+            count += 1
+        return count
+
+    async def record_outcome(
+        self,
+        skill_id: str,
+        *,
+        version: int,
+        passed: bool,
+        task_id: str | None = None,
+        failure: Mapping[str, Any] | None = None,
+        task_class: str = "unknown",
+        environment_fingerprint: str = "",
+    ) -> dict[str, Any]:
+        """Record a terminal outcome for one exact skill revision.
+
+        The evidence row records task outcome and verification state, while
+        the skill metadata remains a compact ranking signal.  Cancellation is
+        preserved rather than counted as a success or failure.
+        """
+        skill = await self.get(skill_id)
+        if skill is None:
+            return {"status": "missing", "skill_id": skill_id, "version": version}
+        if skill.version != version:
+            return {
+                "status": "revision_mismatch",
+                "skill_id": skill_id,
+                "expected_version": version,
+                "active_version": skill.version,
+            }
+        metadata = dict(skill.metadata)
+        athena = dict(metadata.get("athena") or {})
+        evidence = dict(athena.get("evidence") or {})
+        status = str((failure or {}).get("status") or "COMPLETE")
+        cancelled = status.casefold() == "cancelled"
+        verified = bool((failure or {}).get("verified", status == "COMPLETE"))
+        outcome_kind = (
+            "cancelled"
+            if cancelled
+            else "verification_passed"
+            if verified and passed
+            else "verification_failed"
+        )
+        evidence_key = (
+            "cancelled_reuses" if cancelled else "verified_reuses" if passed else "failed_reuses"
+        )
+        evidence[evidence_key] = int(evidence.get(evidence_key) or 0) + 1
+        history = list(evidence.get("outcomes") or [])
+        history.append(
+            {
+                "task_id": task_id,
+                "passed": passed if not cancelled else None,
+                "cancelled": cancelled,
+                "verified": verified,
+                "failure": dict(failure or {}),
+                "version": version,
+                "at": utcnow().isoformat(),
+            }
+        )
+        evidence["outcomes"] = history[-32:]
+        evidence["refinement_required"] = bool(evidence.get("failed_reuses"))
+        evidence["reliability"] = _reliability_score(evidence)
+        athena["evidence"] = evidence
+        metadata["athena"] = athena
+        await self._db.execute(
+            "UPDATE skills SET metadata = ?, updated_at = ? WHERE id = ? AND version = ?",
+            (json.dumps(metadata), utcnow().isoformat(), skill_id, version),
+        )
+        await self._db.execute(
+            "INSERT INTO skill_evidence("
+            "id, skill_id, version, task_id, task_class, "
+            "environment_fingerprint, evidence_kind, outcome, passed, "
+            "cancelled, verified, payload, created_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                new_id("skill_evidence"),
+                skill_id,
+                version,
+                str(task_id or ""),
+                str(task_class or "unknown"),
+                str(environment_fingerprint or ""),
+                "outcome",
+                outcome_kind,
+                None if cancelled else passed,
+                cancelled,
+                verified,
+                json.dumps({"failure": dict(failure or {})}, sort_keys=True),
+                utcnow().isoformat(),
+            ),
+        )
+        await self._emit(
+            EventCategory.SKILL_ACTIVATED.value,
+            {
+                "skill_id": skill_id,
+                "op": "outcome",
+                "version": version,
+                "passed": None if cancelled else passed,
+                "cancelled": cancelled,
+                "verified": verified,
+                "refinement_required": evidence["refinement_required"],
+            },
+            task_id=task_id,
+        )
+        return {
+            "status": "recorded",
+            "skill_id": skill_id,
+            "version": version,
+            "passed": None if cancelled else passed,
+            "cancelled": cancelled,
+            "verified": verified,
+            "refinement_required": evidence["refinement_required"],
+            "reliability": evidence["reliability"],
+        }
+
     async def record_candidate(
         self,
         candidate: SkillCandidate,
@@ -348,72 +518,6 @@ class SkillLifecycle:
         )
         return skill
 
-    async def record_outcome(
-        self,
-        skill_id: str,
-        *,
-        version: int,
-        passed: bool,
-        task_id: str | None = None,
-        failure: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Attach verified reuse evidence to the exact skill revision.
-
-        This extends lifecycle metadata rather than creating a second usage
-        ledger. A version mismatch is reported without mutating the active
-        successor, so an outcome cannot be attributed to the wrong revision.
-        """
-        skill = await self.get(skill_id)
-        if skill is None:
-            return {"status": "missing", "skill_id": skill_id, "version": version}
-        if skill.version != version:
-            return {
-                "status": "revision_mismatch",
-                "skill_id": skill_id,
-                "expected_version": version,
-                "active_version": skill.version,
-            }
-        metadata = dict(skill.metadata)
-        athena = dict(metadata.get("athena") or {})
-        evidence = dict(athena.get("evidence") or {})
-        key = "verified_reuses" if passed else "failed_reuses"
-        evidence[key] = int(evidence.get(key) or 0) + 1
-        outcome = {
-            "task_id": task_id,
-            "passed": passed,
-            "failure": dict(failure or {}),
-            "version": version,
-            "at": utcnow().isoformat(),
-        }
-        history = list(evidence.get("outcomes") or [])
-        history.append(outcome)
-        evidence["outcomes"] = history[-32:]
-        evidence["refinement_required"] = bool(evidence.get("failed_reuses"))
-        athena["evidence"] = evidence
-        metadata["athena"] = athena
-        await self._db.execute(
-            "UPDATE skills SET metadata = ?, updated_at = ? WHERE id = ? AND version = ?",
-            (json.dumps(metadata), utcnow().isoformat(), skill_id, version),
-        )
-        await self._emit(
-            EventCategory.SKILL_ACTIVATED.value,
-            {
-                "skill_id": skill_id,
-                "op": "outcome",
-                "version": version,
-                "passed": passed,
-                "refinement_required": evidence["refinement_required"],
-            },
-            task_id=task_id,
-        )
-        return {
-            "status": "recorded",
-            "skill_id": skill_id,
-            "version": version,
-            "passed": passed,
-            "refinement_required": evidence["refinement_required"],
-        }
-
     async def load_active(self) -> List[Skill]:
         return await self.list(active_only=True)
 
@@ -455,6 +559,16 @@ class SkillLifecycle:
             else EventCategory.SKILL_CANDIDATE_CREATED.value
         )
         await self._emit(ev_type, payload, task_id=task_id)
+
+
+def _reliability_score(evidence: Mapping[str, Any]) -> float:
+    """Return a bounded empirical reuse signal, never proposal confidence."""
+    passed = int(evidence.get("verified_reuses") or 0)
+    failed = int(evidence.get("failed_reuses") or 0)
+    total = passed + failed
+    if total == 0:
+        return 0.0
+    return round(max(0.0, min(1.0, (passed + 0.5) / (total + 1.0))), 6)
 
 
 def _candidate_draft_record(skill: Skill) -> dict[str, Any]:
@@ -569,6 +683,13 @@ class SkillStore:
         if self._lifecycle is not None:
             return await self._lifecycle.trigger(skill_id, arguments, task_id=task_id)
         raise KeyError(f"no such skill: {skill_id}")
+
+    async def record_selection_evidence(
+        self, records: list[dict[str, Any]], *, task_id: str
+    ) -> int:
+        if self._lifecycle is not None:
+            return await self._lifecycle.record_selection_evidence(records, task_id=task_id)
+        return 0
 
     async def record_outcome(self, skill_id: str, **kwargs: Any) -> dict[str, Any]:
         if self._lifecycle is not None:

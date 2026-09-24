@@ -36,6 +36,7 @@ from athena.context.contracts import (
     ContextStaticContext as _StaticContext,
     MemoryCacheKey as _MemoryCacheKey,
     MemoryRetrievalMode,
+    SkillRetrieval,
 )
 from athena.protocol.context import ContextDigestStore
 from athena.context.digest_builder import ContextDigestBuilder
@@ -132,6 +133,7 @@ class CompiledContext:
     # these references as evidence so terminal outcomes can be attributed to
     # the revision the model actually saw.
     selected_skill_versions: tuple[tuple[str, int], ...] = ()
+    skill_selection_records: tuple[Any, ...] = ()
 
     def to_request(
         self,
@@ -513,6 +515,7 @@ class ContextCompiler:
                 for skill in static.skills
                 if getattr(skill, "id", None)
             ),
+            skill_selection_records=static.skill_selection_records,
         )
 
     async def compile_auxiliary(
@@ -647,14 +650,21 @@ class ContextCompiler:
         skills_needed = _skills_context_needed(task.objective)
         require_tools = bool(task.model_policy.require_tools)
         tool_eligible = not is_explicit_response_turn(task.objective)
-        blocks, memories, skills, research, workflows, capability_result = await asyncio.gather(
+        (
+            blocks,
+            memories,
+            skill_retrieval,
+            research,
+            workflows,
+            capability_result,
+        ) = await asyncio.gather(
             self._load_context_blocks(task),
             (
                 self._load_memories(task, mode=memory_mode)
                 if memory_mode is not MemoryRetrievalMode.SKIP
                 else _empty_list()
             ),
-            self._load_skills(task) if skills_needed else _empty_list(),
+            self._load_skills(task) if skills_needed else _empty_skill_retrieval(),
             self._load_research(task) if research_needed else _empty_list(),
             self._load_workflows(task),
             (
@@ -667,7 +677,8 @@ class ContextCompiler:
         static = _StaticContext(
             context_blocks=tuple(blocks),
             memories=tuple(memories),
-            skills=tuple(skills),
+            skills=tuple(skill_retrieval.skills),
+            skill_selection_records=tuple(skill_retrieval.records),
             research=tuple(research),
             workflows=tuple(workflows),
             capabilities=tuple(capabilities),
@@ -984,7 +995,7 @@ class ContextCompiler:
     ) -> list[Any]:
         return await ContextRetrieval(self)._load_memories(task, mode=mode)
 
-    async def _load_skills(self, task: TaskSpec) -> list[Any]:
+    async def _load_skills(self, task: TaskSpec) -> SkillRetrieval:
         return await ContextRetrieval(self)._load_skills(task)
 
     def _project_entries(self, workspace: str | None) -> list[_Entry]:
@@ -1131,6 +1142,10 @@ def _task_entry(task: TaskSpec, *, include_objective: bool = True) -> _Entry:
 
 async def _empty_list() -> list[Any]:
     return []
+
+
+async def _empty_skill_retrieval() -> SkillRetrieval:
+    return SkillRetrieval()
 
 
 async def _empty_capability_result() -> tuple[

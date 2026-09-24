@@ -22,6 +22,9 @@ models, and never plans work. AgentKernel remains the one reasoning authority.
   not enter context through this boundary.
 - Knowledge retrieval must never synthesize new facts: it returns admitted
   evidence only.
+- Skill selection and reuse outcomes are qualification evidence only: the
+  pipeline records exact revision/task-class/environment facts and never grants
+  capability authority.
 
 ## Verification
 

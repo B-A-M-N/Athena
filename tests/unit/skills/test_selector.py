@@ -82,3 +82,52 @@ async def test_selector_prefers_verified_reuse_when_applicability_matches():
         task_context={"project_id": "repo"},
     )
     assert selected[0].name == "verified"
+
+
+async def test_selector_emits_task_and_environment_selection_evidence():
+    skill = _skill(
+        "release",
+        "Verify a release artifact",
+        ["release"],
+    )
+    records, selected = await SkillSelector().select_with_evidence(
+        task_objective="publish a release artifact",
+        available=[skill],
+        limit=1,
+        task_context={
+            "project_id": "repo-a",
+            "environment": "linux",
+            "available_capabilities": ["execute"],
+        },
+    )
+
+    assert [item.id for item in selected] == ["release"]
+    assert len(records) == 1
+    record = records[0].to_record()
+    assert record["skill_id"] == "release"
+    assert record["version"] == 1
+    assert record["task_class"] == "release"
+    assert record["selected"] is True
+    assert record["applicable"] is True
+    assert record["environment_fingerprint"].startswith("env_")
+    assert "trigger_matches:release" in record["evidence"]
+
+
+async def test_observed_failures_demote_a_plausible_skill():
+    failing = _skill(
+        "failing",
+        "Repair a failing service",
+        ["failing", "service"],
+        metadata={"athena": {"evidence": {"failed_reuses": 4}}},
+    )
+    neutral = _skill("neutral", "Repair a failing service", ["failing", "service"])
+    records, selected = await SkillSelector().select_with_evidence(
+        task_objective="repair a failing service",
+        available=[failing, neutral],
+        limit=1,
+        task_context={"project_id": "repo-a"},
+    )
+
+    assert [item.id for item in selected] == ["neutral"]
+    assert records[0].evidence
+    assert "failed_reuses:4" in records[0].evidence

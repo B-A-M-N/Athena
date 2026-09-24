@@ -17,6 +17,7 @@ from athena.strategy import StrategyGuidance
 __all__ = [
     "ContextEntry",
     "ContextStaticContext",
+    "SkillRetrieval",
     "MemoryCacheKey",
     "MemoryRetrievalMode",
 ]
@@ -74,12 +75,21 @@ class MemoryCacheKey:
 
 
 @dataclass(frozen=True)
+class SkillRetrieval:
+    """Skills plus their explicit selection evidence."""
+
+    skills: tuple[Any, ...] = ()
+    records: tuple[Any, ...] = ()
+
+
+@dataclass(frozen=True)
 class ContextStaticContext:
     """Revisioned context material that is stable across model turns."""
 
     context_blocks: tuple[ContextEntry, ...] = ()
     memories: tuple[Any, ...] = ()
     skills: tuple[Any, ...] = ()
+    skill_selection_records: tuple[Any, ...] = ()
     research: tuple[ContextEntry, ...] = ()
     workflows: tuple[ContextEntry, ...] = ()
     capabilities: tuple[CapabilityDescriptor, ...] = ()

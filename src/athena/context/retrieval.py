@@ -43,6 +43,7 @@ from athena.strategy import StrategyAffordance, is_explicit_response_turn
 from athena.context.contracts import (
     ContextEntry as _Entry,
     ContextStaticContext as _StaticContext,
+    SkillRetrieval,
     MemoryCacheKey as _MemoryCacheKey,
     MemoryRetrievalMode,
 )
@@ -338,17 +339,17 @@ class ContextRetrieval:
                 self._c._memory_cache.popitem(last=False)
         return out
 
-    async def _load_skills(self, task: TaskSpec) -> list[Any]:
+    async def _load_skills(self, task: TaskSpec) -> SkillRetrieval:
         if self._c._skill_loader is None:
-            return []
+            return SkillRetrieval()
         try:
             available = list(await self._c._skill_loader.load_active())
         except Exception as exc:
             self._c._record_degradation("skills", exc)
-            return []
+            return SkillRetrieval()
         if not available:
-            return []
-        selected = await SkillSelector(min_score=0.01).select(
+            return SkillRetrieval()
+        records, selected = await SkillSelector(min_score=0.01).select_with_evidence(
             task_objective=task.objective,
             available=available,
             limit=self._c.skill_limit,
@@ -367,7 +368,7 @@ class ContextRetrieval:
                 "dependencies": (task.metadata or {}).get("dependencies", ()),
             },
         )
-        return selected
+        return SkillRetrieval(skills=tuple(selected), records=tuple(records))
 
     async def _load_context_blocks(self, task: TaskSpec) -> list[_Entry]:
         store = self._c._context_block_store

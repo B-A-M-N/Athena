@@ -67,7 +67,14 @@ class KnowledgePipeline:
             return
         transcript = _task_transcript(task, await self._transcript(task))
         successful_calls = _successful_ordinary_calls(transcript)
-        selected_skills = await self._selected_skill_versions(task)
+        selected_skills, selection_records = await self._selected_skill_versions(task)
+        if selection_records and self._skills is not None:
+            recorder = getattr(self._skills, "record_selection_evidence", None)
+            if callable(recorder):
+                try:
+                    await recorder(selection_records, task_id=getattr(task, "id", ""))
+                except Exception as exc:
+                    _logger.warning("skill selection evidence recording failed: %s", exc)
         used_skills = await self._used_skill_versions(task, selected_skills)
         if selected_skills and not used_skills:
             selected_skills = ()
@@ -77,6 +84,7 @@ class KnowledgePipeline:
                 result,
                 selected_skills,
                 passed=status == "COMPLETE",
+                selection_records=selection_records,
             )
         if (
             status == "FAILED"
@@ -257,21 +265,40 @@ class KnowledgePipeline:
             _logger.warning("knowledge pipeline transcript load failed: %s", exc)
             return []
 
-    async def _selected_skill_versions(self, task: Any) -> tuple[tuple[str, int], ...]:
-        """Recover exact skill revisions injected during this task."""
+    async def _selected_skill_versions(
+        self, task: Any
+    ) -> tuple[tuple[tuple[str, int], ...], list[dict[str, Any]]]:
+        """Recover exact skill revisions and deterministic selection records."""
         if self._events is None or not getattr(task, "id", None):
-            return ()
+            return (), []
         try:
             events = await self._events.list_for_task(task.id)
         except Exception as exc:
             _logger.warning("skill selection evidence lookup failed: %s", exc)
-            return ()
+            return (), []
         selected: list[tuple[str, int]] = []
+        records: list[dict[str, Any]] = []
         seen: set[tuple[str, int]] = set()
+        seen_records: set[tuple[Any, ...]] = set()
         for event in events:
             if getattr(event, "type", None) != "SkillContextSelected":
                 continue
             payload = getattr(event, "payload", {}) or {}
+            for item in payload.get("selection_records", ()):
+                if not isinstance(item, Mapping) or not item.get("skill_id"):
+                    continue
+                record = dict(item)
+                identity = (
+                    record.get("skill_id"),
+                    record.get("version"),
+                    record.get("task_class"),
+                    record.get("environment_fingerprint"),
+                    record.get("selected"),
+                    record.get("reason"),
+                )
+                if identity not in seen_records:
+                    seen_records.add(identity)
+                    records.append(record)
             for item in payload.get("skills", ()):
                 if not isinstance(item, Mapping) or not item.get("skill_id"):
                     continue
@@ -282,7 +309,7 @@ class KnowledgePipeline:
                 if ref not in seen:
                     seen.add(ref)
                     selected.append(ref)
-        return tuple(selected)
+        return tuple(selected), records
 
     async def _used_skill_versions(
         self, task: Any, selected: tuple[tuple[str, int], ...]
@@ -318,24 +345,44 @@ class KnowledgePipeline:
         selected: tuple[tuple[str, int], ...],
         *,
         passed: bool,
+        selection_records: list[dict[str, Any]] | None = None,
     ) -> None:
         if self._skills is None:
             return
-        failure = {
-            "status": getattr(
-                getattr(result, "status", None), "value", getattr(result, "status", "")
-            ),
+        status = str(
+            getattr(getattr(result, "status", None), "value", getattr(result, "status", ""))
+        )
+        failure: dict[str, Any] = {
+            "status": status,
             "summary": str(getattr(result, "summary", "") or "")[:1000],
             "unresolved": [str(item) for item in (getattr(result, "unresolved", ()) or ())[:8]],
         }
+        if status == "COMPLETE" or hasattr(result, "verification_receipts"):
+            failure["verified"] = status == "COMPLETE"
         for skill_id, version in selected:
             try:
+                record = next(
+                    (
+                        item
+                        for item in (selection_records or [])
+                        if str(item.get("skill_id")) == skill_id
+                        and int(item.get("version") or 1) == version
+                    ),
+                    None,
+                )
+                outcome_kwargs: dict[str, Any] = {}
+                if record is not None:
+                    outcome_kwargs["task_class"] = str(record.get("task_class") or "general")
+                    outcome_kwargs["environment_fingerprint"] = str(
+                        record.get("environment_fingerprint") or ""
+                    )
                 await self._skills.record_outcome(
                     skill_id,
                     version=version,
                     passed=passed,
                     task_id=getattr(task, "id", None),
-                    failure={} if passed else failure,
+                    failure=({**failure} if not passed else {"status": status, "verified": True}),
+                    **outcome_kwargs,
                 )
             except Exception as exc:
                 _logger.warning("skill outcome recording failed for %s: %s", skill_id, exc)

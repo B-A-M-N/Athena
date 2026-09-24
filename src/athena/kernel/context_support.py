@@ -102,13 +102,18 @@ class ContextSupport:
                 },
                 task,
             )
-        if compiled.selected_skill_versions:
+        if compiled.selected_skill_versions or compiled.skill_selection_records:
             await self._emit(
                 "SkillContextSelected",
                 {
                     "skills": [
                         {"skill_id": skill_id, "version": version}
                         for skill_id, version in compiled.selected_skill_versions
+                    ],
+                    "selection_records": [
+                        record.to_record()
+                        for record in compiled.skill_selection_records
+                        if hasattr(record, "to_record")
                     ],
                     "source": "context_injection",
                 },
