@@ -544,6 +544,10 @@ class CapabilityDispatcher:
                 deadline=task_deadline,
                 runtime_remaining_s=runtime_remaining_s,
                 verification_environment=verification_environment,
+                verification_call=(
+                    getattr(request.origin, "value", request.origin)
+                    == CapabilityRequestOrigin.SYSTEM_VERIFICATION.value
+                ),
                 autonomy=profile,
                 generated_call_depth=_generated_call_depth,
                 generated_call_chain=tuple(_generated_call_chain),

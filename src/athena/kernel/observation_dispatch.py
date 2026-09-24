@@ -18,6 +18,7 @@ from athena.kernel.observation_support import (
     observation_from_result,
     repeated_failure_observation,
     runtime_completed_observation,
+    is_nonrecoverable_recovery_failure,
 )
 from athena.protocol.messages import CapabilityResultBlock
 
@@ -49,6 +50,8 @@ class ObservationDispatchMechanism:
             if result.ok:
                 candidates = [runtime_completed_observation(task, result)]
             else:
+                if is_nonrecoverable_recovery_failure(result):
+                    continue
                 failures = state.interpreter_failure_counts
                 failures[result.capability_id] = failures.get(result.capability_id, 0) + 1
                 candidates = [

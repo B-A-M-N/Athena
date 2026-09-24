@@ -314,3 +314,34 @@ async def test_run_rejects_unconfigured_service_before_constructing_surface(
     assert service.submit_calls == 0
     assert constructed == []
     assert "No model provider is configured" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_run_awaits_async_readiness_without_warning(monkeypatch, tmp_path):
+    import athena.cli.chat as chat
+
+    monkeypatch.setattr(chat, "_make_surface", lambda **kwargs: _RunSurface())
+    service = _RunService()
+    awaited = []
+
+    async def require_agent_ready(request=None):
+        awaited.append(request)
+
+    service.require_agent_ready = require_agent_ready
+
+    async def fake_stream_task(*args, **kwargs):
+        return SimpleNamespace(summary="done", status=TaskStatus.COMPLETE, usage=None)
+
+    monkeypatch.setattr(chat, "stream_task", fake_stream_task)
+    import warnings
+
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        code = await _cmd_run(
+            Options(command="run", args=["hello"], workspace=str(tmp_path)),
+            service,
+        )
+
+    assert code == 0
+    assert len(awaited) == 1
+    assert not any(item.category is RuntimeWarning for item in captured)

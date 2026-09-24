@@ -91,6 +91,12 @@ class InterpreterExtension:
         system_prompt = (
             "You are the interpreter component of the Athena agent kernel. "
             "You translate execution observations into capability proposals. "
+            "Use only capabilities already present in the current task's tool "
+            "definitions. Never invent capability IDs or runtime session IDs; "
+            "for execute, omit session and let Athena create the task-owned "
+            "session. If the prior failure names an unknown capability, invalid "
+            "tool input, or a session identity error, return {} rather than "
+            "proposing another repair. "
             "Respond with a single JSON object with keys "
             '"capability_id", "arguments", "rationale". '
             "Respond with an empty object {} when the observation warrants "

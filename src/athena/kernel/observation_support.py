@@ -15,6 +15,27 @@ __all__ = [
     "runtime_completed_observation",
 ]
 
+_NON_RECOVERABLE_RECOVERY_MARKERS = (
+    "unknown_capability",
+    "unknown capability",
+    "repair_invalid",
+    "not owned by task",
+    "security-sensitive identity",
+    "batch_preflight_failed",
+)
+
+
+def is_nonrecoverable_recovery_failure(result: CapabilityResultBlock) -> bool:
+    """Whether a failed result is already a bounded terminal recovery signal.
+
+    These failures do not become better by asking the interpreter to propose
+    another opaque capability or session. The primary loop retains the result
+    and may stop truthfully; repeated interpreter fusion would only amplify
+    invalid actions and token spend.
+    """
+    text = f"{result.error or ''}\n{result.output or ''}".casefold()
+    return any(marker in text for marker in _NON_RECOVERABLE_RECOVERY_MARKERS)
+
 
 def observation_from_result(task: Any, result: CapabilityResultBlock):
     error_text = (result.error or "")[:2000]
@@ -41,7 +62,7 @@ def observation_from_result(task: Any, result: CapabilityResultBlock):
 
 
 def repeated_failure_observation(task: Any, result: CapabilityResultBlock, attempts: int):
-    if attempts < REPEATED_FAILURE_THRESHOLD:
+    if attempts < REPEATED_FAILURE_THRESHOLD or is_nonrecoverable_recovery_failure(result):
         return None
     return InterpreterObservation(
         kind=BodyObservationKind.REPEATED_FAILURE,

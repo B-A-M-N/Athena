@@ -74,6 +74,13 @@ class CompletionJournal:
         record["unresolved"] = [str(item) for item in unresolved]
         self._persist()
 
+    def mark_stale(self, task_id: str, *, reason: str) -> None:
+        """Retain a journal record whose owning task is no longer present."""
+        record = self._records.setdefault(task_id, {"task_id": task_id})
+        record["state"] = "STALE"
+        record["error"] = str(reason)
+        self._persist()
+
     def mark_aborted(self, task_id: str, *, reason: str = "") -> None:
         """Close a saga whose candidate was safely discarded before commit."""
         record = self._records.get(task_id)
@@ -93,6 +100,7 @@ class CompletionJournal:
                 "VERIFIED",
                 "COMMIT_PROVEN",
                 "RECOVERY_REQUIRED",
+                "STALE",
             }
         )
 

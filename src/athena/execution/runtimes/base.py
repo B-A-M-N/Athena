@@ -93,7 +93,10 @@ class BaseRuntime(metaclass=abc.ABCMeta):
                     f"security-sensitive identity of runtime session {sid} cannot be changed"
                 )
             return sid, session
-        existing_sid = f"{self.name}_{request.task_id}"
+        scope = str(request.metadata.get("__runtime_session_scope") or "")
+        existing_sid = (
+            f"{self.name}_{scope}:{request.task_id}" if scope else f"{self.name}_{request.task_id}"
+        )
         if existing_sid in self._sessions:
             existing = self._sessions[existing_sid]
             if self._request_matches_session(request, existing):

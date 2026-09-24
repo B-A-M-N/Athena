@@ -139,6 +139,7 @@ async def build_commit_plan(
                 task_id=branch.task_id,
                 call_id=new_id("commit"),
                 origin=CapabilityRequestOrigin.TRUSTED_ORCHESTRATION,
+                metadata={"_verified_candidate_commit": True},
             )
         )
     for rel in changes["deleted"]:
@@ -149,6 +150,7 @@ async def build_commit_plan(
                 task_id=branch.task_id,
                 call_id=new_id("commit"),
                 origin=CapabilityRequestOrigin.TRUSTED_ORCHESTRATION,
+                metadata={"_verified_candidate_commit": True},
             )
         )
 

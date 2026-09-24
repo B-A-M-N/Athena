@@ -539,6 +539,10 @@ class InvocationContext:
     # Host-resolved candidate verification toolchain. This is internal
     # execution context, never model-controlled request data.
     verification_environment: Any = None
+    # Internal marker for host-owned acceptance probes. It is never a
+    # model-visible capability argument and gives execution an isolated
+    # verification identity without weakening session ownership checks.
+    verification_call: bool = False
     # Internal execution context only. This deliberately does not belong on
     # CapabilityRequest, where model-visible fields could be mistaken for
     # authority controls.

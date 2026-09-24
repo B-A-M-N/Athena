@@ -354,6 +354,16 @@ class CandidateVerificationService:
         """
         if self._default_source is None:
             return []
+        # A project profile is supporting evidence, not a blanket completion
+        # policy. Read-only and execution-only tasks without an explicit gate
+        # must not acquire unrelated lint/typecheck obligations merely because
+        # those binaries happen to be installed on the host.
+        if not (
+            self._requires_independent_proof(task)
+            or changed_resources
+            or any(c.required for c in task.acceptance_criteria)
+        ):
+            return []
         try:
             profile_task = replace(task, workspace=workspace) if workspace is not None else task
             profile = self._default_source(profile_task)

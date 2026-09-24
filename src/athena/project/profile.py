@@ -219,7 +219,11 @@ class ProjectInspector:
                 "manage.py",
             }
         ][:100]
-        commands, toolchain = self._commands(languages, systems)
+        commands, toolchain = self._commands(
+            languages,
+            systems,
+            has_tests=bool(test_roots),
+        )
         git = self._git(root_path)
         environment = ProjectEnvironment(
             root=str(root_path),
@@ -362,16 +366,16 @@ class ProjectInspector:
 
     @classmethod
     def _commands(
-        cls, languages: set[str], systems: set[str]
+        cls, languages: set[str], systems: set[str], *, has_tests: bool = False
     ) -> tuple[dict[str, tuple[str, ...]], dict[str, str]]:
         commands: dict[str, tuple[str, ...]] = {}
         toolchain: dict[str, str] = {}
         candidates = {
-            "Python": ("python", "python -m pytest", "ruff check", "mypy"),
-            "JavaScript": ("node", "npm test", "npm run build"),
-            "TypeScript": ("node", "npm test", "npm run build", "tsc --noEmit"),
-            "Go": ("go", "go test ./...", "go vet ./..."),
-            "Rust": ("cargo", "cargo test", "cargo check"),
+            "Python": ("python -m pytest",) if has_tests else ("python",),
+            "JavaScript": ("npm test",) if has_tests else ("node",),
+            "TypeScript": ("npm test",) if has_tests else ("node",),
+            "Go": ("go test ./...",) if has_tests else ("go",),
+            "Rust": ("cargo test",) if has_tests else ("cargo",),
         }
         for language in sorted(languages):
             available = tuple(
@@ -381,7 +385,8 @@ class ProjectInspector:
             )
             if available:
                 commands[language.casefold()] = available
-            binary = candidates.get(language, ())[0] if candidates.get(language) else None
+            language_candidates = candidates.get(language, ())
+            binary = language_candidates[0] if language_candidates else None
             resolved = cls._which(binary) if binary else None
             if binary and resolved:
                 toolchain[language.casefold()] = str(resolved)

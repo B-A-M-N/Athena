@@ -132,3 +132,63 @@ async def test_execute_adds_candidate_src_without_inheriting_host_pythonpath(tmp
     assert execution.requests[0].env["PYTHONPATH"] == str(tmp_path / "src")
     assert execution.requests[0].env["PYTHONDONTWRITEBYTECODE"] == "1"
     assert "host/pythonpath" not in execution.requests[0].env
+
+
+def test_execute_descriptor_does_not_expose_opaque_session_argument():
+    properties = ExecuteCapability.descriptor.input_schema["properties"]
+
+    assert "session" not in properties
+    assert "Omit session" in ExecuteCapability.descriptor.description
+
+
+async def test_system_verification_uses_an_isolated_runtime_identity(tmp_path):
+    class _ExecutionManager:
+        def __init__(self):
+            self.requests = []
+            self.destroyed = []
+
+        def available_runtimes(self):
+            return ["shell"]
+
+        def is_session_owned_by_task(self, _session_id, _task_id):
+            return True
+
+        async def stream(self, request, execution_id):
+            self.requests.append(request)
+            yield ExecutionEvent(
+                ExecutionEventType.STARTED,
+                execution_id,
+                metadata={"runtime_session_id": "shell_verify_task"},
+            )
+            yield ExecutionEvent(
+                ExecutionEventType.EXITED,
+                execution_id,
+                exit_status=ExecutionExitStatus.EXITED,
+                exit_code=0,
+            )
+
+        async def destroy_session(self, session_id):
+            self.destroyed.append(session_id)
+
+    execution = _ExecutionManager()
+    capability = ExecuteCapability(execution)
+    result = await capability.invoke(
+        CapabilityRequest(
+            capability_id="execute",
+            task_id="task-a",
+            call_id="verify-call",
+            arguments={"language": "shell", "code": "true"},
+        ),
+        context=InvocationContext(
+            workspace=WorkspaceSpec(id="candidate", root=str(tmp_path)),
+            task_id="task-a",
+            verification_call=True,
+        ),
+    )
+
+    assert result.status is CapabilityResultStatus.OK
+    assert execution.requests[0].task_id == "task-a"
+    assert execution.requests[0].metadata["__runtime_session_scope"] == (
+        "verify:task-a:verify-call"
+    )
+    assert execution.destroyed == ["shell_verify_task"]

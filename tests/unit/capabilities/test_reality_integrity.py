@@ -377,6 +377,36 @@ async def test_completion_recovery_requires_fingerprint_and_final_identity(tmp_p
     assert journal.record("task-missing-final")["state"] == "RECOVERY_REQUIRED"
 
 
+@pytest.mark.asyncio
+async def test_startup_marks_journal_records_for_missing_tasks_stale(tmp_path: Path):
+    journal = CompletionJournal(tmp_path / "journal")
+    journal.begin_verified(
+        task_id="task-missing",
+        branch_id="branch-missing",
+        decision=SimpleNamespace(reason="done", summary="done", unresolved=()),
+        certificate={},
+    )
+    journal.mark_commit_proven("task-missing", final_fingerprint="final")
+
+    class _Shadow:
+        def get_branch(self, branch_id):
+            return None
+
+    class _Tasks:
+        async def get(self, task_id):
+            raise KeyError(f"Task not found: {task_id}")
+
+    coordinator = RealityCoordinator(
+        shadow_engine=_Shadow(),
+        reality_gate=SimpleNamespace(),
+        candidate_verifier=None,
+        completion_journal=journal,
+    )
+
+    assert await coordinator.reconcile_startup(_Tasks()) == 0
+    assert journal.record("task-missing")["state"] == "STALE"
+
+
 def test_completion_journal_survives_reload(tmp_path: Path):
     journal = CompletionJournal(tmp_path)
     journal.begin_verified(

@@ -167,6 +167,17 @@ async def route_request(
     from athena.reality.gate import _mutation_mode, _same_root
 
     mode = _mutation_mode(workspace.mutation_mode)
+    request_origin = getattr(request.origin, "value", request.origin)
+    if request_origin == "system_verification" or bool(
+        (request.metadata or {}).get("_verified_candidate_commit")
+    ):
+        # Verification is already bound by the canonical verifier to the
+        # candidate workspace it was given, and a verified commit request is
+        # bound to the real base workspace selected by the shadow commit
+        # controller. Treating either as a fresh model mutation re-opened a
+        # nested speculative branch and made the later commit look like
+        # workspace drift.
+        return RealityRoute(workspace, ExecutionDisposition.DIRECT)
     if (
         request.task_id
         and gate._dispatcher_runtime_escalations is not None

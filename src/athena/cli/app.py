@@ -23,6 +23,7 @@ Argument parsing prefers ``click`` (optional extra ``cli``) and falls back to
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import shutil
 import sys
@@ -906,10 +907,14 @@ async def _cmd_run(o: Options, service: Any) -> int:
         model_policy=_model_policy(o.model),
         metadata=_criteria_metadata(o),
     )
+    # Readiness remains a service-owned admission boundary. The CLI only
+    # forwards the request and awaits the service's asynchronous contract.
     admit = getattr(service, "require_agent_ready", None)
     if callable(admit):
         try:
-            admit(request)
+            result = admit(request)
+            if inspect.isawaitable(result):
+                await result
         except Exception as exc:
             from athena.protocol.errors import ServiceNotReady
 

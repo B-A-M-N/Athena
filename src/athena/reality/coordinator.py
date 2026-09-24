@@ -639,7 +639,14 @@ class RealityCoordinator:
             task_id = record.get("task_id")
             if not isinstance(task_id, str):
                 continue
-            task = await task_manager.get(task_id)
+            try:
+                task = await task_manager.get(task_id)
+            except KeyError:
+                self._completion.mark_stale(
+                    task_id,
+                    reason="completion journal references a task absent from the current database",
+                )
+                continue
             if task is None:
                 continue
             status = str((task.metadata or {}).get("status") or "")

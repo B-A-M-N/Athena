@@ -49,3 +49,17 @@ def test_planner_keeps_impacted_tests_as_project_resources():
 
     assert plan.impacted_tests == ("tests/test_app.py",)
     assert plan.index_revision == "idx-1"
+
+
+def test_profiler_does_not_turn_installed_tools_into_acceptance_gates_without_tests(tmp_path):
+    from athena.project.profile import ProjectInspector
+
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    profile = ProjectInspector().inspect(str(tmp_path))
+    plan = VerificationPlanner().plan(
+        TaskSpec(id="task", objective="report observed state"),
+        profile,
+    )
+
+    assert plan.criteria == ()
+    assert profile.commands == {"python": ("python",)}

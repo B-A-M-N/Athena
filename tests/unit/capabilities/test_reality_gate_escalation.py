@@ -378,3 +378,33 @@ async def test_complexity_ledger_escalates_across_separate_batches():
     snapshot = dispatcher._complexity_ledger["task-history"].to_record()
     assert snapshot["mutation_count"] == 1
     assert snapshot["execute_observed"] is True
+
+
+async def test_verified_candidate_commit_is_not_rerouted_into_new_candidate(tmp_path):
+    ws = _ws(tmp_path, mode=MutationMode.SPECULATIVE)
+    dispatcher, engine, gate = _gate(tmp_path)
+
+    # A verified commit is a trusted, already-bound operation. It must use the
+    # selected base workspace rather than being reinterpreted as a new model
+    # mutation while the task is marked late-complex.
+    gate._dispatcher_runtime_escalations = {"task-escalation"}
+    request = _request(
+        "fs",
+        {"operation": "write", "path": "README.txt", "content": "committed\n"},
+        "verified-commit",
+    )
+    request = type(request)(
+        **{
+            **request.__dict__,
+            "metadata": {"_verified_candidate_commit": True},
+        }
+    )
+    route = await gate.route(
+        request,
+        ws,
+        {EffectClass.WRITE_LOCAL},
+        FilesystemCapability().descriptor,
+    )
+    assert route.disposition is ExecutionDisposition.DIRECT
+    assert route.workspace.root == ws.root
+    assert gate.active_branch("task-escalation") is None

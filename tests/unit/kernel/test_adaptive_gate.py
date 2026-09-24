@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 
 from athena.kernel.adaptive_gate import project_adaptive_decision
+from athena.kernel.observation_support import is_nonrecoverable_recovery_failure
+from athena.protocol.messages import CapabilityResultBlock
 
 
 def test_projection_distinguishes_generated_repair_from_fusion_strategy_change():
@@ -85,3 +87,19 @@ def test_recovery_mechanism_rejects_repeated_failed_proposal():
     )
     assert state.speculative_recovery_rejections == 1
     asyncio.run(noop())
+
+
+def test_nonrecoverable_recovery_failures_do_not_request_more_fusion():
+    for error in (
+        "unknown capability: create_session",
+        "batch_preflight_failed: repair_invalid repair outcome INVALID",
+        "session pytest_repro is not owned by task task-1",
+        "security-sensitive identity of runtime session shell_task cannot be changed",
+    ):
+        result = CapabilityResultBlock(
+            call_id="call-1",
+            capability_id="execute",
+            ok=False,
+            error=error,
+        )
+        assert is_nonrecoverable_recovery_failure(result) is True
