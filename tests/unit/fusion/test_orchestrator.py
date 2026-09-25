@@ -359,7 +359,11 @@ async def test_synthesized_capability_binds_validation_to_exact_branch(fused):
         name="branch_reader",
         description="reads branch proof",
         code="def run(args):\n    return {'ok': True}\n",
-        input_schema={"type": "object", "additionalProperties": False},
+        input_schema={
+            "type": "object",
+            "properties": {"variant": {"type": "string"}},
+            "additionalProperties": False,
+        },
         effects={"READ_LOCAL"},
         task_id=task_id,
         validation_cases=[{"args": {}, "expect_output": {"ok": True}}],
@@ -397,3 +401,248 @@ async def test_fusion_orchestrator_accepts_explicit_ports(tmp_path):
     assert fusion.service is None
     assert fusion.shadow is shadow
     assert fusion.checkpoints is checkpoints
+
+
+async def test_composed_generated_capability_speculative_reality_and_provenance(fused):
+    """Qualify generated capability, speculation, reality, and provenance as one flow."""
+    from athena.kernel.termination import TerminationDecision
+    from athena.protocol.capabilities import CapabilityRequest, CapabilityRequestOrigin
+    from athena.protocol.tasks import TaskStatus
+
+    svc, ws, task_id = fused
+    criteria = [
+        {
+            "id": "composed-source",
+            "description": "candidate source is present",
+            "verification": {"type": "file", "path": "source.txt"},
+            "required": True,
+        },
+    ]
+    await svc._store_tasks._db.execute(
+        "UPDATE tasks SET acceptance_criteria = ? WHERE id = ?",
+        (json.dumps(criteria), task_id),
+    )
+    fusion = FusionOrchestrator(svc)
+    experiment = await fusion.run_experiment(
+        task_id=task_id,
+        proposal=[
+            {
+                "capability_id": "fs",
+                "arguments": {
+                    "operation": "write",
+                    "path": "source.txt",
+                    "content": "ready\n",
+                    "create_dirs": True,
+                },
+            }
+        ],
+        profile="autonomous",
+        auto_fork_on_failure=False,
+    )
+    assert experiment.status == "CANDIDATE_READY", experiment.error
+    branch = fusion.shadow.get_branch(experiment.branch_id)
+    assert branch is not None
+
+    generated = await fusion.synthesize_from_branch(
+        svc._registry,
+        name="branch_reader",
+        description="reads the branch source through canonical fs",
+        code=(
+            "def run(args):\n"
+            "    return {'value': athena.call('fs', {'operation': 'read', 'path': 'source.txt'})}\n"
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {"variant": {"type": "string"}},
+            "additionalProperties": False,
+        },
+        effects={"READ_LOCAL"},
+        task_id=task_id,
+        validation_cases=[
+            {"args": {"variant": "one"}, "expect_output_contains": "ready"},
+            {"args": {"variant": "two"}, "expect_output_contains": "ready"},
+        ],
+        branch_id=branch.id,
+        workspace=branch.shadow_workspace,
+    )
+    assert generated["admitted"] is True
+    generated_id = generated["capability_id"]
+    call_ids = []
+    for index, (session_id, variant) in enumerate(
+        (
+            ("composed-session-one", "one"),
+            ("composed-session-two", "two"),
+            ("composed-session-two", "three"),
+        ),
+        start=1,
+    ):
+        call_id = f"composed-generated-invocation-{index}"
+        call_ids.append(call_id)
+        execution = await svc._dispatcher.dispatch(
+            CapabilityRequest(
+                capability_id=generated_id,
+                task_id=task_id,
+                session_id=session_id,
+                call_id=call_id,
+                origin=CapabilityRequestOrigin.USER_DIRECT,
+                arguments={"variant": variant},
+            ),
+            workspace=branch.shadow_workspace,
+            profile="autonomous",
+        )
+        assert execution.status.value == "ok", execution.error
+        assert "ready" in json.loads(execution.output)["value"]
+    for call_id in call_ids:
+        await svc._synthesis.observe_event(
+            __import__("athena.protocol.events", fromlist=["make_event"]).make_event(
+                "CapabilityCompleted",
+                {"call_id": call_id, "capability_id": generated_id},
+                task_id=task_id,
+            )
+        )
+        await svc._synthesis.observe_event(
+            __import__("athena.protocol.events", fromlist=["make_event"]).make_event(
+                "VerificationCompleted", {"passed": True}, task_id=task_id
+            )
+        )
+    skill_candidate = svc._synthesis.to_skill_candidate(generated_id)
+    assert skill_candidate is not None
+    generated_identity = skill_candidate.draft.metadata["athena"]["generated_capability"]
+    assert generated_identity["branch_id"] == branch.id
+    assert generated_identity["workspace_fingerprint"] == await fusion.shadow.workspace_fingerprint(
+        branch.shadow_workspace.root
+    )
+    assert generated_identity["revision"] == 1
+
+    svc._reality_gate.activate_branch(branch)
+    task = await svc._task_manager.get(task_id)
+    completion = await svc._reality_coordinator.prepare_completion(
+        task,
+        TerminationDecision(terminal=True, status=TaskStatus.COMPLETE, reason="composed proof"),
+    )
+    assert completion.committed is True
+    assert Path(ws.root, "source.txt").read_text(encoding="utf-8") == "ready\n"
+    assert generated_identity["branch_id"] == experiment.branch_id
+    assert generated_identity["workspace_fingerprint"]
+
+
+async def test_composed_branch_synthesis_rejects_cross_branch_workspace(fused):
+    svc, ws, task_id = fused
+    fusion = FusionOrchestrator(svc)
+    criteria = [
+        {
+            "id": "branch-source",
+            "description": "candidate",
+            "verification": {"type": "file", "path": "source.txt"},
+            "required": True,
+        }
+    ]
+    await svc._store_tasks._db.execute(
+        "UPDATE tasks SET acceptance_criteria = ? WHERE id = ?",
+        (json.dumps(criteria), task_id),
+    )
+
+    async def verified_branch(path: str, content: str) -> str:
+        result = await fusion.run_experiment(
+            task_id=task_id,
+            proposal=[
+                {
+                    "capability_id": "fs",
+                    "arguments": {
+                        "operation": "write",
+                        "path": path,
+                        "content": content,
+                        "create_dirs": True,
+                    },
+                }
+            ],
+            profile="autonomous",
+            auto_fork_on_failure=False,
+        )
+        assert result.status == "CANDIDATE_READY", result.error
+        return result.branch_id
+
+    first_id = await verified_branch("source.txt", "first\n")
+    second_id = await verified_branch("source.txt", "second\n")
+    first = fusion.shadow.get_branch(first_id)
+    second = fusion.shadow.get_branch(second_id)
+    assert first is not None and second is not None
+    with pytest.raises(ValueError, match="workspace must be the selected branch workspace"):
+        await fusion.synthesize_from_branch(
+            svc._registry,
+            name="cross_branch_reader",
+            description="must never bind evidence across branches",
+            code="def run(args):\n    return {'ok': True}\n",
+            input_schema={"type": "object", "additionalProperties": False},
+            effects={"READ_LOCAL"},
+            task_id=task_id,
+            validation_cases=[{"args": {}, "expect_output": {"ok": True}}],
+            branch_id=first.id,
+            workspace=second.shadow_workspace,
+        )
+    assert not os.path.exists(os.path.join(ws.root, "cross_branch_reader.py"))
+
+
+async def test_composed_generation_cancellation_keeps_branch_and_reality_clean(fused, monkeypatch):
+    import asyncio
+
+    svc, ws, task_id = fused
+    fusion = FusionOrchestrator(svc)
+    criteria = [
+        {
+            "id": "branch-source",
+            "description": "candidate",
+            "verification": {"type": "file", "path": "cancel.txt"},
+            "required": True,
+        }
+    ]
+    await svc._store_tasks._db.execute(
+        "UPDATE tasks SET acceptance_criteria = ? WHERE id = ?",
+        (json.dumps(criteria), task_id),
+    )
+    experiment = await fusion.run_experiment(
+        task_id=task_id,
+        proposal=[
+            {
+                "capability_id": "fs",
+                "arguments": {
+                    "operation": "write",
+                    "path": "cancel.txt",
+                    "content": "candidate\n",
+                    "create_dirs": True,
+                },
+            }
+        ],
+        profile="autonomous",
+        auto_fork_on_failure=False,
+    )
+    assert experiment.status == "CANDIDATE_READY", experiment.error
+    branch = fusion.shadow.get_branch(experiment.branch_id)
+    assert branch is not None
+    original_validate = svc._synthesis.validate
+
+    async def slow_validate(*args, **kwargs):
+        await asyncio.sleep(3600)
+        return await original_validate(*args, **kwargs)
+
+    monkeypatch.setattr(svc._synthesis, "validate", slow_validate)
+    pending = asyncio.create_task(
+        fusion.synthesize_from_branch(
+            svc._registry,
+            name="cancelled_generator",
+            description="cancellation boundary",
+            code="def run(args):\n    return {'ok': True}\n",
+            input_schema={"type": "object", "additionalProperties": False},
+            effects={"READ_LOCAL"},
+            task_id=task_id,
+            validation_cases=[{"args": {}}],
+            branch_id=branch.id,
+            workspace=branch.shadow_workspace,
+        )
+    )
+    await asyncio.sleep(0)
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert not os.path.exists(os.path.join(ws.root, "cancelled_generator.py"))
+    assert fusion.shadow.get_branch(branch.id) is not None
