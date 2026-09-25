@@ -354,3 +354,55 @@ async def test_recovery_required_task_survives_recovery_pass():
         assert (await store.get("recovery-task"))["status"] == TaskStatus.RECOVERY_REQUIRED.value
     finally:
         await db.close()
+
+
+@pytest.mark.athena_claim("RECOVERY-PROVIDER-STREAM")
+@pytest.mark.athena_evidence("e2e", "crash-restart")
+@pytest.mark.asyncio
+async def test_service_partial_provider_stream_fails_truthfully_without_completion(make_service):
+    """A provider failure after output must not become a successful task."""
+    from athena.protocol.models import ModelDelta, ModelEvent, ModelEventType
+    from athena.protocol.tasks import AgentRequest, AutonomyLevel
+
+    svc = await make_service()
+    provider = svc._model_registry.provider_for("fake")
+
+    async def failing_stream(request):
+        yield ModelEvent(
+            type=ModelEventType.DELTA,
+            request_id=request.request_id,
+            delta=ModelDelta(request_id=request.request_id, text="partial provider output"),
+        )
+        yield ModelEvent(
+            type=ModelEventType.FAILED,
+            request_id=request.request_id,
+            error="provider connection dropped after partial output",
+            code="provider_disconnect",
+        )
+
+    provider.complete = failing_stream
+    task = await svc.submit(
+        AgentRequest(
+            prompt="STREAM_FAILURE provider disconnect", autonomy=AutonomyLevel.AUTONOMOUS
+        ),
+        wait=False,
+    )
+    from asyncio import sleep
+
+    for _ in range(300):
+        status = await svc.get_task_status(task.id)
+        if status in {TaskStatus.FAILED.value, TaskStatus.RECOVERY_REQUIRED.value}:
+            break
+        await sleep(0.02)
+    assert await svc.get_task_status(task.id) in {
+        TaskStatus.FAILED.value,
+        TaskStatus.RECOVERY_REQUIRED.value,
+    }
+    result = await svc.get_result(task.id)
+    assert result is not None
+    assert result.status is not TaskStatus.COMPLETE
+    events = [event async for event in svc.stream_events(task.id)]
+    diagnostics = [event for event in events if event.type == "DiagnosticsProduced"]
+    assert diagnostics
+    assert any("partial provider output" in str(event.payload) for event in diagnostics)
+    assert not any(event.type == "TaskCompleted" for event in events)
