@@ -283,8 +283,7 @@ def _repair_pass(
         return wrapped, wrapped is not args
 
     obj = dict(obj)
-    props: dict = schema.get("properties") or {}
-    required = set(schema.get("required") or [])
+    props, required = _schema_fields(schema)
 
     # Rule 4: explicit alias rename (canonical absent, exactly one alias).
     aliases = BUILTIN_ALIASES.get(ctx.tool_name, {})
@@ -361,6 +360,42 @@ def _repair_pass(
                 ctx.rules.append(f"null_removal:{prop}")
 
     return obj, changed
+
+
+def _schema_fields(schema: Mapping[str, Any]) -> tuple[dict, set[str]]:
+    """Collect fields from composed object schemas for safe boundary repair.
+
+    Capability descriptors commonly express operation-specific ``oneOf``
+    branches.  The top-level document then has no ``properties`` even though
+    a nested branch has a typed field such as ``fs.create_dirs``.  Repair must
+    see those declared fields, but must still revalidate against the original
+    composed schema; this only widens the deterministic repair pass, not the
+    accepted call contract.
+    """
+    props: dict[str, Any] = {}
+    required: set[str] = set(schema.get("required") or ())
+    pending: list[Mapping[str, Any]] = [schema]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        current_props = current.get("properties") or {}
+        for name, spec in current_props.items():
+            if name in props and props[name] != spec:
+                # A field with different branch contracts is not safe to
+                # coerce globally; strict revalidation remains authoritative.
+                props[name] = {}
+            elif name not in props:
+                props[name] = spec
+        required.update(current.get("required") or ())
+        for composition_key in ("oneOf", "anyOf", "allOf"):
+            branches = current.get(composition_key) or ()
+            if isinstance(branches, (list, tuple)):
+                pending.extend(branch for branch in branches if isinstance(branch, Mapping))
+    return props, required
 
 
 def _root_wrap(value, schema: Mapping[str, Any], ctx: _Ctx) -> dict | None:

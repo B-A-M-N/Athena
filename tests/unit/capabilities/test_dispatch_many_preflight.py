@@ -5,6 +5,7 @@ import asyncio
 import pytest
 
 from athena.capabilities.dispatcher import CapabilityDispatcher
+from athena.capabilities.fs import FilesystemCapability
 from athena.capabilities.registry import CapabilityRegistry
 from athena.policy.engine import PolicyEngine
 from athena.protocol.capabilities import (
@@ -124,6 +125,28 @@ def test_preflight_all_valid_batch_executes_everything():
 
 
 @pytest.mark.athena_scenario("COMPAT-006")
+def test_preflight_repairs_nested_fs_operation_schema_before_execution(tmp_path):
+    """A string boolean from a composed fs schema must not abort the batch."""
+    dispatcher, _ = _dispatcher(FilesystemCapability())
+    results = asyncio.run(
+        dispatcher.dispatch_many(
+            [
+                _req(
+                    "fs",
+                    operation="write",
+                    path="result.txt",
+                    content="MUTATION_OK",
+                    create_dirs="false",
+                )
+            ],
+            workspace=WorkspaceSpec(id="w1", root=str(tmp_path)),
+        )
+    )
+    assert len(results) == 1
+    assert results[0].status == CapabilityResultStatus.OK
+    assert (tmp_path / "result.txt").read_text() == "MUTATION_OK"
+
+
 def test_preflight_repaired_arguments_are_used():
     exec_ = _read_exec(
         schema={
