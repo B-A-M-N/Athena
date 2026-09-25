@@ -5,6 +5,7 @@ from athena.evaluation.neutral import (
     EvaluationOutcome,
     NeutralEvaluationHarness,
     compare_outcomes,
+    compare_delegation_outcomes,
 )
 
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "EvaluationOutcome",
     "NeutralEvaluationHarness",
     "compare_outcomes",
+    "compare_delegation_outcomes",
 ]
