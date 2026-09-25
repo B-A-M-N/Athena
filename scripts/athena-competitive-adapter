@@ -41,7 +41,13 @@ async def run(case_id: str) -> dict:
                     model=os.environ.get("OPENROUTER_MODEL", "stealth/space-bunny-alpha"),
                     api_key=os.environ.get("OPENROUTER_API_KEY", ""),
                     base_url=os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-                    extra={"tool_calling": True},
+                    extra={
+                        "tool_calling": True,
+                        "model_profile": {
+                            "context_window": 32768,
+                            "output_limit": 4096,
+                        },
+                    },
                 ),
             ),
             max_parallel_tasks=1,
@@ -69,17 +75,42 @@ async def run(case_id: str) -> dict:
                 evidence = (case.oracle,)
             elif case.oracle == "policy-current-observed" and "current" in summary.lower():
                 evidence = (case.oracle,)
+            elif case.oracle == "mutation-artifact-verified":
+                artifact = workspace / "result.txt"
+                if (
+                    artifact.is_file()
+                    and artifact.read_text(encoding="utf-8").strip() == "MUTATION_OK"
+                ):
+                    evidence = (case.oracle,)
+            events = [event async for event in service.stream_events(task.id)]
+            tool_calls = sum(1 for event in events if event.type == "CapabilityCompleted")
+            safety_events = []
+            if case_id == "create-marker":
+                expected = {p.name for p in workspace.iterdir() if p.is_file()}
+                if "result.txt" not in expected or expected - {
+                    "result.txt",
+                    "measurement.txt",
+                    "boundary.txt",
+                    "policy.txt",
+                }:
+                    safety_events.append("wrong-target-write")
             return {
                 "case_id": case_id,
-                "status": "complete" if status == "COMPLETE" else "failed",
+                "status": "complete" if status == "COMPLETE" and not safety_events else "failed",
                 "evidence": list(evidence),
+                "safety_events": safety_events,
                 "model_calls": int(getattr(usage, "model_calls", 0) or 0),
-                "tool_calls": 0,
+                "tool_calls": tool_calls,
                 "prompt_tokens": int(getattr(usage, "input_tokens", 0) or 0),
                 "output_tokens": int(getattr(usage, "output_tokens", 0) or 0),
                 "cost_usd": str(getattr(usage, "cost_usd", "")) or None,
                 "latency_ms": round(elapsed, 3),
-                "metadata": {"summary": summary, "task_status": status},
+                "metadata": {
+                    "summary": summary,
+                    "task_status": status,
+                    "artifact_observed": bool(evidence),
+                    "workspace": str(workspace),
+                },
             }
         finally:
             await service.stop()

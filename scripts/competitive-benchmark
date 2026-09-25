@@ -116,8 +116,9 @@ async def main_async(args: argparse.Namespace) -> int:
             "evidence_level": "repeated_candidate" if args.repetitions >= 3 else "smoke_only",
             "release_qualified": False,
             "limitation": (
-                "This live read-only comparison is smoke evidence only. It does not qualify "
-                "representative mutations, recovery, tool safety, cost parity, or competitive replacement."
+                "This live comparison is smoke evidence only. It covers read-only cases "
+                "and a sandboxed Athena mutation, but does not qualify representative "
+                "Hermes mutation, recovery, tool safety, cost parity, or competitive replacement."
             ),
         },
     }

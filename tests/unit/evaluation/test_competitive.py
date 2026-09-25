@@ -7,10 +7,11 @@ from athena.evaluation.competitive import (
 
 def test_competitive_cases_have_independent_oracles_and_read_only_boundaries():
     cases = competitive_cases()
-    assert len(cases) == 3
+    assert len(cases) == 4
     assert len({item.case.id for item in cases}) == len(cases)
     assert all(item.oracle in item.case.required_evidence for item in cases)
-    assert all(item.case.metadata["read_only"] is True for item in cases)
+    assert sum(item.case.metadata["read_only"] for item in cases) == 3
+    assert sum(not item.case.metadata["read_only"] for item in cases) == 1
 
 
 def test_comparison_classification_preserves_partial_outcomes():
