@@ -41,7 +41,7 @@ def _adapter(command: str, case: EvaluationCase):
                 check=False,
             )
             if result.returncode:
-                return {
+                record: dict = {
                     "case_id": _case.id,
                     "status": "blocked",
                     "metadata": {
@@ -49,6 +49,13 @@ def _adapter(command: str, case: EvaluationCase):
                         "stderr": result.stderr[-1000:],
                     },
                 }
+                try:
+                    raw = json.loads(result.stdout)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    raw = None
+                if isinstance(raw, dict):
+                    record.update({key: value for key, value in raw.items() if key != "case_id"})
+                return record
             value = json.loads(result.stdout)
             if not isinstance(value, dict):
                 raise ValueError("adapter must emit a JSON object")
