@@ -28,6 +28,7 @@ from athena.protocol.execution import (
     ExecutionEventType,
     ExecutionExitStatus,
     ExecutionRequest,
+    RuntimePersistence,
 )
 from athena.protocol.tasks import NetworkPolicy
 
@@ -219,6 +220,9 @@ class ExecuteCapability:
             runtime=runtime_name,
             source=code,
             task_id=execution_task_id,
+            persistence=(
+                RuntimePersistence.EPHEMERAL if verification_call else RuntimePersistence.PERSISTENT
+            ),
             workspace_id=ws.id,
             backend=ws.execution_backend or "local",
             cwd=cwd,

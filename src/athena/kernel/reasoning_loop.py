@@ -162,6 +162,9 @@ class ReasoningLoop:
                 cancelled=state.cancel.is_set(),
                 completion_mode=compiled.strategy.completion_mode,
                 work_evidence=tuple(state.work_evidence),
+                recovery_pending=bool(
+                    state.generated_recovery_pending or state.speculative_recovery_pending
+                ),
             )
             if decision.terminal:
                 await kernel._append_final_response(task, response)

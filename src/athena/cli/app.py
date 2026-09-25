@@ -23,7 +23,6 @@ Argument parsing prefers ``click`` (optional extra ``cli``) and falls back to
 from __future__ import annotations
 
 import asyncio
-import inspect
 import os
 import shutil
 import sys
@@ -907,21 +906,21 @@ async def _cmd_run(o: Options, service: Any) -> int:
         model_policy=_model_policy(o.model),
         metadata=_criteria_metadata(o),
     )
-    # Readiness remains a service-owned admission boundary. The CLI only
-    # forwards the request and awaits the service's asynchronous contract.
-    admit = getattr(service, "require_agent_ready", None)
-    if callable(admit):
-        try:
-            result = admit(request)
-            if inspect.isawaitable(result):
-                await result
-        except Exception as exc:
-            from athena.protocol.errors import ServiceNotReady
+    # Readiness is owned by service.submit().  The CLI must not call the
+    # async admission coroutine separately, or it probes readiness twice and
+    # can race a provider state change.
+    # Start submission before constructing the surface so service-owned
+    # readiness is the single admission check and no renderer is opened for
+    # work that cannot be admitted.
+    try:
+        task = await service.submit(request, wait=False)
+    except Exception as exc:
+        from athena.protocol.errors import ServiceNotReady
 
-            if isinstance(exc, ServiceNotReady):
-                print(f"athena run: {exc.message}", file=sys.stderr)
-                return 2
-            raise
+        if isinstance(exc, ServiceNotReady):
+            print(f"athena run: {exc.message}", file=sys.stderr)
+            return 2
+        raise
     surface = None
     from athena.cli.chat import _make_surface, _model_label
 
@@ -942,15 +941,6 @@ async def _cmd_run(o: Options, service: Any) -> int:
         # Start streaming before waiting so an interactive approval can wake
         # the parked task. Waiting first deadlocks supervised execution at the
         # service boundary and hides the OI-style operator surface.
-        try:
-            task = await service.submit(request, wait=False)
-        except Exception as exc:
-            from athena.protocol.errors import ServiceNotReady
-
-            if isinstance(exc, ServiceNotReady):
-                surface.render_notice(exc.message, status="NOT_READY")
-                return 2
-            raise
         task_id = getattr(task, "id", task)
         from athena.cli.chat import stream_task
 

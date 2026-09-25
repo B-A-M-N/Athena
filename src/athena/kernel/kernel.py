@@ -240,6 +240,7 @@ class RunState:
     generated_recovery_retried: bool = False
     generated_recovery_retry_status: str = "not_started"
     generated_recovery_retry_error: str | None = None
+    generated_recovery_repair_fingerprints: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         raw_limit = (self.task.metadata or {}).get("speculation_recovery_attempts", 1)
@@ -678,6 +679,9 @@ class AgentKernel:
             metadata.get("generated_recovery_retry_status") or "not_started"
         )
         state.generated_recovery_retry_error = metadata.get("generated_recovery_retry_error")
+        state.generated_recovery_repair_fingerprints = [
+            str(item) for item in (metadata.get("generated_recovery_repair_fingerprints") or ())
+        ][-4:]
         state.generated_recovery_attempts = max(
             0, int(metadata.get("generated_recovery_attempts") or 0)
         )
@@ -1331,13 +1335,19 @@ class AgentKernel:
                     (call for call in calls if call.call_id == result.call_id),
                     None,
                 )
-                await self._record_generated_failure(task, state, result, original_call)
+                recorded = await self._record_generated_failure(task, state, result, original_call)
+                exhausted_recovery = exhausted_recovery or (
+                    recorded and state.generated_recovery_attempts >= state.generated_recovery_limit
+                )
         if exhausted_recovery:
             await self._emit(
                 "SpeculativeRecoveryStopped",
                 {
-                    "reason": "speculative recovery produced another failed candidate",
-                    "attempts": state.speculative_recovery_attempts,
+                    "reason": "bounded recovery produced another failed candidate",
+                    "attempts": max(
+                        state.speculative_recovery_attempts,
+                        state.generated_recovery_attempts,
+                    ),
                 },
                 task,
             )
@@ -1345,7 +1355,7 @@ class AgentKernel:
                 task,
                 state,
                 TaskStatus.FAILED,
-                "speculative recovery produced another failed candidate",
+                "bounded recovery produced another failed candidate",
             )
         await self._observation_dispatch.offer_one(
             task=task,

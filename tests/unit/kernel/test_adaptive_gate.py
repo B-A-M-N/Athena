@@ -103,3 +103,57 @@ def test_nonrecoverable_recovery_failures_do_not_request_more_fusion():
             error=error,
         )
         assert is_nonrecoverable_recovery_failure(result) is True
+
+
+def test_pending_recovery_rejects_no_action_and_repeated_repair():
+    import asyncio
+    from types import SimpleNamespace
+
+    from athena.kernel.recovery_dispatch import RecoveryDispatchMechanism
+    from athena.protocol.messages import CapabilityCallBlock
+
+    async def noop(*args, **kwargs):
+        return None
+
+    mechanism = RecoveryDispatchMechanism(
+        emit=noop,
+        update_metadata=noop,
+        candidate_payload=lambda call: None,
+        failed_fingerprints=lambda records: set(),
+    )
+    state = SimpleNamespace(
+        speculative_recovery_pending=True,
+        speculative_recovery_attempts=0,
+        speculative_recovery_limit=1,
+        speculative_recovery_rejections=0,
+        speculative_failure_records=[{"failed_operation": [{"capability_id": "fs"}]}],
+        generated_recovery_pending=True,
+        generated_recovery_records=[{"target_capability_id": "synth_buggy"}],
+        generated_recovery_attempts=0,
+        generated_recovery_limit=1,
+        generated_recovery_original=None,
+        generated_recovery_retried=False,
+        generated_recovery_repair_fingerprints=[],
+    )
+    assert mechanism.validate_speculative_recovery(state, []) == (
+        "speculative recovery requires a materially different fusion proposal"
+    )
+    task = SimpleNamespace(id="task-recovery")
+    assert asyncio.run(mechanism.validate_generated_recovery(task, state, [])) == (
+        "generated recovery requires a complete repair for the failed capability"
+    )
+    repair = CapabilityCallBlock(
+        call_id="repair-1",
+        capability_id="synthesis",
+        arguments={
+            "operation": "repair",
+            "capability_id": "synth_buggy",
+            "code": "def run(): return 1",
+        },
+    )
+    assert asyncio.run(mechanism.validate_generated_recovery(task, state, [repair])) is None
+    state.generated_recovery_pending = True
+    state.generated_recovery_attempts = 0
+    assert asyncio.run(mechanism.validate_generated_recovery(task, state, [repair])) == (
+        "generated recovery proposal repeats the failed repair"
+    )

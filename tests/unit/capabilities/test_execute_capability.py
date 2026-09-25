@@ -12,6 +12,7 @@ from athena.protocol.execution import (
     ExecutionEvent,
     ExecutionEventType,
     ExecutionExitStatus,
+    RuntimePersistence,
 )
 from athena.protocol.tasks import PathRule, WorkspaceSpec
 
@@ -192,3 +193,77 @@ async def test_system_verification_uses_an_isolated_runtime_identity(tmp_path):
         "verify:task-a:verify-call"
     )
     assert execution.destroyed == ["shell_verify_task"]
+
+
+async def test_normal_execute_requests_persistent_runtime_session(tmp_path):
+    class _Manager:
+        def available_runtimes(self):
+            return ["python"]
+
+        async def stream(self, request, execution_id):
+            self.request = request
+            yield ExecutionEvent(
+                ExecutionEventType.EXITED,
+                execution_id,
+                exit_status=ExecutionExitStatus.EXITED,
+                exit_code=0,
+            )
+
+    manager = _Manager()
+    result = await ExecuteCapability(manager).invoke(
+        CapabilityRequest(
+            capability_id="execute",
+            task_id="task-session",
+            call_id="exec-session",
+            arguments={"language": "python", "code": "x = 1"},
+        ),
+        context=InvocationContext(workspace=WorkspaceSpec(id="repo", root=str(tmp_path))),
+    )
+    assert result.status is CapabilityResultStatus.OK
+    assert manager.request.persistence is RuntimePersistence.PERSISTENT
+    assert manager.request.runtime_session_id is None
+
+
+async def test_verification_execute_is_ephemeral_and_uses_isolated_scope(tmp_path):
+    class _Manager:
+        def available_runtimes(self):
+            return ["python"]
+
+        def is_session_owned_by_task(self, _sid, _task):
+            return True
+
+        async def stream(self, request, execution_id):
+            self.request = request
+            yield ExecutionEvent(
+                ExecutionEventType.STARTED,
+                execution_id,
+                metadata={"runtime_session_id": "python_verify_task_call"},
+            )
+            yield ExecutionEvent(
+                ExecutionEventType.EXITED,
+                execution_id,
+                exit_status=ExecutionExitStatus.EXITED,
+                exit_code=0,
+            )
+
+        async def destroy_session(self, sid):
+            self.destroyed = sid
+
+    manager = _Manager()
+    result = await ExecuteCapability(manager).invoke(
+        CapabilityRequest(
+            capability_id="execute",
+            task_id="task-verify",
+            call_id="verify-1",
+            arguments={"language": "python", "code": "x = 1"},
+        ),
+        context=InvocationContext(
+            workspace=WorkspaceSpec(id="candidate", root=str(tmp_path)),
+            task_id="task-verify",
+            verification_call=True,
+        ),
+    )
+    assert result.status is CapabilityResultStatus.OK
+    assert manager.request.persistence is RuntimePersistence.EPHEMERAL
+    assert manager.request.metadata["__runtime_session_scope"] == "verify:task-verify:verify-1"
+    assert manager.destroyed == "python_verify_task_call"

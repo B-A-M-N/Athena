@@ -22,6 +22,7 @@ from athena.protocol.tasks import (
     WorkClass,
     WorkspaceSpec,
 )
+from athena.strategy import MUTATION, resolve_turn_intent
 from athena.verification import (
     VerificationPlanner,
     proof_subsumes,
@@ -358,11 +359,15 @@ class CandidateVerificationService:
         # policy. Read-only and execution-only tasks without an explicit gate
         # must not acquire unrelated lint/typecheck obligations merely because
         # those binaries happen to be installed on the host.
-        if not (
-            self._requires_independent_proof(task)
-            or changed_resources
-            or any(c.required for c in task.acceptance_criteria)
-        ):
+        # Installed tools are evidence for planning, not acceptance
+        # authority.  Only independent/complex mutation work may acquire a
+        # baseline; read-only, response-only, and execution-only turns do not
+        # inherit lint/typecheck/build obligations merely from the host
+        # profile.
+        mutation_work = (
+            bool(changed_resources) and resolve_turn_intent(task.objective).kind == MUTATION
+        )
+        if not (self._requires_independent_proof(task) or mutation_work):
             return []
         try:
             profile_task = replace(task, workspace=workspace) if workspace is not None else task

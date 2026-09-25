@@ -138,6 +138,7 @@ class TerminationEvaluator:
         completion_mode: str = RESPONSE_ONLY,
         observed_work: bool = False,
         work_evidence: Sequence[WorkEvidence] = (),
+        recovery_pending: bool = False,
     ) -> TerminationDecision:
         # Cancellation is terminal at turn boundary if signalled.
         if cancelled:
@@ -172,6 +173,15 @@ class TerminationEvaluator:
             return TerminationDecision(
                 terminal=False,
                 reason="model did not signal completion",
+            )
+
+        if recovery_pending:
+            return TerminationDecision(
+                terminal=True,
+                reason="recovery is pending but the model proposed no admissible recovery action",
+                status=TaskStatus.RECOVERY_REQUIRED,
+                unresolved=("typed_recovery_action_required",),
+                summary=response_summary(response),
             )
 
         if self._required_child_state is not None:

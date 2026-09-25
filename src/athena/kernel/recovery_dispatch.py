@@ -125,6 +125,9 @@ class RecoveryDispatchMechanism:
                 "generated_recovery": state.generated_recovery_records[-1],
                 "generated_recovery_original": state.generated_recovery_original,
                 "generated_recovery_retried": state.generated_recovery_retried,
+                "generated_recovery_repair_fingerprints": list(
+                    getattr(state, "generated_recovery_repair_fingerprints", ()) or ()
+                ),
             },
         )
         await self._emit(
@@ -156,16 +159,28 @@ class RecoveryDispatchMechanism:
             and str((call.arguments or {}).get("operation") or "") == "repair"
         ]
         if not repair_calls:
-            return None
+            return "generated recovery requires a complete repair for the failed capability"
         if state.generated_recovery_attempts >= state.generated_recovery_limit:
             return "generated recovery budget exhausted"
         target = str(state.generated_recovery_records[-1].get("target_capability_id") or "")
-        if not any(
-            str((call.arguments or {}).get("capability_id") or "") == target
-            and str((call.arguments or {}).get("code") or "").strip()
+        matching = [
+            call
             for call in repair_calls
-        ):
+            if str((call.arguments or {}).get("capability_id") or "") == target
+            and str((call.arguments or {}).get("code") or "").strip()
+        ]
+        if not matching:
             return "generated recovery requires a complete repair for the failed capability"
+        repair_fingerprint = self._fingerprint(
+            {"capability_id": target, "code": str((matching[0].arguments or {}).get("code") or "")}
+        )
+        attempted = set(getattr(state, "generated_recovery_repair_fingerprints", ()) or ())
+        if repair_fingerprint in attempted:
+            return "generated recovery proposal repeats the failed repair"
+        state.generated_recovery_repair_fingerprints = [
+            *sorted(attempted),
+            repair_fingerprint,
+        ][-4:]
         state.generated_recovery_attempts += 1
         state.generated_recovery_pending = False
         await self._update_metadata(
@@ -197,7 +212,7 @@ class RecoveryDispatchMechanism:
             payload for call in calls if (payload := self._candidate_payload(call)) is not None
         ]
         if not candidate_calls:
-            return None
+            return "speculative recovery requires a materially different fusion proposal"
         if state.speculative_recovery_attempts >= state.speculative_recovery_limit:
             return "speculative recovery budget exhausted"
         failed = self._failed_fingerprints(state.speculative_failure_records)

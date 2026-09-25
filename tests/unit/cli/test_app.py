@@ -261,6 +261,8 @@ class _RunService:
 
     async def submit(self, request, *, wait=False):
         del request, wait
+        if not self.ready:
+            raise ModelProviderUnconfigured("No model provider is configured.")
         self.submit_calls += 1
         return SimpleNamespace(id="task-run")
 
@@ -317,15 +319,21 @@ async def test_run_rejects_unconfigured_service_before_constructing_surface(
 
 
 @pytest.mark.asyncio
-async def test_run_awaits_async_readiness_without_warning(monkeypatch, tmp_path):
+async def test_run_uses_service_submit_as_the_only_readiness_boundary(monkeypatch, tmp_path):
     import athena.cli.chat as chat
 
-    monkeypatch.setattr(chat, "_make_surface", lambda **kwargs: _RunSurface())
+    constructed = []
+
+    def make_surface(**kwargs):
+        constructed.append(kwargs)
+        return _RunSurface()
+
+    monkeypatch.setattr(chat, "_make_surface", make_surface)
     service = _RunService()
-    awaited = []
+    calls = []
 
     async def require_agent_ready(request=None):
-        awaited.append(request)
+        calls.append(request)
 
     service.require_agent_ready = require_agent_ready
 
@@ -333,15 +341,13 @@ async def test_run_awaits_async_readiness_without_warning(monkeypatch, tmp_path)
         return SimpleNamespace(summary="done", status=TaskStatus.COMPLETE, usage=None)
 
     monkeypatch.setattr(chat, "stream_task", fake_stream_task)
-    import warnings
-
-    with warnings.catch_warnings(record=True) as captured:
-        warnings.simplefilter("always")
-        code = await _cmd_run(
-            Options(command="run", args=["hello"], workspace=str(tmp_path)),
-            service,
-        )
+    code = await _cmd_run(
+        Options(command="run", args=["hello"], workspace=str(tmp_path)),
+        service,
+    )
 
     assert code == 0
-    assert len(awaited) == 1
-    assert not any(item.category is RuntimeWarning for item in captured)
+    assert service.submit_calls == 1
+    # The CLI does not invoke readiness itself; TaskAPI.submit owns that call.
+    assert calls == []
+    assert constructed

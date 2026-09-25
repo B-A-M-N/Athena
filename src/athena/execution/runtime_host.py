@@ -457,9 +457,12 @@ class SupervisedLocalBackend(ExecutionBackend):
         workspace_root=None,
         network_policy=None,
         resource_limits=None,
+        session_id=None,
     ):
         await self.supervisor.start()
-        session_id = f"local-host:{task_id}:{runtime}:{secrets.token_hex(8)}"
+        session_id = str(session_id or f"local-host:{task_id}:{runtime}:{secrets.token_hex(8)}")
+        if session_id in self._sessions:
+            return session_id
         await self._request(
             {
                 "op": "create",
@@ -494,6 +497,24 @@ class SupervisedLocalBackend(ExecutionBackend):
         await self.supervisor.start()
         session_id = str(request.runtime_session_id or "")
         if not session_id:
+            scope = str(request.metadata.get("__runtime_session_scope") or "")
+            identity = json.dumps(
+                {
+                    "task_id": request.task_id,
+                    "runtime": request.runtime,
+                    "scope": scope,
+                    "cwd": request.cwd,
+                    "workspace_root": request.workspace_root,
+                    "env": dict(request.env),
+                    "network_policy": getattr(
+                        request.network_policy, "value", request.network_policy
+                    ),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+            session_id = f"local-host:{request.task_id}:{request.runtime}:{digest}"
             session_id = await self.create_session(
                 task_id=request.task_id,
                 runtime=request.runtime,
@@ -502,6 +523,7 @@ class SupervisedLocalBackend(ExecutionBackend):
                 workspace_root=request.workspace_root,
                 network_policy=request.network_policy,
                 resource_limits=request.resource_limits,
+                session_id=session_id,
             )
             request = replace(request, runtime_session_id=session_id)
         elif session_id not in self._sessions:
