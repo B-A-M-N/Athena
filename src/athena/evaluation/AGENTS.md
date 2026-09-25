@@ -17,3 +17,8 @@ This package provides neutral comparison corpora, fixed cases, and deterministic
 ### Skill Selection Evaluation
 
 - `skill_selection.py` owns held-out paraphrase/adversarial fixtures and outcome comparison; it does not activate skills or alter selection policy.
+
+### Competitive Comparison
+
+- `competitive.py` owns the fixed Athena/Hermes corpus, independent read-only oracles, and outcome classification; it does not activate capabilities or certify release readiness.
+- `scripts/competitive-benchmark` records smoke or repeated-candidate evidence only. `release_qualified` remains false until representative mutation, recovery, safety, and cost comparisons are present.

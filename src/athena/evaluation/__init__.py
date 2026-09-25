@@ -1,6 +1,12 @@
 """Neutral, outcome-oriented evaluation primitives."""
 
 from athena.evaluation.benchmark import benchmark_environment, run_fixed_corpus_benchmark
+from athena.evaluation.competitive import (
+    CompetitiveCase,
+    classify_comparison,
+    competitive_cases,
+    outcome_from_competitive_record,
+)
 from athena.evaluation.neutral import (
     EvaluationCase,
     EvaluationOutcome,
@@ -23,4 +29,8 @@ __all__ = [
     "run_fixed_corpus_benchmark",
     "ProviderParityObservation",
     "compare_provider_parity",
+    "CompetitiveCase",
+    "classify_comparison",
+    "competitive_cases",
+    "outcome_from_competitive_record",
 ]

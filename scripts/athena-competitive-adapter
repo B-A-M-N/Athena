@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""Run one neutral comparison case through a real Athena service."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "src"))
+
+from athena.evaluation.competitive import competitive_cases  # noqa: E402
+from athena.protocol.tasks import AgentRequest, AutonomyLevel  # noqa: E402
+from athena.service.config import AthenaConfig, ProviderConfig  # noqa: E402
+from athena.service.service import AthenaService  # noqa: E402
+
+
+async def run(case_id: str) -> dict:
+    case = next((item for item in competitive_cases() if item.case.id == case_id), None)
+    if case is None:
+        return {"case_id": case_id, "status": "failed", "error": "unknown competitive case"}
+    with tempfile.TemporaryDirectory(prefix="athena-competitive-") as temp:
+        workspace = Path(temp) / "workspace"
+        workspace.mkdir()
+        (workspace / "measurement.txt").write_text("sample_count=41\n", encoding="utf-8")
+        (workspace / "boundary.txt").write_text("BOUNDARY_MARKER=present\n", encoding="utf-8")
+        (workspace / "policy.txt").write_text("effective_policy=current\n", encoding="utf-8")
+        config = AthenaConfig(
+            db_path=str(Path(temp) / "athena.db"),
+            workspace_root=str(workspace),
+            artifact_root=str(Path(temp) / "artifacts"),
+            providers=(
+                ProviderConfig(
+                    kind="openai-compat",
+                    name="openrouter",
+                    model=os.environ.get("OPENROUTER_MODEL", "stealth/space-bunny-alpha"),
+                    api_key=os.environ.get("OPENROUTER_API_KEY", ""),
+                    base_url=os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+                    extra={"tool_calling": True},
+                ),
+            ),
+            max_parallel_tasks=1,
+        )
+        service = AthenaService(config=config)
+        await service.start()
+        started = time.perf_counter()
+        try:
+            task = await service.submit(
+                AgentRequest(
+                    prompt=case.case.prompt,
+                    autonomy=AutonomyLevel.AUTONOMOUS,
+                ),
+                wait=True,
+            )
+            elapsed = (time.perf_counter() - started) * 1000
+            result = await service.get_result(task.id)
+            status = await service.get_task_status(task.id)
+            usage = getattr(result, "usage", None)
+            summary = str(getattr(result, "summary", "") or "")
+            evidence = ()
+            if case.oracle == "sample-count-observed" and "41" in summary:
+                evidence = (case.oracle,)
+            elif case.oracle == "boundary-marker-observed" and "present" in summary.lower():
+                evidence = (case.oracle,)
+            elif case.oracle == "policy-current-observed" and "current" in summary.lower():
+                evidence = (case.oracle,)
+            return {
+                "case_id": case_id,
+                "status": "complete" if status == "COMPLETE" else "failed",
+                "evidence": list(evidence),
+                "model_calls": int(getattr(usage, "model_calls", 0) or 0),
+                "tool_calls": 0,
+                "prompt_tokens": int(getattr(usage, "input_tokens", 0) or 0),
+                "output_tokens": int(getattr(usage, "output_tokens", 0) or 0),
+                "cost_usd": str(getattr(usage, "cost_usd", "")) or None,
+                "latency_ms": round(elapsed, 3),
+                "metadata": {"summary": summary, "task_status": status},
+            }
+        finally:
+            await service.stop()
+
+
+def main() -> int:
+    payload = json.loads(sys.stdin.readline() or "{}")
+    record = asyncio.run(run(str(payload.get("case_id") or "")))
+    print(json.dumps(record, sort_keys=True))
+    return 0 if record.get("status") == "complete" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""Run the fixed Athena/Hermes comparison corpus with explicit oracles."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hashlib
+import json
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+import time
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "src"))
+from athena.evaluation.competitive import classify_comparison, competitive_cases  # noqa: E402
+from athena.evaluation.neutral import EvaluationCase, NeutralEvaluationHarness  # noqa: E402
+
+
+def _adapter(command: str, case: EvaluationCase):
+    argv = shlex.split(command)
+
+    def invoke(_case: EvaluationCase) -> dict:
+        payload = {
+            "case_id": _case.id,
+            "prompt": _case.prompt,
+            "required_evidence": list(_case.required_evidence),
+            "forbidden_safety_events": list(_case.forbidden_safety_events),
+            "metadata": dict(_case.metadata),
+        }
+        started = time.perf_counter()
+        try:
+            result = subprocess.run(
+                argv,
+                input=json.dumps(payload) + "\n",
+                text=True,
+                capture_output=True,
+                timeout=600,
+                check=False,
+            )
+            if result.returncode:
+                return {
+                    "case_id": _case.id,
+                    "status": "blocked",
+                    "metadata": {
+                        "adapter_returncode": result.returncode,
+                        "stderr": result.stderr[-1000:],
+                    },
+                }
+            value = json.loads(result.stdout)
+            if not isinstance(value, dict):
+                raise ValueError("adapter must emit a JSON object")
+            return value
+        except (
+            OSError,
+            subprocess.TimeoutExpired,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
+            return {
+                "case_id": _case.id,
+                "status": "blocked",
+                "metadata": {
+                    "error": str(exc),
+                    "wall_clock_ms": (time.perf_counter() - started) * 1000,
+                },
+            }
+
+    return invoke
+
+
+async def main_async(args: argparse.Namespace) -> int:
+    cases = competitive_cases()
+    reports = []
+    for repetition in range(1, args.repetitions + 1):
+        for item in cases:
+            started = time.perf_counter()
+            report = await NeutralEvaluationHarness().run(
+                [item.case],
+                {
+                    "athena": _adapter(args.athena_adapter, item.case),
+                    "hermes": _adapter(args.hermes_adapter, item.case),
+                },
+            )
+            systems = report["cases"][0]["systems"]
+            reports.append(
+                {
+                    "repetition": repetition,
+                    "case": item.case.id,
+                    "oracle": item.oracle,
+                    "systems": systems,
+                    "classification": classify_comparison(systems),
+                    "elapsed_ms": (time.perf_counter() - started) * 1000,
+                }
+            )
+    artifact = {
+        "schema": "athena.competitive-benchmark.v1",
+        "corpus": [item.case.id for item in cases],
+        "adapters": {"athena": args.athena_adapter, "hermes": args.hermes_adapter},
+        "cases": reports,
+        "comparison": {
+            "matched_case_count": len(cases),
+            "repetitions": args.repetitions,
+            "both_complete": sum(
+                1 for item in reports if item["classification"] == "both_complete"
+            ),
+            "classifications": {
+                classification: sum(
+                    1 for item in reports if item["classification"] == classification
+                )
+                for classification in sorted({item["classification"] for item in reports})
+            },
+            "evidence_level": "repeated_candidate" if args.repetitions >= 3 else "smoke_only",
+            "release_qualified": False,
+            "limitation": (
+                "This live read-only comparison is smoke evidence only. It does not qualify "
+                "representative mutations, recovery, tool safety, cost parity, or competitive replacement."
+            ),
+        },
+    }
+    artifact["artifact_sha256"] = hashlib.sha256(
+        json.dumps(reports, sort_keys=True).encode()
+    ).hexdigest()
+    args.output.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(json.dumps(artifact, sort_keys=True))
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--athena-adapter", required=True)
+    parser.add_argument("--hermes-adapter", required=True)
+    parser.add_argument("--output", type=Path, default=Path("competitive-benchmark.json"))
+    parser.add_argument("--repetitions", type=int, default=1)
+    args = parser.parse_args()
+    if args.repetitions < 1 or args.repetitions > 16:
+        parser.error("--repetitions must be between 1 and 16")
+    return asyncio.run(main_async(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""Run one competitive comparison case through a disposable Hermes runtime."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+ROOT = Path(__file__).resolve().parent.parent
+ORACLES = {
+    "read-measurement": "sample-count-observed",
+    "read-boundary": "boundary-marker-observed",
+    "contradiction-check": "policy-current-observed",
+}
+
+
+def _fixture(root: Path, case_id: str) -> None:
+    (root / "measurement.txt").write_text("sample_count=41\n", encoding="utf-8")
+    (root / "boundary.txt").write_text("BOUNDARY_MARKER=present\n", encoding="utf-8")
+    (root / "policy.txt").write_text("effective_policy=current\n", encoding="utf-8")
+
+
+def main() -> int:
+    payload = json.loads(sys.stdin.readline() or "{}")
+    case_id = str(payload.get("case_id") or "")
+    prompt = str(payload.get("prompt") or "")
+    oracle = ORACLES.get(case_id)
+    hermes_bin = os.environ.get("HERMES_BIN") or shutil.which("hermes")
+    if not oracle or not hermes_bin or not os.environ.get("OPENROUTER_API_KEY"):
+        print(
+            json.dumps(
+                {
+                    "case_id": case_id,
+                    "status": "blocked",
+                    "metadata": {"reason": "fixture, Hermes, or OpenRouter unavailable"},
+                }
+            )
+        )
+        return 0
+    with tempfile.TemporaryDirectory(prefix="hermes-competitive-") as temp:
+        root = Path(temp) / "workspace"
+        home = Path(temp) / "hermes-home"
+        root.mkdir()
+        home.mkdir()
+        _fixture(root, case_id)
+        usage_path = Path(temp) / "usage.json"
+        env = dict(os.environ)
+        env["HERMES_HOME"] = str(home)
+        env["TERMINAL_CWD"] = str(root)
+        command = [
+            hermes_bin,
+            "--safe-mode",
+            "--ignore-rules",
+            "--oneshot",
+            prompt,
+            "--model",
+            os.environ.get("OPENROUTER_MODEL", "stealth/space-bunny-alpha"),
+            "--provider",
+            "openrouter",
+            "--toolsets",
+            "file",
+            "--usage-file",
+            str(usage_path),
+            "--in",
+            str(root),
+        ]
+        started = time.perf_counter()
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=root,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=float(os.environ.get("ATHENA_COMPETITIVE_TIMEOUT", "300")),
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(
+                json.dumps(
+                    {
+                        "case_id": case_id,
+                        "status": "blocked",
+                        "metadata": {"reason": type(exc).__name__},
+                    }
+                )
+            )
+            return 0
+        latency_ms = (time.perf_counter() - started) * 1000
+        output = completed.stdout.strip()
+        try:
+            usage = (
+                json.loads(usage_path.read_text(encoding="utf-8")) if usage_path.exists() else {}
+            )
+        except (OSError, ValueError):
+            usage = {}
+        evidence = []
+        if completed.returncode == 0:
+            expected_text = {
+                "sample-count-observed": "41",
+                "boundary-marker-observed": "present",
+                "policy-current-observed": "current",
+            }[oracle]
+            if expected_text in output.casefold():
+                evidence.append(oracle)
+        record = {
+            "case_id": case_id,
+            "status": "complete" if completed.returncode == 0 and evidence else "failed",
+            "evidence": evidence,
+            "model_calls": int(usage.get("api_calls") or 0),
+            "tool_calls": 0,
+            "prompt_tokens": int(usage.get("input_tokens") or 0),
+            "output_tokens": int(usage.get("output_tokens") or 0),
+            "cost_usd": usage.get("estimated_cost_usd")
+            if usage.get("cost_status") == "known"
+            else None,
+            "latency_ms": round(latency_ms, 3),
+            "metadata": {
+                "output": output[-4000:],
+                "stderr": completed.stderr[-1000:],
+                "model": usage.get("model"),
+                "provider": usage.get("provider"),
+                "cache_read_tokens": usage.get("cache_read_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
+            },
+        }
+        print(json.dumps(record, sort_keys=True))
+        return 0 if record["status"] == "complete" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
