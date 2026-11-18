@@ -837,9 +837,7 @@ class AgentRequest:
 
     requested_capabilities: frozenset[str] | None = None
 
-    metadata: Mapping[str, JSONValue] = field(
-        default_factory=dict
-    )
+    metadata: Mapping[str, JSONValue] = field(default_factory=dict)
 ```
 
 `AgentRequest` is an interface-level object.
@@ -1208,23 +1206,19 @@ fanout is forbidden.
 
 ```python
 class ModelProvider(Protocol):
-
     async def list_models(
         self,
-    ) -> Sequence[ModelInfo]:
-        ...
+    ) -> Sequence[ModelInfo]: ...
 
     async def complete(
         self,
         request: ModelRequest,
-    ) -> AsyncIterator[ModelEvent]:
-        ...
+    ) -> AsyncIterator[ModelEvent]: ...
 
     async def cancel(
         self,
         request_id: str,
-    ) -> None:
-        ...
+    ) -> None: ...
 ```
 
 Streaming is the canonical API.
@@ -1693,11 +1687,7 @@ File modification SHOULD support expected content hashes.
 Example:
 
 ```python
-PatchFile(
-    path="src/main.py",
-    expected_sha256="abc123...",
-    patch="..."
-)
+PatchFile(path="src/main.py", expected_sha256="abc123...", patch="...")
 ```
 
 Mismatch:
@@ -1803,30 +1793,25 @@ Use `runtime`, not `language`.
 
 ```python
 class Runtime(Protocol):
-
     async def execute(
         self,
         request: ExecutionRequest,
-    ) -> AsyncIterator[ExecutionEvent]:
-        ...
+    ) -> AsyncIterator[ExecutionEvent]: ...
 
     async def interrupt(
         self,
         execution_id: str,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     async def reset(
         self,
         runtime_session_id: str,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     async def close(
         self,
         runtime_session_id: str,
-    ) -> None:
-        ...
+    ) -> None: ...
 ```
 
 ---

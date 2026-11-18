@@ -198,7 +198,7 @@ class _PSSession:
                 raise BrokenPipeError("PowerShell stdin is unavailable")
             process.stdin.write(wrapped + "\n")
             process.stdin.flush()
-        except Exception:  # rationale: worker I/O loss is converted to an observable execution event
+        except Exception:  # rationale: worker I/O loss becomes an ExecutionEvent
             yield ExecutionEvent(
                 type=ExecutionEventType.STDERR,
                 execution_id=execution_id,

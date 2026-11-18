@@ -40,8 +40,10 @@ def main() -> int:
         # DAGOAL reference, so chroma alone cannot distinguish foreground
         # from the dark field. Keep the chromatic threshold for colored
         # telemetry while admitting bright neutral phosphor cells.
-        return alpha > 180 and max(red, green, blue) > 90 and (
-            channel_range > 18 or max(red, green, blue) > 150
+        return (
+            alpha > 180
+            and max(red, green, blue) > 90
+            and (channel_range > 18 or max(red, green, blue) > 150)
         )
 
     lit_count = sum(lit(x, y) for y in range(HEIGHT) for x in range(WIDTH))
@@ -54,16 +56,8 @@ def main() -> int:
 
     # Buddy is a recognizable actor in the world lane, not the dominant
     # foreground. Bound its occupancy as well as requiring a real silhouette.
-    actor_rows = {
-        y
-        for y in range(148, 244)
-        if sum(lit(x, y) for x in range(230, 350)) >= 2
-    }
-    actor_columns = {
-        x
-        for x in range(230, 350)
-        if sum(lit(x, y) for y in range(148, 244)) >= 2
-    }
+    actor_rows = {y for y in range(148, 244) if sum(lit(x, y) for x in range(230, 350)) >= 2}
+    actor_columns = {x for x in range(230, 350) if sum(lit(x, y) for y in range(148, 244)) >= 2}
     if len(actor_rows) < 18 or len(actor_columns) < 18:
         fail(
             "world actor does not have a recognizable bounded matrix footprint "
@@ -115,8 +109,12 @@ def main() -> int:
             return False
         if abs(top_start - bottom_start) > 12 or abs(top_end - bottom_end) > 12:
             return False
-        left_band = range(max(0, min(top_start, bottom_start) - 8), min(WIDTH, max(top_start, bottom_start) + 4))
-        right_band = range(max(0, min(top_end, bottom_end) - 4), min(WIDTH, max(top_end, bottom_end) + 9))
+        left_band = range(
+            max(0, min(top_start, bottom_start) - 8), min(WIDTH, max(top_start, bottom_start) + 4)
+        )
+        right_band = range(
+            max(0, min(top_end, bottom_end) - 4), min(WIDTH, max(top_end, bottom_end) + 9)
+        )
         middle_rows = range(top + 3, bottom - 2)
         left_support = sum(any(lit(x, y) for x in left_band) for y in middle_rows)
         right_support = sum(any(lit(x, y) for x in right_band) for y in middle_rows)

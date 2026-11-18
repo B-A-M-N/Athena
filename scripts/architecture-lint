@@ -1311,6 +1311,19 @@ def _budget_widening_hits(
                 )
             )
     for key in sorted(set(waivers) - seen):
+        family, module = key
+        waiver = waivers[key]
+        if current[family].get(module) == waiver.get("new_budget"):
+            hits.append(
+                Hit(
+                    "architecture-size-baseline",
+                    ARCHITECTURE_DEBT_WAIVERS,
+                    1,
+                    f"waived {family}/{module}: {waiver.get('old_budget')} -> {waiver.get('new_budget')}",
+                    "info",
+                )
+            )
+            continue
         hits.append(
             Hit(
                 "architecture-size-baseline",

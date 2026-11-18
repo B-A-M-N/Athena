@@ -90,14 +90,14 @@ def build_data() -> DemoData:
     source_validation = GeneratedSourceValidator().validate(
         generated_code, tier=ValidationTier.TASK
     )
-    source_checks = tuple(
-        f"{check.name}:{check.status}" for check in source_validation.checks
-    )
+    source_checks = tuple(f"{check.name}:{check.status}" for check in source_validation.checks)
 
-    output_schema = _schema_for_values([
-        {"files_checked": 601, "violations": 17},
-        {"files_checked": 412, "violations": 0},
-    ])
+    output_schema = _schema_for_values(
+        [
+            {"files_checked": 601, "violations": 17},
+            {"files_checked": 412, "violations": 0},
+        ]
+    )
 
     raw_arguments = '{"files": ["src/athena"], "mode": "strict"}'
     candidate = ToolCallCandidate.parse(
@@ -133,26 +133,32 @@ def build_data() -> DemoData:
         arguments=repaired,
         candidate=candidate,
     )
-    accumulator.ingest(ModelEvent(
-        type=ModelEventType.DELTA,
-        request_id=request.request_id,
-        delta=ModelDelta(request_id=request.request_id, text="I found a repeatable check."),
-    ))
-    accumulator.ingest(ModelEvent(
-        type=ModelEventType.DELTA,
-        request_id=request.request_id,
-        delta=ModelDelta(request_id=request.request_id, block=call),
-    ))
-    accumulator.ingest(ModelEvent(
-        type=ModelEventType.DONE,
-        request_id=request.request_id,
-        response=ModelResponse(
+    accumulator.ingest(
+        ModelEvent(
+            type=ModelEventType.DELTA,
             request_id=request.request_id,
-            model=request.model,
-            provider=request.provider,
-            blocks=(TextBlock(type="text", text="I found a repeatable check."),),
-        ),
-    ))
+            delta=ModelDelta(request_id=request.request_id, text="I found a repeatable check."),
+        )
+    )
+    accumulator.ingest(
+        ModelEvent(
+            type=ModelEventType.DELTA,
+            request_id=request.request_id,
+            delta=ModelDelta(request_id=request.request_id, block=call),
+        )
+    )
+    accumulator.ingest(
+        ModelEvent(
+            type=ModelEventType.DONE,
+            request_id=request.request_id,
+            response=ModelResponse(
+                request_id=request.request_id,
+                model=request.model,
+                provider=request.provider,
+                blocks=(TextBlock(type="text", text="I found a repeatable check."),),
+            ),
+        )
+    )
     response = accumulator.finish()
 
     content = b"official manifest rule: every release artifact must be verified"
@@ -196,9 +202,7 @@ def _clip(value: object, width: int) -> str:
 
 def _schema_summary(schema: dict) -> str:
     properties = schema.get("properties", {})
-    fields = ", ".join(
-        f"{name}:{spec.get('type', 'union')}" for name, spec in properties.items()
-    )
+    fields = ", ".join(f"{name}:{spec.get('type', 'union')}" for name, spec in properties.items())
     return "{" + fields + "}"
 
 
@@ -257,7 +261,12 @@ def build_scenes(data: DemoData) -> list[SceneScript]:
             appended_right=[
                 ("Source", "primary / artifact-backed"),
                 ("Evidence", _clip(data.evidence.extracted_claim, 30)),
-                ("Hash", ((data.source.content_hash or "")[:16] + "...") if data.source.content_hash else "(no-hash)"),
+                (
+                    "Hash",
+                    ((data.source.content_hash or "")[:16] + "...")
+                    if data.source.content_hash
+                    else "(no-hash)",
+                ),
             ],
             progress=6,
         ),
@@ -373,17 +382,23 @@ def _event(event_type: str, payload: dict[str, Any] | None = None):
 def _model_turn(text: str) -> list[Any]:
     """Return the real model boundary events for one explanatory turn."""
     return [
-        _event("ModelRequestStarted", {
-            "provider": "fake",
-            "model": "fake-1",
-            "role": "primary",
-        }),
+        _event(
+            "ModelRequestStarted",
+            {
+                "provider": "fake",
+                "model": "fake-1",
+                "role": "primary",
+            },
+        ),
         _event("ModelDelta", {"text": text}),
-        _event("ModelResponseCompleted", {
-            "provider": "fake",
-            "model": "fake-1",
-            "role": "primary",
-        }),
+        _event(
+            "ModelResponseCompleted",
+            {
+                "provider": "fake",
+                "model": "fake-1",
+                "role": "primary",
+            },
+        ),
     ]
 
 
@@ -399,20 +414,29 @@ def _capability_turn(
     call_id = call_id or "demo-" + capability_id.replace(".", "-")
     execution_id = call_id + "-exec"
     return [
-        _event("CapabilityRequested", {
-            "call_id": call_id,
-            "capability_id": capability_id,
-            "arguments": arguments,
-        }),
+        _event(
+            "CapabilityRequested",
+            {
+                "call_id": call_id,
+                "capability_id": capability_id,
+                "arguments": arguments,
+            },
+        ),
         _event("CapabilityStarted", {"call_id": call_id, "capability_id": capability_id}),
-        _event("ExecutionStarted", {"call_id": call_id, "execution_id": execution_id, "runtime": runtime}),
+        _event(
+            "ExecutionStarted",
+            {"call_id": call_id, "execution_id": execution_id, "runtime": runtime},
+        ),
         _event("StdoutChunk", {"execution_id": execution_id, "data": output}),
-        _event("ExecutionExited", {
-            "execution_id": execution_id,
-            "runtime": runtime,
-            "exit_status": "success",
-            "exit_code": 0,
-        }),
+        _event(
+            "ExecutionExited",
+            {
+                "execution_id": execution_id,
+                "runtime": runtime,
+                "exit_status": "success",
+                "exit_code": 0,
+            },
+        ),
         _event("CapabilityCompleted", {"call_id": call_id, "capability_id": capability_id}),
     ]
 
@@ -455,10 +479,13 @@ def _events_for_stage(stage: int, data: DemoData) -> list[Any]:
                 {"operation": "snapshot", "uri": "artifact://sha256/demo-manifest"},
                 f"source: {data.source.title}\nevidence: {data.evidence.extracted_claim}\n",
             ),
-            _event("ArtifactCreated", {
-                "name": "demo-manifest",
-                "uri": "artifact://sha256/demo-manifest",
-            }),
+            _event(
+                "ArtifactCreated",
+                {
+                    "name": "demo-manifest",
+                    "uri": "artifact://sha256/demo-manifest",
+                },
+            ),
         ]
     if stage == 4:
         return [
@@ -508,18 +535,24 @@ def _events_for_stage(stage: int, data: DemoData) -> list[Any]:
                 "The helper requests execution under inherited task authority; "
                 "this action needs your approval."
             ),
-            _event("ApprovalRequested", {
-                "call_id": "demo-execute",
-                "approval_id": "demo-approval-01",
-                "capability_id": "execute",
-                "scopes": ["call", "task", "session"],
-                "reason": "execution can change the local workspace",
-            }),
-            _event("ApprovalResolved", {
-                "approval_id": "demo-approval-01",
-                "decision": "approved",
-                "scope": "task",
-            }),
+            _event(
+                "ApprovalRequested",
+                {
+                    "call_id": "demo-execute",
+                    "approval_id": "demo-approval-01",
+                    "capability_id": "execute",
+                    "scopes": ["call", "task", "session"],
+                    "reason": "execution can change the local workspace",
+                },
+            ),
+            _event(
+                "ApprovalResolved",
+                {
+                    "approval_id": "demo-approval-01",
+                    "decision": "approved",
+                    "scope": "task",
+                },
+            ),
             *_capability_turn(
                 "execute",
                 {"language": "python", "code": "verify_manifest(paths)"},
@@ -529,10 +562,7 @@ def _events_for_stage(stage: int, data: DemoData) -> list[Any]:
         ]
     if stage == 8:
         return [
-            *_model_turn(
-                "Execution produced a structured observation, not just a "
-                "narrated claim."
-            ),
+            *_model_turn("Execution produced a structured observation, not just a narrated claim."),
             *_capability_turn(
                 "worldstate.record",
                 {"operation": "record", "claim": "release artifacts require verification"},
@@ -609,21 +639,31 @@ def emit_fixture(scenes: list[SceneScript], path: str) -> None:
     contract: the event sequence is the input to the production CLI surface.
     """
     with open(path, "w", encoding="utf-8") as handle:
-        handle.write(json.dumps({
-            "kind": "demo_meta",
-            "schema": "athena.capability_fabric.scene/v1",
-            "scene_count": len(scenes),
-        }) + "\n")
+        handle.write(
+            json.dumps(
+                {
+                    "kind": "demo_meta",
+                    "schema": "athena.capability_fabric.scene/v1",
+                    "scene_count": len(scenes),
+                }
+            )
+            + "\n"
+        )
         for index, scene in enumerate(scenes, start=1):
-            handle.write(json.dumps({
-                "kind": "scene",
-                "stage": index,
-                "title": scene.title,
-                "status": scene.status,
-                "progress": scene.progress,
-                "appended_events": [list(item) for item in scene.appended_events],
-                "appended_right": [list(item) for item in scene.appended_right],
-            }) + "\n")
+            handle.write(
+                json.dumps(
+                    {
+                        "kind": "scene",
+                        "stage": index,
+                        "title": scene.title,
+                        "status": scene.status,
+                        "progress": scene.progress,
+                        "appended_events": [list(item) for item in scene.appended_events],
+                        "appended_right": [list(item) for item in scene.appended_right],
+                    }
+                )
+                + "\n"
+            )
 
 
 def run_replay(scenes: list[SceneScript], data: DemoData, *, speed: float, source: str) -> None:
@@ -635,13 +675,15 @@ def run_replay(scenes: list[SceneScript], data: DemoData, *, speed: float, sourc
             continue
         if kind != "scene":
             continue
-        replay_scenes.append(SceneScript(
-            title=record["title"],
-            status=record["status"],
-            appended_events=[tuple(item) for item in record.get("appended_events", [])],
-            appended_right=[tuple(item) for item in record.get("appended_right", [])],
-            progress=int(record.get("progress", 0)),
-        ))
+        replay_scenes.append(
+            SceneScript(
+                title=record["title"],
+                status=record["status"],
+                appended_events=[tuple(item) for item in record.get("appended_events", [])],
+                appended_right=[tuple(item) for item in record.get("appended_right", [])],
+                progress=int(record.get("progress", 0)),
+            )
+        )
     asyncio.run(_run_surface(replay_scenes or scenes, data, speed=speed))
 
 

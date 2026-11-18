@@ -243,7 +243,7 @@ deferred visual work; they are not release claims.
 ```python
 # Add near line 762 (class-level constants):
 PANE_GAP = 3
-BEZEL_MARGIN = 1     # ← NEW: extra 1-cell relief inside outer chassis box
+BEZEL_MARGIN = 1  # ← NEW: extra 1-cell relief inside outer chassis box
 _REPAINT_INTERVAL = 0.04
 ```
 
@@ -260,30 +260,36 @@ In `_frame_lines()`, replace the existing top/bottom/cabinet_row section (lines 
 # lines[op_y + op_h - 1] = self._fit(bottom, cols)
 
 # --- REPLACE WITH ---
-bezel_m  = self.BEZEL_MARGIN
-outer_w  = left_w + len(seam_fill) + right_w + 2 + (bezel_m * 2)
+bezel_m = self.BEZEL_MARGIN
+outer_w = left_w + len(seam_fill) + right_w + 2 + (bezel_m * 2)
 bezel_gutter = " " * bezel_m
 
 # Outer chassis box uses heavy double-line chars for the physical cabinet look:
-bezel_top    = prefix + "╔" + "═" * outer_w + "╗"
+bezel_top = prefix + "╔" + "═" * outer_w + "╗"
 bezel_bottom = prefix + "╚" + "═" * outer_w + "╝"
 
+
 def chassis_row(left_value: str, right_value: str) -> str:
-    left_panel  = "▐" + self._fit(left_value,  op_inner_w) + "▌"
+    left_panel = "▐" + self._fit(left_value, op_inner_w) + "▌"
     right_panel = "▐" + self._fit(right_value, oi_inner_w) + "▌"
     return prefix + "║" + bezel_gutter + left_panel + seam_fill + right_panel + bezel_gutter + "║"
 
+
 # Per-aperture inner rim rows (top):
-left_rim_top  = "╓" + "─" * op_inner_w + "╖"
+left_rim_top = "╓" + "─" * op_inner_w + "╖"
 right_rim_top = "╓" + "─" * oi_inner_w + "╖"
-rim_top_row   = prefix + "║" + bezel_gutter + left_rim_top + seam_fill + right_rim_top + bezel_gutter + "║"
+rim_top_row = (
+    prefix + "║" + bezel_gutter + left_rim_top + seam_fill + right_rim_top + bezel_gutter + "║"
+)
 
 # Per-aperture inner rim rows (bottom):
-left_rim_bot  = "╙" + "─" * op_inner_w + "╜"
+left_rim_bot = "╙" + "─" * op_inner_w + "╜"
 right_rim_bot = "╙" + "─" * oi_inner_w + "╜"
-rim_bot_row   = prefix + "║" + bezel_gutter + left_rim_bot + seam_fill + right_rim_bot + bezel_gutter + "║"
+rim_bot_row = (
+    prefix + "║" + bezel_gutter + left_rim_bot + seam_fill + right_rim_bot + bezel_gutter + "║"
+)
 
-lines[op_y]     = self._fit(bezel_top, cols)
+lines[op_y] = self._fit(bezel_top, cols)
 lines[op_y + 1] = self._fit(rim_top_row, cols)
 lines[op_y + 2] = self._fit(chassis_row(left_title, right_title), cols)
 
@@ -293,13 +299,13 @@ for index in range(content_h):
     row = op_y + 3 + index
     lines[row] = self._fit(
         chassis_row(
-            left[index]  if index < len(left)  else "",
+            left[index] if index < len(left) else "",
             right[index] if index < len(right) else "",
         ),
         cols,
     )
 
-lines[op_y + 3 + content_h]     = self._fit(rim_bot_row, cols)
+lines[op_y + 3 + content_h] = self._fit(rim_bot_row, cols)
 lines[op_y + 3 + content_h + 1] = self._fit(bezel_bottom, cols)
 ```
 
@@ -319,18 +325,18 @@ lines[op_y + 3 + content_h + 1] = self._fit(bezel_bottom, cols)
 Add class-level glyph constants:
 ```python
 # Near PANE_GAP / BEZEL_MARGIN constants:
-_SPEAKER_GRILLE = "▐▌▐▌▐▌▐▌"   # 8-char speaker dot pattern
-_KNOB_LARGE     = "( ◎ )"        # 6-char large rotary knob
-_KNOB_SMALL     = "(○)"           # 3-char small knob
+_SPEAKER_GRILLE = "▐▌▐▌▐▌▐▌"  # 8-char speaker dot pattern
+_KNOB_LARGE = "( ◎ )"  # 6-char large rotary knob
+_KNOB_SMALL = "(○)"  # 3-char small knob
 ```
 
 Replace the controls + prompt area (lines ~1394-1407):
 ```python
-controls_y   = layout.controls.y
-task_status  = self.projection.status
-running_led  = "●" if task_status not in {"READY", "IDLE", ""} else "·"
+controls_y = layout.controls.y
+task_status = self.projection.status
+running_led = "●" if task_status not in {"READY", "IDLE", ""} else "·"
 model_serial = self._fit(self.model_label, 18)
-prompt_text  = self._prompt_text or "type a request · /help for controls"
+prompt_text = self._prompt_text or "type a request · /help for controls"
 
 # --- Section A: speaker grille (left) ---
 sect_a = self._SPEAKER_GRILLE
@@ -351,13 +357,10 @@ sect_d = (
 )
 
 # --- Row layout ---
-lines[controls_y]     = self._fit("─" * max(cols - 4, 1), cols)
-lines[controls_y + 1] = self._fit(
-    f"  {sect_a}   {led_block}   {sect_c}   {sect_d}", cols
-)
+lines[controls_y] = self._fit("─" * max(cols - 4, 1), cols)
+lines[controls_y + 1] = self._fit(f"  {sect_a}   {led_block}   {sect_c}   {sect_d}", cols)
 lines[controls_y + 2] = self._fit(
-    f"  AUDIO OUT   {self._fit(prompt_text, 40)}   "
-    f"↑↓ scroll  ←→ left/right  Ctrl-C cancel", cols
+    f"  AUDIO OUT   {self._fit(prompt_text, 40)}   ↑↓ scroll  ←→ left/right  Ctrl-C cancel", cols
 )
 lines[controls_y + 3] = self._fit("─" * max(cols - 4, 1), cols)
 
@@ -389,17 +392,17 @@ if self._right_scroll:
 else:
     base = "ATHENA OI // GLASS COMPUTE"
     live = "LIVE VIEWPORT"
-    pad  = max(oi_inner_w - len(base) - len(live) - 2, 1)
+    pad = max(oi_inner_w - len(base) - len(live) - 2, 1)
     right_title = base + " " * pad + live
 
 # Also update lines[0] for the chassis-top header chip:
 # CURRENT (line 1348):
 lines[0] = self._fit("ATHENA  //  OPERATOR INSTRUMENT", cols)
 # REPLACE WITH:
-chip        = f"[ GLASS COMPUTE ENGINE {'■' if self.display == 'glass' else '□'} ]"
+chip = f"[ GLASS COMPUTE ENGINE {'■' if self.display == 'glass' else '□'} ]"
 header_body = "ATHENA  OPERATOR INSTRUMENT  //"
-chip_pad    = max(cols - len(header_body) - len(chip) - 4, 1)
-lines[0]    = self._fit(header_body + " " * chip_pad + chip, cols)
+chip_pad = max(cols - len(header_body) - len(chip) - 4, 1)
+lines[0] = self._fit(header_body + " " * chip_pad + chip, cols)
 ```
 
 ---
@@ -411,10 +414,14 @@ lines[0]    = self._fit(header_body + " " * chip_pad + chip, cols)
 ```python
 # Add after _text() static method (around line 162):
 
+
 def _pixel_rect(
     self,
     draw: Any,
-    x1: int, y1: int, x2: int, y2: int,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
     *,
     fill: "Color",
     pixel_size: int = 3,
@@ -422,7 +429,8 @@ def _pixel_rect(
 ) -> None:
     """Fill a rectangle using discrete pixel blocks (dot-matrix CRT effect)."""
     import random
-    rng = random.Random(x1 * 31 + y1 * 97)   # stable per position
+
+    rng = random.Random(x1 * 31 + y1 * 97)  # stable per position
     for py in range(y1, y2, pixel_size):
         for px in range(x1, x2, pixel_size):
             if rng.random() < density:
@@ -431,10 +439,14 @@ def _pixel_rect(
                     fill=fill,
                 )
 
+
 def _pixel_line(
     self,
     draw: Any,
-    x1: int, y1: int, x2: int, y2: int,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
     *,
     fill: "Color",
     pixel_size: int = 3,
@@ -442,7 +454,7 @@ def _pixel_line(
     """Draw a line using discrete pixel blocks."""
     dist = max(abs(x2 - x1), abs(y2 - y1), 1)
     for i in range(0, dist + pixel_size, pixel_size):
-        t  = min(i / dist, 1.0)
+        t = min(i / dist, 1.0)
         px = int(x1 + (x2 - x1) * t)
         py = int(y1 + (y2 - y1) * t)
         draw.rectangle((px, py, px + pixel_size - 1, py + pixel_size - 1), fill=fill)
@@ -454,39 +466,99 @@ Replace the smooth `rounded_rectangle` body (lines ~786-801) with:
 # CURRENT:
 draw.rounded_rectangle(
     (x - body_w, body_top, x + body_w, body_bottom),
-    radius=max(2, scale // 2), outline=color, fill=(16, 28, 51, 238), width=stroke,
+    radius=max(2, scale // 2),
+    outline=color,
+    fill=(16, 28, 51, 238),
+    width=stroke,
 )
 draw.rounded_rectangle(
     (x - scale * 2, screen_top, x + scale * 2, screen_bottom),
-    radius=max(1, scale // 4), outline=(100, 148, 191, 180), fill=(9, 20, 39, 245), width=stroke,
+    radius=max(1, scale // 4),
+    outline=(100, 148, 191, 180),
+    fill=(9, 20, 39, 245),
+    width=stroke,
 )
 
 # REPLACE WITH (pixel = quantization unit):
 pixel = max(2, scale // 5)
 # Body fill — dithered pixel interior
 self._pixel_rect(
-    draw, x - body_w + pixel, body_top + pixel, x + body_w - pixel, body_bottom - pixel,
-    fill=(16, 28, 51, 230), pixel_size=pixel, density=0.88,
+    draw,
+    x - body_w + pixel,
+    body_top + pixel,
+    x + body_w - pixel,
+    body_bottom - pixel,
+    fill=(16, 28, 51, 230),
+    pixel_size=pixel,
+    density=0.88,
 )
 # Body outline as pixel chains
-self._pixel_line(draw, x - body_w, body_top,    x + body_w, body_top,    fill=color, pixel_size=pixel)
-self._pixel_line(draw, x - body_w, body_bottom, x + body_w, body_bottom, fill=color, pixel_size=pixel)
-self._pixel_line(draw, x - body_w, body_top,    x - body_w, body_bottom, fill=color, pixel_size=pixel)
-self._pixel_line(draw, x + body_w, body_top,    x + body_w, body_bottom, fill=color, pixel_size=pixel)
+self._pixel_line(draw, x - body_w, body_top, x + body_w, body_top, fill=color, pixel_size=pixel)
+self._pixel_line(
+    draw, x - body_w, body_bottom, x + body_w, body_bottom, fill=color, pixel_size=pixel
+)
+self._pixel_line(draw, x - body_w, body_top, x - body_w, body_bottom, fill=color, pixel_size=pixel)
+self._pixel_line(draw, x + body_w, body_top, x + body_w, body_bottom, fill=color, pixel_size=pixel)
 # Screen face — tighter fill density for phosphor glow look
 screen_fill = (9, 20, 39, 245)
 self._pixel_rect(
-    draw, x - scale * 2 + pixel, screen_top + pixel, x + scale * 2 - pixel, screen_bottom - pixel,
-    fill=screen_fill, pixel_size=pixel, density=0.95,
+    draw,
+    x - scale * 2 + pixel,
+    screen_top + pixel,
+    x + scale * 2 - pixel,
+    screen_bottom - pixel,
+    fill=screen_fill,
+    pixel_size=pixel,
+    density=0.95,
 )
-self._pixel_line(draw, x - scale*2, screen_top,    x + scale*2, screen_top,    fill=(100, 148, 191, 180), pixel_size=pixel)
-self._pixel_line(draw, x - scale*2, screen_bottom, x + scale*2, screen_bottom, fill=(100, 148, 191, 180), pixel_size=pixel)
-self._pixel_line(draw, x - scale*2, screen_top,    x - scale*2, screen_bottom, fill=(100, 148, 191, 180), pixel_size=pixel)
-self._pixel_line(draw, x + scale*2, screen_top,    x + scale*2, screen_bottom, fill=(100, 148, 191, 180), pixel_size=pixel)
+self._pixel_line(
+    draw,
+    x - scale * 2,
+    screen_top,
+    x + scale * 2,
+    screen_top,
+    fill=(100, 148, 191, 180),
+    pixel_size=pixel,
+)
+self._pixel_line(
+    draw,
+    x - scale * 2,
+    screen_bottom,
+    x + scale * 2,
+    screen_bottom,
+    fill=(100, 148, 191, 180),
+    pixel_size=pixel,
+)
+self._pixel_line(
+    draw,
+    x - scale * 2,
+    screen_top,
+    x - scale * 2,
+    screen_bottom,
+    fill=(100, 148, 191, 180),
+    pixel_size=pixel,
+)
+self._pixel_line(
+    draw,
+    x + scale * 2,
+    screen_top,
+    x + scale * 2,
+    screen_bottom,
+    fill=(100, 148, 191, 180),
+    pixel_size=pixel,
+)
 # Eyes — pixel blocks instead of smooth ellipses
-for ex in (x - scale*2 + stroke + eye_shift, x + scale - stroke + eye_shift):
-    self._pixel_rect(draw, ex, eye_y, ex + scale - stroke, eye_y + eye_height,
-                     fill=eye, pixel_size=max(2, pixel - 1), density=1.0)
+for ex in (x - scale * 2 + stroke + eye_shift, x + scale - stroke + eye_shift):
+    self._pixel_rect(
+        draw,
+        ex,
+        eye_y,
+        ex + scale - stroke,
+        eye_y + eye_height,
+        fill=eye,
+        pixel_size=max(2, pixel - 1),
+        density=1.0,
+    )
 ```
 
 Apply the same pixelation to antenna and feet lines (replace `draw.line()` with `self._pixel_line()`).
@@ -527,19 +599,26 @@ self.projection.model_label = self.model_label
 ```python
 # CURRENT:
 self._text(draw, (margin, top), scene.title, font_small, bright)
-self._text(draw, (margin, top + 22),
-    f"MODE  {scene.status:<14}  VIEWPORT  {width}×{height}", font_small, dim)
+self._text(
+    draw,
+    (margin, top + 22),
+    f"MODE  {scene.status:<14}  VIEWPORT  {width}×{height}",
+    font_small,
+    dim,
+)
 draw.line((margin, top + 43, ...), ...)
 
 # REPLACE WITH (adds MODEL REQUEST and ACTIVE OPERATION rows):
 self._text(draw, (margin, top), scene.title, font_small, bright)
 model_req = f"> MODEL REQUEST · {scene.model_label}"
 self._text(draw, (margin, top + 18), model_req, font_small, accent)
-op_label  = "> ACTIVE OPERATION" if scene.mode.value not in {"idle", "respond", "think"} else "> IDLE"
+op_label = (
+    "> ACTIVE OPERATION" if scene.mode.value not in {"idle", "respond", "think"} else "> IDLE"
+)
 self._text(draw, (margin, top + 36), op_label, font_small, dim)
 draw.line((margin, top + 53, width - margin, top + 53), fill=(115, 154, 196, 95), width=1)
 # Downstream body_top references shift from (top + 62) to (top + 68):
-body_top = top + 68   # was top + 62
+body_top = top + 68  # was top + 62
 ```
 > Apply `body_top = top + 68` consistently throughout `_render_base()` and `_render_action_content()`.
 
@@ -586,21 +665,23 @@ def _tree_rows(
     """Render entities as file-tree rows with ├─/└─ prefix and right badge."""
     n = min(len(entities), max_rows)
     for idx in range(n):
-        entity  = entities[idx]
+        entity = entities[idx]
         is_last = idx == n - 1
-        prefix  = "└─" if is_last else "├─"
-        status  = str(getattr(entity, "status", "")).lower()
-        badge   = (
-            "[✓] read"    if status in {"complete", "success", "read"}
-            else "[!] err"    if status in {"failed", "failure", "error"}
-            else "[…] work"   if status in {"active", "running", "requested"}
+        prefix = "└─" if is_last else "├─"
+        status = str(getattr(entity, "status", "")).lower()
+        badge = (
+            "[✓] read"
+            if status in {"complete", "success", "read"}
+            else "[!] err"
+            if status in {"failed", "failure", "error"}
+            else "[…] work"
+            if status in {"active", "running", "requested"}
             else "[·] watch"
         )
         color = self._entity_color(entity, ink, accent, warn, bad)
         max_label = max(1, (available_width // 9) - len(badge) - 4)
-        label     = entity.label[:max_label]
-        self._text(draw, (left, start_y + idx * row_height),
-                   f"{prefix} {label}", font, color)
+        label = entity.label[:max_label]
+        self._text(draw, (left, start_y + idx * row_height), f"{prefix} {label}", font, color)
         badge_x = left + available_width - len(badge) * 7
         self._text(draw, (badge_x, start_y + idx * row_height), badge, font, color)
 ```
@@ -613,10 +694,17 @@ for idx, (label, color) in enumerate(tree):
 
 # WITH:
 self._tree_rows(
-    draw, resources, font_small, left, body_top + 24,
+    draw,
+    resources,
+    font_small,
+    left,
+    body_top + 24,
     available_width=width // 2 - margin - 4,
     row_height=20,
-    ink=ink, accent=accent, warn=warn, bad=bad,
+    ink=ink,
+    accent=accent,
+    warn=warn,
+    bad=bad,
 )
 ```
 
@@ -629,14 +717,17 @@ for row, line in enumerate(tree, 3):
 # WITH:
 n = min(len(resources), 8)
 for idx in range(n):
-    entity  = resources[idx]
+    entity = resources[idx]
     is_last = idx == n - 1
-    pfx     = "└─" if is_last else "├─"
-    status  = str(entity.status).lower()
-    badge   = (
-        "[✓] read"  if status in {"complete", "success", "read"}
-        else "[!]"      if status in {"failed", "failure"}
-        else "[●]"      if status in {"active", "running"}
+    pfx = "└─" if is_last else "├─"
+    status = str(entity.status).lower()
+    badge = (
+        "[✓] read"
+        if status in {"complete", "success", "read"}
+        else "[!]"
+        if status in {"failed", "failure"}
+        else "[●]"
+        if status in {"active", "running"}
         else "[…]"
     )
     label_w = max(split - 8 - len(badge), 4)
@@ -653,11 +744,11 @@ Replace the pseudo-random node graph with a proper top-down tree:
 ```python
 # REPLACE lines 258-290 WITH:
 right_col_x = right + 4
-right_w_px  = width - right_col_x - margin
-node_w      = min(90, right_w_px - 8)
-node_h      = 24
-cx          = right_col_x + right_w_px // 2   # horizontal centre
-tree_top_y  = body_top + 18
+right_w_px = width - right_col_x - margin
+node_w = min(90, right_w_px - 8)
+node_h = 24
+cx = right_col_x + right_w_px // 2  # horizontal centre
+tree_top_y = body_top + 18
 
 # Build adjacency
 adj: dict[str, list] = {}
@@ -669,17 +760,20 @@ for entity in runtime_entities[:6]:
     else:
         roots.append(entity)
 
+
 def _node(ent, nx, ny):
     ec = self._entity_color(ent, ink, accent, warn, bad)
     draw.rounded_rectangle(
         (nx - node_w // 2, ny - node_h // 2, nx + node_w // 2, ny + node_h // 2),
-        radius=3, outline=ec, fill=(18, 32, 58, 210), width=1,
+        radius=3,
+        outline=ec,
+        fill=(18, 32, 58, 210),
+        width=1,
     )
     marker = _state_marker(ent.status)
-    self._text(draw, (nx - node_w // 2 + 5, ny - 9),
-               f"{ent.label[:14]} {marker}", font_small, ec)
-    self._text(draw, (nx - node_w // 2 + 5, ny + 2),
-               ent.kind[:10], font_small, dim)
+    self._text(draw, (nx - node_w // 2 + 5, ny - 9), f"{ent.label[:14]} {marker}", font_small, ec)
+    self._text(draw, (nx - node_w // 2 + 5, ny + 2), ent.kind[:10], font_small, dim)
+
 
 row_y = tree_top_y
 for root in roots:
@@ -688,20 +782,23 @@ for root in roots:
     if children:
         draw.line(
             (cx, row_y + node_h // 2, cx, row_y + node_h // 2 + 10),
-            fill=(88, 145, 183, 100), width=1,
+            fill=(88, 145, 183, 100),
+            width=1,
         )
     step = node_h + 18
     for child in children:
         cy = row_y + step
         _node(child, cx, cy)
-        draw.line((cx, row_y + node_h//2 + 10, cx, cy - node_h//2),
-                  fill=(88, 145, 183, 100), width=1)
+        draw.line(
+            (cx, row_y + node_h // 2 + 10, cx, cy - node_h // 2), fill=(88, 145, 183, 100), width=1
+        )
         row_y = cy
     row_y += node_h + 10
 
 if not runtime_entities:
-    self._text(draw, (right_col_x, body_top + 42),
-               "· no runtime operations observed", font_small, dim)
+    self._text(
+        draw, (right_col_x, body_top + 42), "· no runtime operations observed", font_small, dim
+    )
 ```
 
 ---
@@ -737,10 +834,10 @@ canvas.put(3, 0, f"{bar}  {pct}%")
 # In reduce(), DiagnosticsProduced handler — expand the normed dict:
 for d in payload.get("diagnostics") or []:
     normed = {
-        "message":  d.get("message") or d.get("detail") or str(d),
-        "path":     d.get("path") or d.get("file") or d.get("location") or "",
+        "message": d.get("message") or d.get("detail") or str(d),
+        "path": d.get("path") or d.get("file") or d.get("location") or "",
         "expected": str(d.get("expected") or ""),
-        "actual":   str(d.get("actual")   or ""),
+        "actual": str(d.get("actual") or ""),
         "severity": str(d.get("severity") or ""),
     }
     self.diagnostics.append(normed)
@@ -749,10 +846,10 @@ for d in payload.get("diagnostics") or []:
 #### framebuffer.py — FAILURE block (replace lines ~386-409):
 ```python
 for diagnostic in scene.diagnostics[: max((height - row - 20) // row_height, 1)]:
-    msg      = diagnostic.get("message") or str(diagnostic)
+    msg = diagnostic.get("message") or str(diagnostic)
     location = diagnostic.get("path") or diagnostic.get("location") or ""
     expected = diagnostic.get("expected", "")
-    actual   = diagnostic.get("actual",   "")
+    actual = diagnostic.get("actual", "")
     severity = diagnostic.get("severity", "")
 
     self._text(draw, (margin, row), f"> RESULT: {msg}", font, bad)
@@ -775,21 +872,26 @@ for diagnostic in scene.diagnostics[: max((height - row - 20) // row_height, 1)]
 ```python
 row = 2
 for diagnostic in scene.diagnostics[: max(height - 4, 1)]:
-    msg      = diagnostic.get("message") or diagnostic.get("detail") or str(diagnostic)
+    msg = diagnostic.get("message") or diagnostic.get("detail") or str(diagnostic)
     location = diagnostic.get("path") or diagnostic.get("file") or diagnostic.get("location") or ""
     expected = diagnostic.get("expected", "")
-    actual   = diagnostic.get("actual",   "")
+    actual = diagnostic.get("actual", "")
     severity = diagnostic.get("severity", "")
 
-    canvas.put(row, 0, f"> RESULT: {msg}".strip()); row += 1
+    canvas.put(row, 0, f"> RESULT: {msg}".strip())
+    row += 1
     if expected:
-        canvas.put(row, 0, f"expected: {expected}"); row += 1
+        canvas.put(row, 0, f"expected: {expected}")
+        row += 1
     if actual:
-        canvas.put(row, 0, f"actual:   {actual}");   row += 1
+        canvas.put(row, 0, f"actual:   {actual}")
+        row += 1
     if location:
-        canvas.put(row, 0, f"at {location}");         row += 1
+        canvas.put(row, 0, f"at {location}")
+        row += 1
     if severity:
-        canvas.put(row, 0, f"severity: {severity}");  row += 1
+        canvas.put(row, 0, f"severity: {severity}")
+        row += 1
 ```
 
 ---
@@ -818,19 +920,23 @@ elif event_type == "TaskIterationStarted":
 ```python
 entries = scene.alerts[-3:] or scene.stream[-3:] or ["awaiting canonical events"]
 for idx, entry in enumerate(entries):
-    is_next  = str(entry).upper().startswith(("NEXT STEP", "SCANNING", "PROPOSING", "CHECKING"))
-    prefix   = "> " if is_next else "  "
-    color    = (
-        bad    if "fail" in entry.lower() or "error" in entry.lower()
-        else warn   if "approval" in entry.lower()
-        else accent if is_next
+    is_next = str(entry).upper().startswith(("NEXT STEP", "SCANNING", "PROPOSING", "CHECKING"))
+    prefix = "> " if is_next else "  "
+    color = (
+        bad
+        if "fail" in entry.lower() or "error" in entry.lower()
+        else warn
+        if "approval" in entry.lower()
+        else accent
+        if is_next
         else ink
     )
     self._text(
         draw,
         (margin, band_y + 30 + idx * 18),
         f"{prefix}{entry[: max(20, width // 12)]}",
-        font_small, color,
+        font_small,
+        color,
     )
 ```
 
@@ -852,6 +958,7 @@ def _animation_tick(self, dt: float) -> bool:
     self.mascot.advance(dt)
     self.repaint_oi(force=False)
     return True
+
 
 # REPLACE WITH:
 def _animation_tick(self, dt: float) -> bool:
@@ -887,6 +994,7 @@ After building the canvas (before returning), inject animated indicators:
 # At the end of render_scene_lines(), before `return canvas.lines()`:
 if visual is not None:
     from athena.cli.activity import VisualActionKind as _VAK
+
     if scene.mode is _VAK.CODE:
         # Blinking block cursor on the code view
         cursor_visible = visual.cursor_phase < 0.55
@@ -910,18 +1018,24 @@ if visual is not None:
 ```python
 # CURRENT (line ~1308):
 return render_scene_lines(
-    self.projection, self.scene,
-    width=width, height=height,
-    buddy_lines=(...), buddy_enabled=self.mascot_enabled,
+    self.projection,
+    self.scene,
+    width=width,
+    height=height,
+    buddy_lines=(...),
+    buddy_enabled=self.mascot_enabled,
     recent=self._recent,
 )
 # REPLACE WITH:
 return render_scene_lines(
-    self.projection, self.scene,
-    width=width, height=height,
-    buddy_lines=(...), buddy_enabled=self.mascot_enabled,
+    self.projection,
+    self.scene,
+    width=width,
+    height=height,
+    buddy_lines=(...),
+    buddy_enabled=self.mascot_enabled,
     recent=self._recent,
-    visual=self.animator.visual,    # ADD
+    visual=self.animator.visual,  # ADD
 )
 ```
 
@@ -932,30 +1046,43 @@ return render_scene_lines(
 
 ```python
 # CURRENT:
-_ACTIVE_STATES = frozenset({
-    "THINKING", "READING", "SEARCHING", "TOOLS",
-    "EXECUTING", "APPROVAL", "FAILURE", "RECOVERING",
-    "DELEGATED", "CODING", "VERIFYING", "TESTING",
-})
+_ACTIVE_STATES = frozenset(
+    {
+        "THINKING",
+        "READING",
+        "SEARCHING",
+        "TOOLS",
+        "EXECUTING",
+        "APPROVAL",
+        "FAILURE",
+        "RECOVERING",
+        "DELEGATED",
+        "CODING",
+        "VERIFYING",
+        "TESTING",
+    }
+)
 
 # REPLACE WITH:
-_ACTIVE_STATES = frozenset({
-    "THINKING",
-    "READING",
-    "SEARCHING",
-    "TOOLS",
-    "EXECUTING",
-    "APPROVAL",
-    "FAILURE",
-    "RECOVERING",
-    "DELEGATED",
-    "CODING",
-    "VERIFYING",
-    "TESTING",
-    "RESPONDING",   # Model streaming — cursor blink during response
-    "INSPECTING",   # Eye scan animation active
-    "GENERATING",   # Tool construction animation
-})
+_ACTIVE_STATES = frozenset(
+    {
+        "THINKING",
+        "READING",
+        "SEARCHING",
+        "TOOLS",
+        "EXECUTING",
+        "APPROVAL",
+        "FAILURE",
+        "RECOVERING",
+        "DELEGATED",
+        "CODING",
+        "VERIFYING",
+        "TESTING",
+        "RESPONDING",  # Model streaming — cursor blink during response
+        "INSPECTING",  # Eye scan animation active
+        "GENERATING",  # Tool construction animation
+    }
+)
 ```
 
 ---
