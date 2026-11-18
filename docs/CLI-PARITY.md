@@ -37,7 +37,7 @@ and exit-code semantics.
 | memory candidate lifecycle | no dedicated HTTP route | `athena memory candidates/inspect/promote/discard` | supported |
 | MCP status/tools/resources/prompts | no dedicated HTTP route | `athena mcp list/tools/resources/prompts/doctor/reconnect` | supported |
 | provider outcome recovery list/inspection | `GET /v1/inference-recoveries[/{attempt_id}]` | `athena inference-recoveries list/show ATTEMPT_ID` | supported |
-| provider outcome resolution | `POST /v1/inference-recoveries/{attempt_id}` | `athena inference-recoveries resolve ATTEMPT_ID --resolution ... --note ...` | supported |
+| provider outcome resolution | `POST /v1/inference-recoveries/{attempt_id}` | `athena inference-recoveries resolve ATTEMPT_ID --resolution ... --note ... [--authorized-by OPERATOR]` | supported; retry authorization is explicit |
 | provider liability closeout | `POST /v1/inference-recoveries/{attempt_id}/liability` | `athena inference-recoveries close-liability ATTEMPT_ID --note ...` | supported |
 | permissions projection | operator query service | `athena permissions` | supported |
 | artifact projection | operator query service | `athena artifacts list [--limit N]` | supported |

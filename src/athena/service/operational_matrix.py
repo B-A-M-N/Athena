@@ -30,6 +30,8 @@ def behavioral_proof(passport: Any, runtime: Any) -> dict[str, Any]:
 
 
 def build_operational_matrix(service: Any) -> dict[str, Any]:
+    from athena.execution.sandbox_doctor import sandbox_status
+
     ports = OperationalMatrixPorts(service)
     execution = ports.execution
     backend_rows = execution.backend_status() if execution is not None else []
@@ -79,6 +81,7 @@ def build_operational_matrix(service: Any) -> dict[str, Any]:
             )
     return {
         "execution": cells,
+        "sandbox": sandbox_status(ports.config),
         "mcp": ports.mcp_status(),
         "memory": ports.runtime_health().get("memory_embeddings", {}),
     }

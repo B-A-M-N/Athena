@@ -45,8 +45,9 @@ async def stop(ports: Any) -> None:
             await ports.scheduler.stop()
         except Exception as exc:
             _logger.warning("scheduler stop failed: %s", exc)
-        if ports.store_events is not None:
+        if ports.store_events is not None and getattr(ports, "scheduler_event_subscribed", False):
             ports.store_events.unsubscribe(ports.scheduler.notify_event)
+            ports.scheduler_event_subscribed = False
         ports.scheduler = None
 
     if ports.store_events is not None and ports.synthesis_event_observer is not None:

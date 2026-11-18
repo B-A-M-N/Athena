@@ -56,12 +56,16 @@ class ServiceLifecycle:
         self.ports = ports or LifecyclePorts(service)
         self._authority_composer = AuthorityComposer(ports=AuthorityCompositionPorts(service))
 
-    async def start(self) -> None:
+    async def start(self, *, activate_runtime: bool = True) -> None:
         if self.ports.started:
+            if activate_runtime:
+                await self.activate_runtime()
             return
 
         try:
             await self.ports.start_impl()
+            if activate_runtime:
+                await self.activate_runtime()
         except BaseException:
             self.ports.startup_health = {
                 **self.ports.startup_health,
@@ -76,6 +80,59 @@ class ServiceLifecycle:
             except BaseException as cleanup_error:
                 _logger.error("startup unwind failed: %s", cleanup_error, exc_info=True)
             raise
+
+    async def activate_runtime(self) -> None:
+        """Start background producers after the service graph is initialized."""
+        if not self.ports.started:
+            await self.start(activate_runtime=True)
+            return
+        if self.ports.runtime_active:
+            return
+        task_manager = self.ports.task_manager
+        scheduler = self.ports.scheduler
+        if task_manager is None or scheduler is None:
+            raise RuntimeError("AthenaService runtime cannot activate before initialization")
+        cfg = self.ports.config
+
+        # Initialization already settled recovery and readiness. These
+        # supervisors are ambient producers: keep them out of passive
+        # control-plane startup and start them only for a live service.
+        await self.ports.start_mcp_supervisor()
+        if self.ports.pack_manager is not None:
+            await self.ports.pack_manager.lifecycle.start_hook_dispatcher()
+        events = self.ports.store_events
+        if events is not None and not self.ports.scheduler_event_subscribed:
+            events.subscribe(scheduler.notify_event, exclude_event_types=FAST_EVENT_TYPES)
+            self.ports.scheduler_event_subscribed = True
+
+        # Packs and any dependent resumable tasks are settled before a worker
+        # can claim fresh work (rehydration ran during startup).
+        from athena.service.startup import StartupPhaseRunner
+
+        await StartupPhaseRunner(self)._start_workers(
+            cfg=cfg,
+            scheduler=scheduler,
+            task_manager=task_manager,
+            kernel=self.ports.kernel,
+        )
+        self.ports.runtime_active = True
+        self._set_startup_health()
+
+    def _set_startup_health(self) -> None:
+        checks = self.ports.startup_health.get("checks")
+        if not isinstance(checks, dict):
+            return
+        degraded = any(
+            value.get("status") != "ok"
+            for value in checks.values()
+            if isinstance(value, dict)
+        )
+        self.ports.startup_health["status"] = "degraded" if degraded else "ok"
+        self.ports.startup_health["blocking_failures"] = [
+            name
+            for name, value in checks.items()
+            if isinstance(value, dict) and value.get("blocking") and value.get("status") != "ok"
+        ]
 
     async def _build_authorities(
         self,
@@ -231,7 +288,6 @@ class ServiceLifecycle:
             loop_interval_seconds=cfg.scheduler_interval_seconds,
         )
         self.ports.scheduler = scheduler
-        events.subscribe(scheduler.notify_event, exclude_event_types=FAST_EVENT_TYPES)
         schedule_api = ScheduleAPI(scheduler, task_manager)
         self.ports.schedule_api = schedule_api
         registry.register(ScheduleCapability(schedule_api))

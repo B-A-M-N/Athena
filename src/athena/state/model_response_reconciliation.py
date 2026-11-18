@@ -52,8 +52,9 @@ async def ensure_attempt_row(
         "reservation_amount, reservation_applied_at, provider_usage_id, "
         "provider_outcome_status, created_at, completed_at, actual_input_tokens, "
         "actual_output_tokens, actual_cost, response_committed_at, accounting_applied_at, idempotency_key, "
-        "idempotency_semantics, provider_outcome_note, provider_outcome_resolved_at"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "idempotency_semantics, provider_outcome_note, provider_outcome_resolved_at, "
+        "retry_authorized_at, retry_authorized_by, replacement_attempt_id"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             row["attempt_id"],
             row["task_id"],
@@ -77,6 +78,9 @@ async def ensure_attempt_row(
             row.get("idempotency_semantics") or idempotency_semantics,
             row.get("provider_outcome_note"),
             row.get("provider_outcome_resolved_at"),
+            row.get("retry_authorized_at"),
+            row.get("retry_authorized_by"),
+            row.get("replacement_attempt_id"),
         ),
     )
 

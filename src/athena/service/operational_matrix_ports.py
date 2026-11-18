@@ -8,7 +8,7 @@ from typing import Any
 class OperationalMatrixPorts:
     """Expose execution readiness and canonical service projections."""
 
-    _RESOURCE_NAMES = frozenset({"_execution", "mcp_status", "runtime_health"})
+    _RESOURCE_NAMES = frozenset({"_execution", "mcp_status", "runtime_health", "config"})
 
     def __init__(self, owner: Any) -> None:
         object.__setattr__(self, "_owner", owner)

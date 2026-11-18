@@ -64,6 +64,22 @@ pip install "athena-agent==0.1.0b1" "athena-agent-native==0.1.0b1"
 The optional `glass` extra installs Pillow for the hosted raster OI renderer;
 ANSI/plain operation does not require it.
 
+### System prerequisites
+
+Athena keeps these host requirements separate:
+
+- Core CLI and inference need a supported Python environment and a configured
+  provider. Bubblewrap is not required just to inspect configuration or use
+  provider-backed features that do not execute local code.
+- Restricted generated-code and local execution require Linux Bubblewrap. If
+  Bubblewrap is missing or its user-namespace preflight fails, Athena fails
+  closed instead of running that code unsandboxed. Check with
+  `athena doctor startup`.
+- The optional native desktop frontend is a separate Linux X11/Openbox
+  prerequisite. Install the matching `athena-agent-native` companion only for
+  that supported desktop cell; it does not replace the restricted execution
+  prerequisite.
+
 ## Development
 
 Athena is easiest to work on from an editable install. The repository provides

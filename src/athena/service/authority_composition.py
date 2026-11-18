@@ -145,7 +145,10 @@ class AuthorityComposer:
 
         reality_gate = RealityGate(self._ports.shadow_engine())
         dispatcher.set_reality_gate(reality_gate)
-        budgets = BudgetTracker(task_store=tasks)
+        budgets = BudgetTracker(
+            task_store=tasks,
+            reservation_store=store_components.model_response_store,
+        )
         dispatcher.set_budget_tracker(budgets)
         artifacts.set_budget_tracker(budgets)
         task_manager = TaskManager(

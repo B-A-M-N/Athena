@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""Create or verify a canonical manifest of frozen source inputs."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import sys
+
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "src"))
+
+from athena.release.source_manifest import build_manifest, verify_manifest  # noqa: E402
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--verify", type=Path)
+    parser.add_argument("--source-sha", default=None)
+    args = parser.parse_args(argv)
+    if bool(args.output) == bool(args.verify):
+        parser.error("provide exactly one of --output or --verify")
+    root = args.root.resolve()
+    if args.output:
+        manifest = build_manifest(root, source_sha=args.source_sha)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        print(f"source-manifest: PASS — {manifest['tree_sha256']}")
+        return 0
+    try:
+        expected = json.loads(args.verify.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"source-manifest: FAIL — invalid manifest: {exc}", file=sys.stderr)
+        return 1
+    ok, detail = verify_manifest(root, expected, source_sha=args.source_sha)
+    if ok:
+        print(f"source-manifest: PASS — {detail}")
+        return 0
+    print(f"source-manifest: FAIL — {detail}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
