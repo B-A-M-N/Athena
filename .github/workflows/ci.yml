@@ -130,6 +130,19 @@ jobs:
             /usr/bin/true
       - name: Bootstrap locked Rust dependencies
         run: cargo fetch --manifest-path native/Cargo.toml --locked
+      - name: Provision pinned cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.6.4
+      - name: Bootstrap pinned release toolchain
+        # The release-script tests execute the same provisioned-toolchain
+        # contract release-check satisfies on a developer checkout.
+        run: |
+          set -euo pipefail
+          mkdir -p .release-toolchain/bin
+          cp "$(command -v cosign)" .release-toolchain/bin/cosign
+          .release-toolchain/bin/cosign version
+          scripts/bootstrap-cargo-deny
       - name: Build native binary for projection tests
         run: cargo build --manifest-path native/Cargo.toml --locked --offline
       - name: Run the complete Python suite on Python 3.12
