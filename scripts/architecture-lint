@@ -1061,6 +1061,9 @@ def _architecture_reference(root: Path) -> str | None:
                 merge_base = _git_output(root, "merge-base", "HEAD", candidate)
                 if merge_base:
                     return merge_base
+    parent = _git_output(root, "rev-parse", "--verify", "HEAD~1^{commit}")
+    if parent:
+        return parent
     return _git_output(root, "rev-parse", "--verify", "HEAD^{commit}")
 
 
