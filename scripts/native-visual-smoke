@@ -50,7 +50,11 @@ renderer_files = [
     "native/src/lib.rs", "native/src/x11.rs", "native/src/buddy/mod.rs",
     "native/src/buddy/poses.rs", "native/src/render/buddy.rs",
     "native/src/render/chassis.rs", "native/src/render/frame.rs",
-    "native/src/render/oi.rs", "native/src/render/primitives.rs",
+    "native/src/render/oi/mod.rs", "native/src/render/oi/attention.rs",
+    "native/src/render/oi/compose.rs", "native/src/render/oi/layout.rs",
+    "native/src/render/oi/motion.rs", "native/src/render/oi/scenes.rs",
+    "native/src/render/oi/target.rs", "native/src/render/oi/telemetry.rs",
+    "native/src/render/primitives.rs",
     "native/src/render/prompt.rs", "native/src/render/terminal.rs",
     "native/src/render/text.rs", "native/src/render/theme.rs",
 ]
@@ -145,7 +149,7 @@ done
 # OI fixtures remain separate so a content change cannot hide a shell drift.
 "$repo_root/scripts/native-cabinet-golden"
 
-projection='{"schema_version":3,"title":"ATHENA // VISUAL SMOKE","status":"SEARCHING","semantic_state":"search","oi":["SYMBOL GRAPH // FIXED CLOCK"],"current_action":{"kind":"search","label":"workspace","target":"workspace","query":"workspace"},"active_operation":{"id":"op-01","label":"inspect workspace","target":"workspace","state":"running","action_kind":"search","mutation_state":"read-only"},"model_request":{"provider":"local","model":"athena-model","status":"active"},"workspace_tree":[{"id":"workspace","kind":"workspace","label":"/workspace","status":"ready","children":[{"id":"src","kind":"directory","label":"src/athena","status":"ready"},{"id":"native","kind":"file","label":"native.rs","status":"reading"},{"id":"tests","kind":"directory","label":"tests","status":"ready"}]}],"runtime_tree":[{"id":"inspect","kind":"task","label":"inspect workspace","status":"running","children":[{"id":"read","kind":"execution","label":"read native.rs","status":"active"}]}],"entities":[{"id":"root","kind":"operation","label":"workspace","status":"active"},{"id":"child","kind":"task","label":"native.rs","status":"active","parent_id":"root"}],"attention_items":[],"buddy":{"state":"SEARCH","anchor":"right","status":"active","character":"owl"},"trace":["> SEARCH · workspace"],"view":{"mode":"search"}}'
+projection='{"schema_version":5,"title":"ATHENA // VISUAL SMOKE","status":"SEARCHING","semantic_state":"search","oi":["SYMBOL GRAPH // FIXED CLOCK"],"current_action":{"kind":"search","label":"workspace","target":"workspace","query":"workspace"},"active_operation":{"id":"op-01","label":"inspect workspace","target":"workspace","state":"running","action_kind":"search","mutation_state":"read-only"},"model_request":{"provider":"local","model":"athena-model","status":"active"},"workspace_tree":[{"id":"workspace","kind":"workspace","label":"/workspace","status":"ready","children":[{"id":"src","kind":"directory","label":"src/athena","status":"ready"},{"id":"native","kind":"file","label":"native.rs","status":"reading"},{"id":"tests","kind":"directory","label":"tests","status":"ready"}]}],"runtime_tree":[{"id":"inspect","kind":"task","label":"inspect workspace","status":"running","children":[{"id":"read","kind":"execution","label":"read native.rs","status":"active"}]}],"entities":[{"id":"root","kind":"operation","label":"workspace","status":"active"},{"id":"child","kind":"task","label":"native.rs","status":"active","parent_id":"root"}],"attention_items":[],"buddy":{"state":"SEARCH","anchor":"right","status":"active","character":"owl"},"trace":["> SEARCH · workspace"],"view":{"mode":"search"}}'
 
   PROJECTION="$projection" NATIVE_BIN="$native_bin" TMP_DIR="$tmp_dir" \
   GOLDEN_DIR="$golden_dir" UPDATE_GOLDENS="$update_goldens" CHECK_LAYOUT="$repo_root/scripts/check-native-layout.py" \
@@ -427,7 +431,11 @@ renderer_files = [
     "native/src/lib.rs", "native/src/x11.rs", "native/src/buddy/mod.rs",
     "native/src/buddy/poses.rs", "native/src/render/buddy.rs",
     "native/src/render/chassis.rs", "native/src/render/frame.rs",
-    "native/src/render/oi.rs", "native/src/render/primitives.rs",
+    "native/src/render/oi/mod.rs", "native/src/render/oi/attention.rs",
+    "native/src/render/oi/compose.rs", "native/src/render/oi/layout.rs",
+    "native/src/render/oi/motion.rs", "native/src/render/oi/scenes.rs",
+    "native/src/render/oi/target.rs", "native/src/render/oi/telemetry.rs",
+    "native/src/render/primitives.rs",
     "native/src/render/prompt.rs", "native/src/render/terminal.rs",
     "native/src/render/text.rs", "native/src/render/theme.rs",
 ]

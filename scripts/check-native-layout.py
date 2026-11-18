@@ -155,10 +155,10 @@ def main(argv: list[str]) -> int:
         text_scale = float(layout.get("text_scale", 1.0))
         font_scale = text_scale
         expected_sizes = [
-            max(16, round(16 * font_scale)),
-            max(16, round(16 * font_scale)),
-            max(14, round(14 * font_scale)),
-            max(12, round(12 * font_scale)),
+            max(16, round(20 * font_scale)),
+            max(16, round(20 * font_scale)),
+            max(15, round(18 * font_scale)),
+            max(12, round(13 * font_scale)),
         ]
         if sizes != expected_sizes:
             fail(f"font sizes do not follow cabinet scale: {sizes} != {expected_sizes}")
