@@ -80,7 +80,9 @@ jobs:
           make format-check static-critical
 
   full-python-3-12:
-    runs-on: ubuntu-24.04
+    # The complete suite must run on the same GLIBC baseline as the release
+    # artifacts; sandboxed-execution and native seam tests are part of it.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -88,17 +90,53 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.12"
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@bc540ba06a4ccee415bb241490e0b25ee8e7d315 # 1.85.0
       - name: Install uv
         run: python -m pip install uv==0.11.21
       - name: Install workspace sandbox dependency
         run: |
           sudo apt-get update
           sudo apt-get install -y bubblewrap
+      - name: Prepare Bubblewrap sandbox
+        run: |
+          set -euo pipefail
+
+          # Bubblewrap needs unprivileged user namespaces.
+          current_userns="$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)"
+          if [ -n "$current_userns" ] && [ "$current_userns" != "1" ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+
+          # Ubuntu 24.04+ AppArmor otherwise blocks Bubblewrap's network setup.
+          current_apparmor="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)"
+          if [ -n "$current_apparmor" ] && [ "$current_apparmor" != "0" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+          command -v bwrap
+          bwrap --version
+          bwrap \
+            --die-with-parent \
+            --new-session \
+            --unshare-pid \
+            --unshare-net \
+            --proc /proc \
+            --dev /dev \
+            --ro-bind /usr /usr \
+            --ro-bind /bin /bin \
+            --ro-bind /lib /lib \
+            --ro-bind /lib64 /lib64 \
+            /usr/bin/true
+      - name: Bootstrap locked Rust dependencies
+        run: cargo fetch --manifest-path native/Cargo.toml --locked
+      - name: Build native binary for projection tests
+        run: cargo build --manifest-path native/Cargo.toml --locked --offline
       - name: Run the complete Python suite on Python 3.12
         env:
           PYTHONUNBUFFERED: "1"
         run: |
-          make test
+          uv run --frozen --extra dev --extra anthropic --extra mcp python -m pytest -q
 
   critical-contracts:
     runs-on: ubuntu-24.04
@@ -123,13 +161,17 @@ jobs:
           make critical-contracts
 
   native:
-    runs-on: ubuntu-24.04
+    # Build the native companion on the same GLIBC-compatible baseline as the
+    # release artifact policy.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
       - name: Install Rust 1.85
         uses: dtolnay/rust-toolchain@bc540ba06a4ccee415bb241490e0b25ee8e7d315 # 1.85.0
+        with:
+          components: rustfmt, clippy
       - name: Install native build dependencies
         run: |
           sudo apt-get update

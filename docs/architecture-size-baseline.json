@@ -323,7 +323,7 @@
     "service/observations.py": 92,
     "service/operational_matrix.py": 87,
     "service/operator_query.py": 530,
-    "service/provider_recovery.py": 453,
+    "service/provider_recovery.py": 482,
     "service/provider_runtime.py": 193,
     "service/readiness.py": 303,
     "service/reasoning_components.py": 222,

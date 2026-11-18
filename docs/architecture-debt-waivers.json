@@ -342,8 +342,8 @@
       "family": "python",
       "path": "service/provider_recovery.py",
       "old_budget": 422,
-      "new_budget": 453,
-      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows service/provider_recovery.py: retained behavior from both sides ratcheted at the integrated total (old 422); retire by decomposition."
+      "new_budget": 482,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows service/provider_recovery.py: retained behavior from both sides ratcheted at the integrated total (old 422), then widened again by the qualification-phase provider sibling-attempt and raw-pending-outcome liability contracts required by the retry/billing recovery review; retire by decomposition."
     },
     {
       "family": "python",
