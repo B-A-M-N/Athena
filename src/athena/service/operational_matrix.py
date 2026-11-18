@@ -30,7 +30,7 @@ def behavioral_proof(passport: Any, runtime: Any) -> dict[str, Any]:
 
 
 def build_operational_matrix(service: Any) -> dict[str, Any]:
-    from athena.execution.sandbox_doctor import sandbox_status
+    from athena.affordances.sandbox_doctor import sandbox_status
 
     ports = OperationalMatrixPorts(service)
     execution = ports.execution

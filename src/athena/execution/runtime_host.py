@@ -132,9 +132,7 @@ class _RuntimeHost:
             try:
                 writer.write((json.dumps({"kind": "error", "error": str(exc)}) + "\n").encode())
                 await writer.drain()
-            except (
-                Exception
-            ):  # rationale: a disconnected client cannot receive protocol error output
+            except Exception:  # rationale: a disconnected client cannot receive protocol error output
                 pass
         finally:
             writer.close()

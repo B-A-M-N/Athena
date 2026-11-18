@@ -595,6 +595,77 @@ def _doctor_native(o: "Options", config: Any) -> int:
     return 0 if preflight.ok and binary_ok else 1
 
 
+def _doctor_startup(o: "Options", config: Any) -> int:
+    """Start the service briefly and report readiness-owned checks."""
+    del o
+    from athena.affordances.sandbox_doctor import (
+        profile_requires_restricted_execution,
+        sandbox_status,
+    )
+
+    sandbox = sandbox_status(config)
+    sandbox_ready = bool(sandbox["available"])
+    sandbox_detail = str(sandbox["detail"])
+    requires_sandbox = profile_requires_restricted_execution(config)
+    if sandbox_ready:
+        print(f"Sandbox: READY (bubblewrap {sandbox_detail})")
+    else:
+        print(f"Sandbox: UNAVAILABLE (fail-closed: {sandbox_detail})")
+    try:
+        service = build_service(config)
+    except ServiceUnavailable as exc:
+        print(f"startup health: failed ({exc})")
+        return 1
+
+    async def probe() -> dict[str, Any]:
+        try:
+            # Doctor is a passive preflight. It initializes the durable graph
+            # so readiness can be inspected, but must not start workers,
+            # schedulers, or ambient watch producers.
+            await service.start(activate_runtime=False)
+            health = service.startup_health()
+            health["operational_matrix"] = service.operational_matrix()
+            return health
+        finally:
+            await service.stop()
+
+    try:
+        health = asyncio.run(probe())
+    except Exception as exc:  # broad-exception: startup diagnostics fail closed
+        print(f"startup health: failed ({exc})")
+        return 1
+    print(f"startup health: {health.get('status', 'unknown')}")
+    for name, check in (health.get("checks") or {}).items():
+        status = check.get("status", "unknown") if isinstance(check, dict) else "unknown"
+        print(f"  {name}: {status}")
+    matrix = health.get("operational_matrix") or {}
+    for cell in matrix.get("execution") or ():
+        print(
+            "  execution/{backend}/{runtime}: available={available} persistent={persistent} "
+            "state={state} reattach={reattach} deps={deps}".format(
+                backend=cell.get("backend"),
+                runtime=cell.get("runtime"),
+                available="yes" if cell.get("available") else "no",
+                persistent="yes" if cell.get("persistent_session") else "no",
+                state="yes" if cell.get("persistent_runtime_state") else "no",
+                reattach="yes" if cell.get("reattach") else "no",
+                deps=",".join(cell.get("dependency_installation") or ()) or "none",
+            )
+        )
+    mcp = matrix.get("mcp") or {}
+    if isinstance(mcp, dict):
+        for name, status in sorted(mcp.items()):
+            state = status.get("state", "unknown") if isinstance(status, dict) else "unknown"
+            print(f"  mcp/{name}: {state}")
+    memory = matrix.get("memory") or {}
+    if isinstance(memory, dict):
+        print(f"  semantic-memory: {memory.get('state', 'unknown')}")
+    if requires_sandbox and not sandbox_ready:
+        print("  capability profile: restricted execution is not ready", file=sys.stderr)
+        return 1
+    return 0 if health.get("status") == "ok" else 1
+
+
 class ServiceUnavailable(Exception):
     pass
 
@@ -720,9 +791,7 @@ def dispatch(o: Options) -> int:
     if o.command == "doctor":
         target = o.args[0] if o.args else "startup"
         if target == "startup":
-            from athena.execution.sandbox_doctor import doctor_startup
-
-            return doctor_startup(o, config)
+            return _doctor_startup(o, config)
         if target == "native":
             return _doctor_native(o, config)
         if target != "display":
