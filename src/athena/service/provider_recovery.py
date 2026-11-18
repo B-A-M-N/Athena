@@ -74,7 +74,11 @@ class ProviderOutcomeRecoveryAPI:
     def _provider_recovery_service(self) -> "ProviderOutcomeRecoveryService":
         recovery = getattr(self, "__dict__", {}).get("_provider_recovery_runtime")
         if recovery is None:
-            raise RuntimeError("provider outcome recovery is not composed")
+            recovery = ProviderOutcomeRecoveryAPI.compose(self)
+            try:
+                setattr(self, "_provider_recovery_runtime", recovery)
+            except AttributeError:
+                pass
         return recovery
 
     async def list_provider_outcome_recoveries(
@@ -113,6 +117,31 @@ class ProviderOutcomeRecoveryAPI:
 
     async def reconcile_provider_outcomes(self) -> dict[str, int]:
         return await ProviderOutcomeRecoveryAPI._provider_recovery_service(self).reconcile()
+
+    async def _release_provider_reservation(
+        self,
+        store: Any,
+        *,
+        task_id: str,
+        attempt_id: str,
+        amount: Decimal,
+    ) -> None:
+        recovery = ProviderOutcomeRecoveryAPI._provider_recovery_service(self)
+        await recovery._release_provider_reservation(
+            store, task_id=task_id, attempt_id=attempt_id, amount=amount
+        )
+
+    async def _finalize_provider_outcome(
+        self,
+        task_id: str,
+        *,
+        resolution: str,
+        attempt_id: str,
+    ) -> None:
+        recovery = ProviderOutcomeRecoveryAPI._provider_recovery_service(self)
+        await recovery._finalize_provider_outcome(
+            task_id, resolution=resolution, attempt_id=attempt_id
+        )
 
 
 class ProviderOutcomeRecoveryService:

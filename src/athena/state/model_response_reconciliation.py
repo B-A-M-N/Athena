@@ -17,14 +17,22 @@ async def reject_unresolved_legacy_receipts(
     model: str,
     request_fingerprint: str,
 ) -> None:
-    """Prevent a new fingerprint from silently bypassing an old liability."""
+    """Prevent a new fingerprint from silently bypassing a raw-pending liability.
+
+    Only receipts whose provider call never produced an outcome event
+    (``pending`` or pre-attempt legacy rows) block a new fingerprint.
+    Receipts with an explicit outcome event (``unknown`` or a confirmed
+    resolution) coexist as sibling attempts by design; their liability is
+    governed by the operator-visible provider-outcome recovery machinery.
+    """
     rows = await db.fetch_all_raw(
         "SELECT r.*, a.status AS attempt_status, "
         "a.provider_outcome_status AS attempt_outcome_status "
         "FROM model_response_receipts AS r "
         "LEFT JOIN model_response_attempts AS a ON a.attempt_id = r.attempt_id "
         "WHERE r.task_id = ? AND r.provider = ? AND r.model = ? "
-        "AND r.request_fingerprint != ?",
+        "AND r.request_fingerprint != ? "
+        "AND (r.provider_outcome_status IS NULL OR r.provider_outcome_status = 'pending')",
         (task_id, provider, model, request_fingerprint),
     )
     unresolved = [row for row in rows if _requires_reconciliation(row)]
