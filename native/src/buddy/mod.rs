@@ -370,10 +370,10 @@ const fn owl_frame(_source: &[u32; 40], phase: usize) -> [u32; 40] {
 /// cat ears/tail and bot antenna/face panel are authored into their masks.
 const fn cat_frame(source: &[u32; 40], phase: usize) -> [u32; 40] {
     let mut output = *source;
-    output[1] |= 1_u32 << (8 + phase % 2) | 1_u32 << (23 - phase % 2);
-    output[2] |= 1_u32 << 7 | 1_u32 << 24;
-    output[30] |= 1_u32 << 1 | 1_u32 << 2 | 1_u32 << 3;
-    output[31] |= 1_u32 << 0 | 1_u32 << 1;
+    output[1] |= (1_u32 << (8 + phase % 2)) | (1_u32 << (23 - phase % 2));
+    output[2] |= (1_u32 << 7) | (1_u32 << 24);
+    output[30] |= (1_u32 << 1) | (1_u32 << 2) | (1_u32 << 3);
+    output[31] |= (1_u32 << 0) | (1_u32 << 1);
     output
 }
 
@@ -387,7 +387,7 @@ const fn bot_frame(source: &[u32; 40], phase: usize) -> [u32; 40] {
         row += 1;
     }
     output[0] |= 1_u32 << (15 + phase % 2);
-    output[1] |= 1_u32 << 15 | 1_u32 << 16 | 1_u32 << 17;
+    output[1] |= (1_u32 << 15) | (1_u32 << 16) | (1_u32 << 17);
     output
 }
 
