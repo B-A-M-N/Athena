@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import inspect
 from dataclasses import asdict
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Mapping
 
 from athena.protocol.models import ModelResponse, UsageInfo
@@ -249,7 +249,6 @@ class ModelResponseStore:
                 idempotency_semantics=idempotency_semantics,
             )
             return dict(existing or {})
-
 
     async def mark_reservation_applied(self, *, attempt_id: str) -> bool:
         timestamp = utcnow().isoformat()

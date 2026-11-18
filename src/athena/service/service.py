@@ -28,6 +28,7 @@ import os
 import tempfile
 from dataclasses import replace
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 

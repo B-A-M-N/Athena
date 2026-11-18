@@ -123,9 +123,7 @@ class ServiceLifecycle:
         if not isinstance(checks, dict):
             return
         degraded = any(
-            value.get("status") != "ok"
-            for value in checks.values()
-            if isinstance(value, dict)
+            value.get("status") != "ok" for value in checks.values() if isinstance(value, dict)
         )
         self.ports.startup_health["status"] = "degraded" if degraded else "ok"
         self.ports.startup_health["blocking_failures"] = [
@@ -278,7 +276,6 @@ class ServiceLifecycle:
     ) -> None:
         """Build scheduler/maintenance owners, then register their capabilities."""
         cfg = self.ports.config
-        events = self.ports.store_events
         scheduler = Scheduler(
             store=self.ports.store_schedules,
             task_manager=task_manager,

@@ -31,6 +31,7 @@ class TaskAPIPorts:
         "kernel": "_kernel",
         "store_tasks": "_store_tasks",
         "config": "config",
+        "self_host": "_self_host",
     }
     _APPLICATION_OPERATIONS = {
         "require_agent_ready": "require_agent_ready",
@@ -231,9 +232,7 @@ class TaskAPI:
             # its task/claim transition before generic intake can enqueue it.
             return
         if metadata.get("_intake_owner") == "self_host" or metadata.get("_athena_self_host"):
-            reconciler = getattr(
-                getattr(self._svc, "_self_host", None), "reconcile_created_task", None
-            )
+            reconciler = getattr(self._ports.self_host, "reconcile_created_task", None)
             if not callable(reconciler) or not await reconciler(task):
                 return
         try:
@@ -268,9 +267,7 @@ class TaskAPI:
                 "_athena_self_host"
             ):
                 continue
-            reconciler = getattr(
-                getattr(self._svc, "_self_host", None), "reconcile_created_task", None
-            )
+            reconciler = getattr(self._ports.self_host, "reconcile_created_task", None)
             if callable(reconciler) and await reconciler(task):
                 self_host_recovered += 1
             else:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from decimal import Decimal, InvalidOperation
+from collections.abc import Mapping
 from typing import Any
 
 from athena.protocol.failure import FailureInfo
@@ -346,6 +347,11 @@ class ProviderOutcomeRecoveryService:
         for attempt in await store.list_resolved_attempts():
             try:
                 resolution = str(attempt.get("provider_outcome_status") or "")
+                retry_authorized = (
+                    resolution == "unknown"
+                    and bool(attempt.get("retry_authorized_at"))
+                    and attempt.get("reservation_released_at") is None
+                )
                 task_id = str(attempt.get("task_id") or "")
                 amount = _validated_actual_cost(attempt.get("reservation_amount")) or Decimal("0")
                 attempt_id = str(attempt.get("attempt_id") or "")
@@ -363,9 +369,7 @@ class ProviderOutcomeRecoveryService:
                 # A retry-authorized attempt keeps the original unknown
                 # outcome's reservation as open liability; only a confirmed
                 # failed outcome releases it during reconciliation.
-                if resolution == "confirmed_failed" and not attempt.get(
-                    "reservation_released_at"
-                ):
+                if resolution == "confirmed_failed" and not attempt.get("reservation_released_at"):
                     await self._release_provider_reservation(
                         store, task_id=task_id, attempt_id=attempt_id, amount=amount
                     )
