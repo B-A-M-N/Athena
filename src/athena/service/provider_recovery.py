@@ -76,7 +76,7 @@ class ProviderOutcomeRecoveryAPI:
         if recovery is None:
             recovery = ProviderOutcomeRecoveryAPI.compose(self)
             try:
-                setattr(self, "_provider_recovery_runtime", recovery)
+                self._provider_recovery_runtime = recovery
             except AttributeError:
                 pass
         return recovery
