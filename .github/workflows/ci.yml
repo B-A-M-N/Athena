@@ -4,7 +4,10 @@ name: CI
 on:  # yamllint disable-line rule:truthy
   pull_request:
   push:
-    branches: [main]
+    # Candidate release qualification branches are listed here so pushing to
+    # them triggers the certification chain (see core-release-certification
+    # below); every privileged job keeps its push-to-main/tag-only guard.
+    branches: [main, candidate/next-release, fix/pr6-safe-main-integration]
     tags: ["v*", "[0-9]+.[0-9]+.[0-9]+"]
   # Candidate release qualification: the certification chain can be exercised
   # against any branch before merging to main. Dispatched runs are

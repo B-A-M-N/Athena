@@ -116,14 +116,10 @@ class RuntimeSessionStore:
     ) -> None:
         now = utcnow().isoformat()
         safe_metadata = sanitize_session_metadata(metadata)
-        workspace_identity = _metadata_value(
-            safe_metadata, "workspace_identity", "workspace_root"
-        )
+        workspace_identity = _metadata_value(safe_metadata, "workspace_identity", "workspace_root")
         network_policy = _metadata_value(safe_metadata, "network_policy")
         process_identity = _metadata_value(safe_metadata, "process_identity")
-        environment_fingerprint = _metadata_value(
-            safe_metadata, "environment_fingerprint"
-        )
+        environment_fingerprint = _metadata_value(safe_metadata, "environment_fingerprint")
         runtime_version = _metadata_value(safe_metadata, "runtime_version")
         start_identity = _metadata_value(safe_metadata, "start_identity")
         try:
