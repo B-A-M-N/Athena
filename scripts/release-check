@@ -573,6 +573,46 @@ def main(argv: list[str] | None = None) -> int:
             env["ATHENA_CARGO_DENY_BIN"] = str(cargo_deny_root / "bin" / "cargo-deny")
             if evidence_dir is not None and cargo_deny_receipt.is_file():
                 shutil.copy2(cargo_deny_receipt, evidence_stage / cargo_deny_receipt.name)
+        # Materialize the provisioned-toolchain contract inside the frozen
+        # checkout so release-script tests execute the same environment a
+        # provisioned developer checkout satisfies (scripts/cosign-env and
+        # the toolchain-passport contract).  Entries are gitignored, so the
+        # --require-clean assertions stay valid.
+        provisioned_toolchain = checkout / ".release-toolchain"
+        provisioned_toolchain.mkdir(parents=True, exist_ok=True)
+        provisioned_cosign = provisioned_toolchain / "bin" / "cosign"
+        resolved_cosign_env = (
+            env.get("ATHENA_COSIGN") or env.get("COSIGN_BIN") or shutil.which("cosign")
+        )
+        if resolved_cosign_env and not provisioned_cosign.exists():
+            provisioned_toolchain.joinpath("bin").mkdir(parents=True, exist_ok=True)
+            os.symlink(
+                str(Path(resolved_cosign_env).resolve()),
+                str(provisioned_cosign),
+            )
+        provisioned_cargo_deny = provisioned_toolchain / "cargo-deny" / "bin" / "cargo-deny"
+        resolved_cargo_deny = env.get("ATHENA_CARGO_DENY_BIN")
+        if resolved_cargo_deny and Path(resolved_cargo_deny).is_file() and not provisioned_cargo_deny.exists():
+            provisioned_toolchain.joinpath("cargo-deny", "bin").mkdir(parents=True, exist_ok=True)
+            os.symlink(
+                str(Path(resolved_cargo_deny).resolve()),
+                str(provisioned_cargo_deny),
+            )
+        if not Path(checkout / ".venv").exists():
+            # scripts/cosign-env resolves the release python through the
+            # real project .venv, so the frozen checkout must carry a real
+            # entry point, not a redirect to the lane-private environment.
+            venv_record = _run(
+                [args.uv, "sync", "--frozen"],
+                cwd=checkout,
+                env={**env, "UV_PROJECT_ENVIRONMENT": str(checkout / ".venv")},
+                timeout=args.timeout,
+            )
+            if int(venv_record.get("exit_code") or 0) != 0:
+                raise RuntimeError(
+                    "frozen-checkout project environment sync failed: "
+                    + str(venv_record.get("output") or "")
+                )
         lanes_to_run = release_commands(
             args.uv,
             skip_e2e=args.skip_e2e,
