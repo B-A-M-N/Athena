@@ -320,6 +320,42 @@ jobs:
                 --defer-signing \
                 --evidence-dir "$RUNNER_TEMP/athena-release-evidence"
             '
+      - name: Capture visual-golden candidates and per-fixture RMSE (owner evidence, nonpublishing)
+        # Evidence-only companion to verify mode.  Captures the 45 mandatory
+        # fixtures plus the physical cabinet from THIS candidate commit into
+        # RUNNER_TEMP (never the checked-in golden assets), then compares each
+        # capture against the committed approved goldens and prints the full
+        # per-fixture RMSE table.  Nothing is approved or regenerated in the
+        # repository; golden review status stays an owner decision.
+        continue-on-error: true
+        env:
+          NATIVE_VISUAL_UPDATE_GOLDENS: "1"
+          NATIVE_VISUAL_GOLDEN_DIR: "${{ runner.temp }}/athena-visual-candidates"
+          NATIVE_CABINET_UPDATE_GOLDEN: "1"
+          NATIVE_CABINET_GOLDEN: "${{ runner.temp }}/athena-visual-candidates/cabinet-golden.png"
+        run: |
+          set -euo pipefail
+          candidate_dir="${RUNNER_TEMP}/athena-visual-candidates"
+          rm -rf "$candidate_dir"
+          mkdir -p "$candidate_dir"
+          cp native/assets/oi/visual-goldens/manifest.json "$candidate_dir/manifest.json"
+          xvfb-run -a -s '-screen 0 1920x1080x24 -ac' \
+            bash -ceu '
+              openbox --replace >/tmp/athena-openbox-capture.log 2>&1 &
+              wm_pid=$!
+              trap "kill $wm_pid 2>/dev/null || true" EXIT
+              sleep 1
+              scripts/native-visual-smoke || true
+            '
+          GOLDEN_DIR="${RUNNER_TEMP}/athena-visual-candidates" \
+            python3 scripts/compare-visual-goldens.py
+
+      - name: Upload candidate visual-capture evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: athena-visual-candidates-${{ github.sha }}
+          path: ${{ runner.temp }}/athena-visual-candidates
       - name: Upload certified release artifacts and evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
