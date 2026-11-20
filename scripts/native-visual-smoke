@@ -46,18 +46,11 @@ import os
 from pathlib import Path
 
 repo_root = Path(os.environ["REPO_ROOT"])
-renderer_files = [
-    "native/src/lib.rs", "native/src/x11.rs", "native/src/buddy/mod.rs",
-    "native/src/buddy/poses.rs", "native/src/render/buddy.rs",
-    "native/src/render/chassis.rs", "native/src/render/frame.rs",
-    "native/src/render/oi/mod.rs", "native/src/render/oi/attention.rs",
-    "native/src/render/oi/compose.rs", "native/src/render/oi/layout.rs",
-    "native/src/render/oi/motion.rs", "native/src/render/oi/scenes.rs",
-    "native/src/render/oi/target.rs", "native/src/render/oi/telemetry.rs",
-    "native/src/render/primitives.rs",
-    "native/src/render/prompt.rs", "native/src/render/terminal.rs",
-    "native/src/render/text.rs", "native/src/render/theme.rs",
-]
+renderer_files = json.loads(
+    (repo_root / "native/assets/oi/visual-goldens/renderer-files.json").read_text(
+        encoding="utf-8"
+    )
+)["renderer_files"]
 
 def renderer_revision():
     digest = hashlib.sha256()
@@ -418,7 +411,8 @@ PY
   '
 
 if [[ "$update_goldens" == "1" ]]; then
-  MANIFEST_PATH="$manifest_path" GOLDEN_DIR="$golden_dir" REPO_ROOT="$repo_root" "$system_python" -c '
+  MANIFEST_PATH="$manifest_path" GOLDEN_DIR="$golden_dir" REPO_ROOT="$repo_root" \
+  CAPTURE_DIR="$tmp_dir" "$system_python" -c '
 import hashlib
 import json
 import os
@@ -427,24 +421,32 @@ from pathlib import Path
 repo_root = Path(os.environ["REPO_ROOT"])
 manifest_path = Path(os.environ["MANIFEST_PATH"])
 golden_dir = Path(os.environ["GOLDEN_DIR"])
-renderer_files = [
-    "native/src/lib.rs", "native/src/x11.rs", "native/src/buddy/mod.rs",
-    "native/src/buddy/poses.rs", "native/src/render/buddy.rs",
-    "native/src/render/chassis.rs", "native/src/render/frame.rs",
-    "native/src/render/oi/mod.rs", "native/src/render/oi/attention.rs",
-    "native/src/render/oi/compose.rs", "native/src/render/oi/layout.rs",
-    "native/src/render/oi/motion.rs", "native/src/render/oi/scenes.rs",
-    "native/src/render/oi/target.rs", "native/src/render/oi/telemetry.rs",
-    "native/src/render/primitives.rs",
-    "native/src/render/prompt.rs", "native/src/render/terminal.rs",
-    "native/src/render/text.rs", "native/src/render/theme.rs",
-]
+capture_dir = Path(os.environ["CAPTURE_DIR"])
+renderer_files = json.loads(
+    (repo_root / "native/assets/oi/visual-goldens/renderer-files.json").read_text(
+        encoding="utf-8"
+    )
+)["renderer_files"]
 revision = hashlib.sha256()
 for relative in renderer_files:
     revision.update(relative.encode())
     revision.update(b"\0")
     revision.update((repo_root / relative).read_bytes())
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+required_stems = {name[:-4] for name in manifest["required_pngs"]}
+captured_stems = {
+    path.name[:-4]
+    for path in capture_dir.glob("*.png")
+    if not path.name.startswith("operator-persistence")
+    and not path.name.endswith(".oi.png")
+}
+missing = sorted(required_stems - captured_stems)
+unexpected = sorted(captured_stems - required_stems)
+if missing or unexpected:
+    raise SystemExit(
+        "visual golden refresh would not cover the required fixtures: "
+        f"missing={missing} unexpected={unexpected}"
+    )
 manifest["review_status"] = "pending"
 manifest["renderer_revision"] = revision.hexdigest()
 manifest["golden_hashes"] = {
