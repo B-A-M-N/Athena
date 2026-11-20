@@ -17,6 +17,7 @@ EXCLUDED_DIRECTORIES = frozenset(
         ".venv",
         ".artifacts",
         ".pytest_cache",
+        ".hypothesis",
         ".mypy_cache",
         ".ruff_cache",
         "__pycache__",
