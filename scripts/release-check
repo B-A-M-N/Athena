@@ -799,6 +799,11 @@ def main(argv: list[str] | None = None) -> int:
                     str(record.get("output") or ""),
                 )
             if int(record.get("exit_code") or 0) != 0:
+                # Publish the failing lane's output tail before raising so a
+                # red certification names its actual root cause in the run log.
+                output_tail = str(record.get("output") or "")[-4000:]
+                if output_tail:
+                    print(f"[release-check] lane {name} failed; output tail:\n{output_tail}")
                 raise RuntimeError(
                     f"command failed with exit {record['exit_code']}: {' '.join(command)}"
                 )
@@ -927,6 +932,11 @@ def main(argv: list[str] | None = None) -> int:
                     record["release_run_id"] = run_id
                     lanes.append(record)
                     if int(record.get("exit_code") or 0) != 0:
+                        output_tail = str(record.get("output") or "")[-4000:]
+                        if output_tail:
+                            print(
+                                f"[release-check] lane {name} failed; output tail:\n{output_tail}"
+                            )
                         raise RuntimeError(
                             f"command failed with exit {record['exit_code']}: {' '.join(command)}"
                         )
