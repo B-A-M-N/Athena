@@ -218,12 +218,18 @@ jobs:
   core-release-certification:
     # workflow_dispatch runs the identical certification chain against a
     # candidate branch (defer-signing, no publishing); push runs remain the
-    # authoritative post-merge qualification.
+    # authoritative post-merge qualification.  Pushes to the candidate
+    # integration branch also certify pre-merge when dispatch rights are not
+    # available to the automation identity.  This is a nonpublishing
+    # qualification path: every privileged job below keeps its push-to-main/
+    # tag gate, so signing and publication stay unreachable from a candidate.
     if: >-
       (github.event_name == 'workflow_dispatch') ||
       (github.event_name == 'push' &&
       (github.ref == 'refs/heads/main' ||
-      startsWith(github.ref, 'refs/tags/')))
+      startsWith(github.ref, 'refs/tags/') ||
+      github.ref == 'refs/heads/candidate/next-release' ||
+      github.ref == 'refs/heads/fix/pr6-safe-main-integration'))
     # Keep release builds on the GLIBC-compatible baseline used by the native
     # artifact policy; Ubuntu 24.04 emits newer imported symbols.
     runs-on: ubuntu-22.04
