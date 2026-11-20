@@ -7,7 +7,7 @@ from athena.execution.conformance import (
     run_backend_conformance,
     run_backend_passport,
 )
-from athena.execution.conformance_probes import containment_source
+from athena.execution.conformance_probes import containment_source, prove_containment
 from athena.execution.manager import ExecutionManager
 from athena.execution.runtimes import NodeRuntime, PythonRuntime, ShellRuntime
 from athena.protocol.execution import ExecutionExitStatus, ExecutionResult
@@ -175,3 +175,65 @@ async def test_local_runtime_matrix_is_behaviorally_proven(tmp_path):
         assert all("execution" in receipt.checks for receipt in receipts)
     finally:
         await manager.close_all()
+
+
+class _BoundaryManager:
+    """Fake manager where allow/deny outcomes are scriptable per session task."""
+
+    def __init__(self, *, allow_stdout: str, deny_stdout: str):
+        self.allow_stdout = allow_stdout
+        self.deny_stdout = deny_stdout
+
+    async def create_session(self, **kwargs):
+        return f"{kwargs['runtime']}-session"
+
+    async def execute(self, request):
+        output = self.allow_stdout if "positive" in request.task_id else self.deny_stdout
+        return ExecutionResult(
+            execution_id="fixture",
+            exit_code=0,
+            status=ExecutionExitStatus.EXITED,
+            stdout=output,
+        )
+
+    async def destroy_session(self, _session_id):
+        return None
+
+
+def _advertised():
+    return {"filesystem_containment": True, "network_containment": True}
+
+
+@pytest.mark.asyncio
+async def test_failed_network_positive_control_is_recorded_as_failure():
+    proof = await prove_containment(
+        _BoundaryManager(allow_stdout="FS=DENIED NET=DENIED", deny_stdout="FS=DENIED NET=DENIED"),
+        backend="local",
+        runtime="python",
+        workspace_id="ws",
+        workspace_root="/tmp",
+        cwd=None,
+        advertised=_advertised(),
+        require_all_claims=True,
+    )
+    assert proof.proven["filesystem_containment"] is True
+    assert not proof.proven["network_containment"]
+    assert any("positive control failed" in failure for failure in proof.failures), proof.failures
+    assert proof.contract_checks["network_containment"]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_passed_network_positive_control_does_not_record_failure():
+    proof = await prove_containment(
+        _BoundaryManager(allow_stdout="FS=DENIED NET=ALLOWED", deny_stdout="FS=DENIED NET=DENIED"),
+        backend="local",
+        runtime="python",
+        workspace_id="ws",
+        workspace_root="/tmp",
+        cwd=None,
+        advertised=_advertised(),
+        require_all_claims=True,
+    )
+    assert all(proof.proven.values())
+    assert proof.failures == (), proof.failures
+    assert proof.contract_checks["network_containment"]["status"] == "passed"
