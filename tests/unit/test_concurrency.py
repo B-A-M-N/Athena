@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 
 import pytest
 
@@ -90,10 +91,9 @@ async def test_run_blocking_cancellation_bounds_worker_admission(count: int) -> 
                 active -= 1
 
     tasks = [asyncio.create_task(run_blocking(blocked)) for _ in range(count)]
-    for _ in range(1000):
-        if started.is_set():
-            break
-        await asyncio.sleep(0)
+    admission_deadline = time.monotonic() + 5.0
+    while not started.is_set() and time.monotonic() < admission_deadline:
+        await asyncio.sleep(0.005)
     assert started.is_set(), "a bounded worker should start within the admission probe"
     await asyncio.sleep(0.02)
     assert peak <= 16
@@ -128,10 +128,12 @@ async def test_run_blocking_keeps_long_waiters_from_exhausting_short_capacity() 
                 active -= 1
 
     long_tasks = [asyncio.create_task(run_blocking(long_blocked, _pool="long")) for _ in range(10)]
-    for _ in range(1000):
-        if started.is_set():
-            break
-        await asyncio.sleep(0)
+    # Worker threads are scheduled by the OS, not the event loop; spinning on
+    # bare yields can starve them under loaded xdist runners. Poll until a
+    # bounded deadline instead.
+    admission_deadline = time.monotonic() + 5.0
+    while not started.is_set() and time.monotonic() < admission_deadline:
+        await asyncio.sleep(0.005)
     assert started.is_set(), "all long-pool workers should admit before the probe"
 
     assert await asyncio.wait_for(run_blocking(lambda: "short"), timeout=1) == "short"
