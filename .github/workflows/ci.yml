@@ -321,6 +321,7 @@ jobs:
                 --evidence-dir "$RUNNER_TEMP/athena-release-evidence"
             '
       - name: Capture visual-golden candidates and per-fixture RMSE (owner evidence, nonpublishing)
+        if: always()
         # Evidence-only companion to verify mode.  Captures the 45 mandatory
         # fixtures plus the physical cabinet from THIS candidate commit into
         # RUNNER_TEMP (never the checked-in golden assets), then compares each

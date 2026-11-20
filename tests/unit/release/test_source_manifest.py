@@ -15,6 +15,9 @@ def test_source_manifest_detects_changes_but_ignores_release_outputs(tmp_path):
     hypothesis_state.mkdir(parents=True)
     hypothesis_state.joinpath("0015c0ec5754ebf3").write_bytes(b"example-db")
     (tmp_path / ".hypothesis" / ".gitignore").write_text("*\n", encoding="utf-8")
+    toolchain = tmp_path / ".release-toolchain" / "bin"
+    toolchain.mkdir(parents=True)
+    (toolchain / "cosign").write_bytes(b"provisioned-binary")
     cache = tmp_path / ".pytest_cache"
     cache.mkdir()
     (cache / "v").write_text("cache", encoding="utf-8")
