@@ -512,6 +512,13 @@
       "old_budget": 1068,
       "new_budget": 1177,
       "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows tasks/budgets.py: retained behavior from both sides ratcheted at the integrated total (old 1068); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "state/runtime_sessions.py",
+      "old_budget": 223,
+      "new_budget": 287,
+      "rationale": "RuntimeSessionStore.start gains durable reincarnation of dead rows after service restart: the deterministic session id (runtime_task) collided with the recovery-marked dead row, dropping the recovery record (UNIQUE violation swallowed; with durability_mandatory the new incarnation failed to persist). Identity checks (task/backed/runtime/cwd/workspace/network-policy) and merged metadata add ~64 lines; retire by extracting session identity validation into a dedicated module."
     }
   ]
 }
