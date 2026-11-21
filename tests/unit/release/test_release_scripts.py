@@ -48,6 +48,60 @@ def test_release_check_requires_every_required_scenario_to_pass() -> None:
     assert failures == ["HOST-001"]
 
 
+def test_system_python_resolution_prefers_xlib_capable_interpreter(monkeypatch) -> None:
+    """The system interpreter chosen for native X11 lanes must import Xlib.
+
+    Regression: on certification runners, actions/setup-python's interpreter
+    shadows /usr/bin/python3 on PATH, so ``shutil.which("python3")`` picked
+    an interpreter without the apt-installed python3-xlib and
+    ``native-desktop-acceptance`` failed closed with "python3-xlib is
+    required for EWMH state normalization".
+    """
+    release_check = runpy.run_path(str(_ROOT / "scripts" / "release-check"))
+    resolve = release_check["_resolve_system_python"]
+    # runpy.run_path copies the namespace, so patch the function's real
+    # module globals rather than the returned mapping.
+    script_globals = resolve.__globals__
+
+    xlib_capable_paths = {"/usr/bin/python3", "/opt/hostedtoolcache/python-with-xlib/bin/python3"}
+
+    def xlib_capable(interpreter: str) -> bool:
+        return interpreter in xlib_capable_paths
+
+    monkeypatch.setitem(script_globals, "_python_imports_xlib", xlib_capable)
+
+    # The CI failure signature: PATH python3 lacks Xlib -> fall back to the
+    # system interpreter that provides it.
+    assert resolve("/opt/hostedtoolcache/python/bin/python3") == "/usr/bin/python3"
+
+    # An Xlib-capable PATH interpreter is kept as-is.
+    assert (
+        resolve("/opt/hostedtoolcache/python-with-xlib/bin/python3")
+        == "/opt/hostedtoolcache/python-with-xlib/bin/python3"
+    )
+
+    # No interpreter provides Xlib: keep the PATH interpreter rather than
+    # changing behavior the contract does not require.
+    monkeypatch.setitem(script_globals, "_python_imports_xlib", lambda _interpreter: False)
+    assert (
+        resolve("/opt/hostedtoolcache/python/bin/python3")
+        == "/opt/hostedtoolcache/python/bin/python3"
+    )
+
+    # A missing PATH interpreter with a working system interpreter is usable.
+    monkeypatch.setitem(script_globals, "_python_imports_xlib", xlib_capable)
+    assert resolve(None) == "/usr/bin/python3"
+
+
+def test_system_python_resolution_returns_none_without_path_interpreter(monkeypatch) -> None:
+    release_check = runpy.run_path(str(_ROOT / "scripts" / "release-check"))
+    resolve = release_check["_resolve_system_python"]
+    # No python3 on PATH and system /usr/bin/python3 cannot import Xlib:
+    # resolution stays None (the lane then fails closed with its own message).
+    monkeypatch.setitem(resolve.__globals__, "_python_imports_xlib", lambda _interpreter: False)
+    assert resolve(None) is None
+
+
 def test_support_matrix_generation_executes_against_bound_fixture(tmp_path: Path) -> None:
     source_sha = "a" * 40
     run_id = "fixture-run"
