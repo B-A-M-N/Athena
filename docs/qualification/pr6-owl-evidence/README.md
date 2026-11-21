@@ -10,10 +10,25 @@ clock); nothing in `native/assets/oi/visual-goldens/` was modified.
 
 ## Findings
 
-- 30/45 fixtures (all `bot` and `cat`) are within the 0.08 RMSE threshold
-  (range 0.069–0.079).
-- 15/45 fixtures exceed it — **every owl-family fixture** (0.078–0.091),
-  across all scenes. See `45-fixture-rmse-table.csv`.
+> **Correction (supersedes the numbers in the first PR #7 report):** an
+> earlier comment stated "15/45 fixtures exceed it — every owl-family
+> fixture (0.078–0.091)". The reconciled figures from
+> `45-fixture-rmse-table.csv` are: **21/45 fixtures exceed the 0.08 RMSE
+> threshold — 17 of 19 owl fixtures (0.0805–0.0908) plus 4 non-owl
+> fixtures** (`approval-bot` 0.0828563, `approval-cat` 0.0828562,
+> `failure-bot`/`failure-cat` 0.0814077, scene-level drift). "All owl
+> fixtures exceed" was wrong: `1672-idle-owl` (0.0779161) and
+> `1672-code-owl` (0.0787659) pass. The claim "all 30 bot/cat fixtures
+> pass" was also wrong: 22 of the 26 non-owl fixtures pass, 4 exceed.
+> (44837755514, 44843525464) produced the identical over-threshold set;
+> only `typing-long-owl` moved at the 5th decimal (0.0841672 → 0.0841857,
+> caret-blink phase). See the resolution section below for the full list.
+
+- 24/45 fixtures are within the 0.08 RMSE threshold against the
+  pre-redesign goldens.
+- 21/45 fixtures exceed it — 17 owl-family fixtures (0.0805–0.0908) plus
+  `approval-bot`, `approval-cat`, `failure-bot`, `failure-cat` (0.081–0.083).
+  See `45-fixture-rmse-table.csv`.
 - Region analysis: the pixel difference between committed and captured frames
   is concentrated in the buddy-sprite region (owl density 0.22–0.27 vs 0.00–0.04
   for the bot sprite in the same region). The remaining frame-wide difference
@@ -44,18 +59,47 @@ clock); nothing in `native/assets/oi/visual-goldens/` was modified.
   `owl-committed-crop.png`, `owl-captured-crop.png`,
   `committed-approval-owl.png`, `captured-approval-owl.png`,
   `diff-approval-owl.png`.
+- `owl-review-6states.png` — post-approval 6-state defect review composite
+  (idle, approval, failure / code, search, read; 6x zoom, owl region).
+- `owl-ambient-context.png` — wide-context review of the ambient dot field.
 - `45-fixture-rmse-table.csv` — full per-fixture RMSE table from the
   certification capture step.
 
-## Owner decision
+## Owner decision (RESOLVED)
 
 The old owl (white, ~55 px, crown) and the new owl (96x90 px phosphor
 dot-field owl with ear tufts, crown lobes, orbital discs, talons) cannot both
-be the approved contract. No visual gate failure is resolvable by engineering
-correction: the renderer change is intentional, complete, tested, and
-digest-tracked; the committed goldens are simply stale relative to it.
-Outcome of a decision to adopt the new owl design: regenerate the 15 owl
-fixtures via `scripts/native-visual-smoke` refresh (fixture-identity asserts
-already enforced) and mark approval — owner-only. Declining reverts the owl
-renderer to the pre-`6bc9b8d` sprite. Until then the
-`core-release-certification` visual gate fails closed by design.
+be the approved contract. The repository owner reviewed the comparison
+artifacts and **approved retaining the new phosphor dot-field owl**
+(`6bc9b8d`, `draw_sampled_owl`), with the condition that the captures be
+inspected for actual visual defects first.
+
+### Defect inspection performed before regeneration
+
+- Six-state zoom review (idle, approval, failure, code, search, read):
+  recognizable owl silhouette in all states, twin symmetric eye fields,
+  correct signal colors (approval amber / failure red), no clipping, no
+  collision with identity-plate or UI text.
+- Ambient-field context review: the surrounding dots are the intentional
+  terrain/star dot-matrix field (Handoff.md D11), not rendering garbage.
+- Cross-run determinism: 43/45 captures byte-identical (sha256) between two
+  independent CI runs (`07d9fb7` and `1f874d8`); the exceptions
+  (`typing-long-{owl,bot,cat}`) differ only in a 194x16 px input-caret strip
+  (cursor blink phase is not frozen by the presentation clock), RMSE impact
+  < 0.001.
+
+### Resolution applied
+
+- Exactly the 21 over-threshold fixtures (17 owl + the 4 approval/failure
+  bot/cat) were refreshed from the authoritative final-HEAD certification
+  captures (run 44843525464). The other 24 fixtures and the cabinet golden
+  are byte-untouched.
+- The manifest was refreshed through the repository's update-mode mechanism
+  (`scripts/native-visual-smoke` refresh semantics): fixture-identity
+  assertion (45/45, no missing/unexpected), `renderer_revision` recomputed
+  over the 51 declared `renderer-files.json` inputs, `golden_hashes`
+  recomputed for all `required_pngs`, `capture_clock: fixed` preserved,
+  `review_status` set to `approved` reflecting the owner decision recorded
+  above. Thresholds unchanged.
+- Stale-approval invalidation verified still fail-closed: tampering any
+  declared renderer source invalidates `renderer_revision`.
