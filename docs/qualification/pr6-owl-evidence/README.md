@@ -92,8 +92,7 @@ inspected for actual visual defects first.
 
 - Exactly the 21 over-threshold fixtures (17 owl + the 4 approval/failure
   bot/cat) were refreshed from the authoritative final-HEAD certification
-  captures (run 44843525464). The other 24 fixtures and the cabinet golden
-  are byte-untouched.
+  captures (run 44843525464). The other 24 fixtures are byte-untouched.
 - The manifest was refreshed through the repository's update-mode mechanism
   (`scripts/native-visual-smoke` refresh semantics): fixture-identity
   assertion (45/45, no missing/unexpected), `renderer_revision` recomputed
@@ -103,3 +102,35 @@ inspected for actual visual defects first.
   above. Thresholds unchanged.
 - Stale-approval invalidation verified still fail-closed: tampering any
   declared renderer source invalidates `renderer_revision`.
+
+## Cabinet golden (second correction)
+
+The first report also claimed "cabinet golden PASSES, RMSE 0.0202 ≤ 0.03".
+That was a bad offline measurement. With the manifest gate fixed, CI runs
+the cabinet check and FAILS at RMSE **0.035235 > 0.03** — verified offline
+committed-vs-captured and reproduced by CI (run 44936425019).
+
+Classification performed before refresh:
+
+- The capture is **byte-identical across three independent CI runs"
+  (44837755514, 44843525464, 44936425019, sha256 `201212c3…`) — fully
+  deterministic; no run-to-run noise.
+- Attribution: the committed cabinet golden was captured at `d9f90c0`
+  ("converge hybrid TUI visuals", 2026-09-11). Subsequent PR-branch native
+  work (`8caeb70` chassis/text/prompt recomposition, `6bc9b8d` render
+  restructure: new `fonts.rs`, `glyphs.rs`, `fit.rs`, split `chassis.rs` —
+  the same overhaul family the owner approved for the owl) changed the
+  dot-matrix label rasterization deterministically.
+- Content identity verified: all banners/labels ("ATHENA // CONTROL DECK",
+  "ENC", "BRI", "FOCUS", "CRT", "ATHENA 01 // GLASS MODEL …") present at
+  identical positions in committed vs captured frames (`banner-zoom.png`);
+  the delta is glyph-raster/intensity level, not missing or relocated
+  content. The earlier read that the banner was "missing in the fresh
+  capture" was a misframed-crop artifact and is retracted.
+- No material defects found; the same phosphor-terminal design direction
+  applies.
+
+Resolution: `cabinet-golden.png` refreshed from the same byte-identical
+deterministic capture. Evidence: `cabinet-diff-heat.png` (full-frame diff
+attribution), `banner-zoom.png` (label content identity),
+`v-bottom-full.png` (region context). Threshold unchanged (0.03).
