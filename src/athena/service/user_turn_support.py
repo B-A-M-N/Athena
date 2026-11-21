@@ -5,8 +5,6 @@ from __future__ import annotations
 from typing import Any
 
 from athena.protocol.messages import (
-    ArtifactRefBlock,
-    FileRefBlock,
     Message,
     Provenance,
     Role,
@@ -45,13 +43,16 @@ class UserTurnSupport:
                 ),
             )
         ]
-        for attachment in getattr(request, "attachments", ()) or ():
-            if hasattr(attachment, "uri"):
-                blocks.append(ArtifactRefBlock(uri=str(attachment.uri), ref=attachment))
-            elif isinstance(attachment, dict):
-                uri = str(attachment.get("uri") or attachment.get("ref") or "")
-                if uri:
-                    blocks.append(FileRefBlock(uri=uri, mime_type=attachment.get("mime_type")))
+        # ``AgentRequest.attachments`` is ephemeral. CREATED-task recovery
+        # receives only the durable TaskSpec, whose context_refs are the
+        # canonical attachment representation. Prefer the request for the
+        # initial write, but always fall back to those refs after a restart.
+        from athena.service.intake import attachment_blocks
+
+        attachments = getattr(request, "attachments", None)
+        if not attachments:
+            attachments = getattr(task, "context_refs", ())
+        blocks.extend(attachment_blocks(attachments))
         message = Message(
             id=f"msg_user_{task.id}",
             role=Role.USER,

@@ -33,11 +33,11 @@ import time
 REPO = "/home/bamn/Athena"
 LOG = "/tmp/gate-env-guard.log"
 
-LOAD_CEIL = 3.0        # 1-min loadavg ceiling at launch
-LOAD_HARD = 12.0       # live ceiling before we shed our own tree
-MEM_FLOOR_GI = 5.0     # MemAvailable floor (GiB) at launch
-PSI_FLOOR = 25.0       # sustained memory PSI (some avg10) that means real stalls
-TREND_RATIO = 1.35     # load5/load1 above this = climbing, fail even under ceil
+LOAD_CEIL = 3.0  # 1-min loadavg ceiling at launch
+LOAD_HARD = 12.0  # live ceiling before we shed our own tree
+MEM_FLOOR_GI = 5.0  # MemAvailable floor (GiB) at launch
+PSI_FLOOR = 25.0  # sustained memory PSI (some avg10) that means real stalls
+TREND_RATIO = 1.35  # load5/load1 above this = climbing, fail even under ceil
 
 
 def log(msg: str) -> None:
@@ -150,9 +150,18 @@ def main() -> int:
     # take the gate down. start_new_session detaches it from our process group
     # and signal dispositions.
     gate = subprocess.Popen(
-        [".venv/bin/python", "scripts/release-check", "--sha", "10c7353",
-         "--bootstrap", "--evidence-dir", ".release-evidence"],
-        cwd=REPO, stdout=outfile, stderr=subprocess.STDOUT,
+        [
+            ".venv/bin/python",
+            "scripts/release-check",
+            "--sha",
+            "10c7353",
+            "--bootstrap",
+            "--evidence-dir",
+            ".release-evidence",
+        ],
+        cwd=REPO,
+        stdout=outfile,
+        stderr=subprocess.STDOUT,
         start_new_session=True,
     )
     log(f"launched run 6 (sha 10c7353) pid={gate.pid} (own session)")

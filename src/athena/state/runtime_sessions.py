@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from collections.abc import Mapping
 
 from athena.protocol.messages import utcnow
@@ -115,30 +116,93 @@ class RuntimeSessionStore:
     ) -> None:
         now = utcnow().isoformat()
         safe_metadata = sanitize_session_metadata(metadata)
-        await self._db.execute(
-            "INSERT INTO runtime_sessions("
-            "id, task_id, backend, runtime, cwd, workspace_identity, network_policy, "
-            "process_identity, environment_fingerprint, runtime_version, pid, is_alive, "
-            "start_identity, started_at, last_heartbeat, ended_at, metadata"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, NULL, ?)",
-            (
-                session_id,
-                task_id,
-                backend,
-                runtime,
-                cwd,
-                _metadata_value(safe_metadata, "workspace_identity", "workspace_root"),
-                _metadata_value(safe_metadata, "network_policy"),
-                _metadata_value(safe_metadata, "process_identity"),
-                _metadata_value(safe_metadata, "environment_fingerprint"),
-                _metadata_value(safe_metadata, "runtime_version"),
-                pid,
-                _metadata_value(safe_metadata, "start_identity"),
-                now,
-                now,
-                json.dumps(safe_metadata, default=str),
-            ),
-        )
+        workspace_identity = _metadata_value(safe_metadata, "workspace_identity", "workspace_root")
+        network_policy = _metadata_value(safe_metadata, "network_policy")
+        process_identity = _metadata_value(safe_metadata, "process_identity")
+        environment_fingerprint = _metadata_value(safe_metadata, "environment_fingerprint")
+        runtime_version = _metadata_value(safe_metadata, "runtime_version")
+        start_identity = _metadata_value(safe_metadata, "start_identity")
+        try:
+            await self._db.execute(
+                "INSERT INTO runtime_sessions("
+                "id, task_id, backend, runtime, cwd, workspace_identity, network_policy, "
+                "process_identity, environment_fingerprint, runtime_version, pid, is_alive, "
+                "start_identity, started_at, last_heartbeat, ended_at, metadata"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, NULL, ?)",
+                (
+                    session_id,
+                    task_id,
+                    backend,
+                    runtime,
+                    cwd,
+                    workspace_identity,
+                    network_policy,
+                    process_identity,
+                    environment_fingerprint,
+                    runtime_version,
+                    pid,
+                    start_identity,
+                    now,
+                    now,
+                    json.dumps(safe_metadata, default=str),
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            # Deterministic runtime session ids ("{runtime}_{task_id}") are
+            # re-derived after every service restart while the durable row of
+            # the previous incarnation survives (recovery marks it dead).
+            # Re-establishing that identical identity is the honest way to
+            # keep crash-recovery truth: a second crash must still find a
+            # live row to reconcile. Anything else remains a hard conflict.
+            if "runtime_sessions.id" not in str(exc):
+                raise
+            existing = await self.get(session_id)
+            if existing is None or existing.get("is_alive"):
+                raise
+            if str(existing.get("task_id") or "") != task_id:
+                raise
+            # Security-sensitive identity (workspace binding and policy) must
+            # be identical across incarnations of the same session id.
+            # Per-incarnation process facts (pid, process identity, runtime
+            # version fingerprints) legitimately describe the new incarnation.
+            for column, value in zip(
+                (
+                    "backend",
+                    "runtime",
+                    "cwd",
+                    "workspace_identity",
+                    "network_policy",
+                ),
+                (backend, runtime, cwd, workspace_identity, network_policy),
+                strict=True,
+            ):
+                if (existing.get(column) or None) != (value or None):
+                    raise RuntimeError(
+                        f"runtime session {session_id} identity changed across "
+                        f"re-establishment ({column})"
+                    ) from exc
+            merged = dict(existing.get("metadata") or {})
+            merged.update(safe_metadata)
+            merged["reincarnations"] = int(merged.get("reincarnations") or 0) + 1
+            merged["previous_ended_at"] = existing.get("ended_at")
+            merged_safe = sanitize_session_metadata(merged)
+            await self._db.execute(
+                "UPDATE runtime_sessions SET pid = ?, is_alive = 1, "
+                "process_identity = ?, environment_fingerprint = ?, "
+                "runtime_version = ?, start_identity = ?, started_at = ?, "
+                "last_heartbeat = ?, ended_at = NULL, metadata = ? WHERE id = ?",
+                (
+                    pid,
+                    process_identity,
+                    environment_fingerprint,
+                    runtime_version,
+                    start_identity,
+                    now,
+                    now,
+                    json.dumps(merged_safe, default=str),
+                    session_id,
+                ),
+            )
 
     async def mark_closed(self, session_id: str, *, metadata: dict | None = None) -> None:
         safe_metadata = sanitize_session_metadata(metadata)

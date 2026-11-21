@@ -183,15 +183,15 @@ async def prove_containment(
                         "status": "failed",
                         "positive_control": positive_detail,
                     }
+                    if require_all_claims:
+                        failures.append(
+                            "network containment positive control failed: " + positive_detail
+                        )
                 else:
                     contract_checks["network_containment"] = {
                         "status": "unverified",
                         "positive_control": positive_detail,
                     }
-                    if require_all_claims:
-                        failures.append(
-                            "network containment positive control failed: " + positive_detail
-                        )
             containment_session = await manager.create_session(
                 task_id=f"conformance-boundary-{runtime}",
                 runtime=runtime,

@@ -81,12 +81,6 @@ class StartupPhaseRunner:
             workspace=workspace,
             task_manager=authorities.task_manager,
         )
-        await self._start_workers(
-            cfg=cfg,
-            scheduler=self._ports.scheduler,
-            task_manager=authorities.task_manager,
-            kernel=reasoning["kernel"],
-        )
         self._finish_health()
 
     def _initialize(self) -> tuple[Any, WorkspaceSpec]:
@@ -246,7 +240,6 @@ class StartupPhaseRunner:
         self._ports.mcp_prompts = MCPPromptProvider()
         await self._ports.connect_mcp()
         registry.register(MCPContextCapability(self._ports.mcp_resources, self._ports.mcp_prompts))
-        await self._ports.start_mcp_supervisor()
         if self._ports.pack_manager is not None:
             self._lifecycle._bind_pack_lifecycle(
                 skill_lifecycle=self._ports.skill_lifecycle,

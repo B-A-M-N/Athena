@@ -79,7 +79,7 @@ class ContextSupport:
             if loader is None:
                 loader = self._messages.list_session_messages
             return await loader(task.session_id)
-        except Exception as exc:
+        except Exception as exc:  # rationale: transcript loss is an integrity breach
             raise ContextIntegrityError(
                 f"canonical transcript unavailable for session {task.session_id}",
                 cause=exc,

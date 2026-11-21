@@ -7,9 +7,9 @@ truthful, and a product-shaped proof exercises the live path.
 | Area | Implementation status | Evidence |
 |---|---|---|
 | Continuation authority and approvals | Complete | Durable input rows, CAS answer consumption, per-task coordination, restart-safe relaunch, and race/barrier coverage. |
-| Provider-outcome recovery | Complete for bounded beta scope | Four explicit dispositions have a durable attempt/receipt/task/reservation contract; finite non-negative cost validation, first-writer-wins resolution, liability closeout, startup replay, and all-four-disposition restart coverage are present. |
+| Provider-outcome recovery | Complete for bounded beta scope | Four explicit dispositions have a durable attempt/receipt/task/reservation contract; keyed reservation amounts release by attempt ID, retry authorization retains the original UNKNOWN liability until reconciliation or explicit closeout, and startup replay is idempotent. |
 | Scheduler occurrence recovery | Complete for bounded beta scope | FIRED/next-run/disable writes share one transaction, legacy FIRED-with-unchanged-next-run repair is startup-safe, and tick/run-now/event concurrency plus duplicate delivery are covered. |
-| Ordinary task intake recovery | Complete for bounded beta scope | Task row → canonical `msg_user_<task-id>` → queue is phase-marked and restart-reconcilable; compatible existing CREATED rows retry intake, unsafe rows quarantine, and insert/message/enqueue fault paths are covered. |
+| Ordinary task intake recovery | Complete for bounded beta scope | Task row → canonical `msg_user_<task-id>` → queue is phase-marked and restart-reconcilable; compatible existing CREATED rows retry intake with full attachment provenance, unsafe rows quarantine, and insert/message/enqueue fault paths are covered. |
 | Operator CLI parity | Complete for current service/API surface | Typed nested Click and argparse trees expose documented command families, aliases, validation, completion, provider evidence fields, artifacts/candidates/mutations, and parity mappings in [`docs/CLI-PARITY.md`](CLI-PARITY.md). |
 | Principal identity | Complete | `AthenaConfig.cache_namespace` is the single default principal source; dispatcher, context, memory, history, workflows, skills, generated capabilities, reflection, and service APIs consume it. |
 | Context continuity | Complete for bounded beta scope | Hierarchical durable digests retain objective, decisions, work, runtime state, evidence, artifacts, failures, acceptance state, transcript anchors, and recovery queries. |
@@ -93,8 +93,11 @@ checkout is intentionally dirty, so this is not a frozen release claim.
   cycle bound that covers the soak matrix's documented recovery envelope.
 - Durable inference receipts are first-writer-wins, retain broker-derived
   actual usage, reconcile budget/provider rows by attempt ID, and reconstruct a
-  missing provider-usage row during replay. Legacy two-column migration ledgers
-  and failed database startup/retry paths have explicit regression coverage.
+  missing provider-usage row during replay. The keyed reservation ledger and
+  UNKNOWN retry authorization path preserve each attempt's exact financial
+  liability across concurrent releases, crashes, and restarts. Legacy
+  two-column migration ledgers and failed database startup/retry paths have
+  explicit regression coverage.
 
 ## Release boundary
 

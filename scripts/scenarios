@@ -555,6 +555,13 @@ def main(argv: list[str] | None = None) -> int:
         entries.append(entry)
         if not args.quiet:
             print(f"[{entry['status']:>7}] {sc.id} ({entry['duration_s']}s)", flush=True)
+            if entry["status"] == "failed":
+                for evidence in entry.get("evidence", ()):
+                    tail = str(evidence.get("tail") or "")[-2000:]
+                    if tail:
+                        print(
+                            f"[scenario-failure] {sc.id} output tail:\n{tail}", flush=True
+                        )
 
     families: dict[str, dict] = {}
     for fam in FAMILY_ORDER:

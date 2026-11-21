@@ -31,8 +31,20 @@ expected_mode="$("$system_python" -c 'import json,sys; print(json.load(open(sys.
 binary="$output_dir/bin/cargo-deny"
 mkdir -p "$output_dir"
 
+cargo_deny_build_min="1.88.0"
+active_rustc_release="$(rustc -vV | sed -n 's/^release: //p')"
+builder_toolchain=()
+oldest="$(printf '%s\n%s\n' "$active_rustc_release" "$cargo_deny_build_min" | sort -V | head -1)"
+if [[ "$oldest" != "$cargo_deny_build_min" ]]; then
+  # cargo-deny releases newer than the pinned workspace toolchain still need
+  # a rustc that can compile them; build the auditor with its own minimal
+  # toolchain without changing the project's locked build toolchain.
+  rustup toolchain install "$cargo_deny_build_min" --profile minimal
+  builder_toolchain=("+$cargo_deny_build_min")
+fi
+
 if [[ ! -x "$binary" ]]; then
-  cargo install cargo-deny --version "$expected_version" --locked --root "$output_dir"
+  cargo "${builder_toolchain[@]}" install cargo-deny --version "$expected_version" --locked --root "$output_dir"
 fi
 
 [[ -x "$binary" ]] || {
@@ -45,8 +57,8 @@ actual_version="$("$binary" --version | awk 'NR==1 {print $2}')"
   exit 1
 }
 actual_digest="$(sha256sum "$binary" | awk '{print $1}')"
-rustc_verbose="$(rustc -vV)"
-cargo_version="$(cargo --version)"
+rustc_verbose="$(rustc "${builder_toolchain[@]}" -vV)"
+cargo_version="$(cargo "${builder_toolchain[@]}" --version)"
 
 receipt="${ATHENA_CARGO_DENY_RECEIPT:-$output_dir/cargo-deny-bootstrap.json}"
 mkdir -p "$(dirname "$receipt")"

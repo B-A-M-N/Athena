@@ -312,6 +312,11 @@ class TaskIntake:
                         source_id=getattr(att, "id", None),
                         summary=getattr(att, "producer", None),
                         mime_type=getattr(att, "mime_type", None),
+                        hash=getattr(att, "hash", None),
+                        size=getattr(att, "size", None),
+                        storage_path=getattr(att, "storage_path", None),
+                        producer=getattr(att, "producer", None),
+                        metadata=dict(getattr(att, "metadata", {}) or {}),
                     )
                 )
             elif isinstance(att, dict):
@@ -322,6 +327,11 @@ class TaskIntake:
                         source_id=att.get("source_id"),
                         summary=att.get("summary"),
                         mime_type=att.get("mime_type"),
+                        hash=att.get("hash"),
+                        size=att.get("size"),
+                        storage_path=att.get("storage_path"),
+                        producer=att.get("producer") or att.get("summary"),
+                        metadata=dict(att.get("metadata") or {}),
                     )
                 )
         spec_kwargs: dict = dict(

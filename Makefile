@@ -1,20 +1,18 @@
-.PHONY: format format-check static-critical lint typecheck compile test full-test check critical-contracts perf performance scenarios arch-lint native-build native-check native-test native-fmt native-clippy native-smoke native-package release-check
+.PHONY: format format-check static-critical lint typecheck compile test full-test check critical-contracts perf performance scenarios arch-lint demo native-build native-check native-test native-fmt native-clippy native-smoke native-package release-check support-matrix-check migration-baseline
 
 UV ?= uv
-UV_RUN_DEV := $(UV) run --extra dev
+UV_RUN_DEV := $(UV) run --frozen --extra dev
 RUFF := $(UV_RUN_DEV) ruff
 MYPY := $(UV_RUN_DEV) mypy
 PYTHON := $(UV_RUN_DEV) python
-PYTEST := $(UV) run --extra dev --extra anthropic pytest
+PYTEST := $(UV) run --frozen --extra dev --extra anthropic pytest
+CHECK_ARTIFACT_DIR ?= .artifacts/check
 
 format:
 	$(RUFF) format src tests
 
 format-check:
 	$(RUFF) format --check src tests
-
-static-critical:
-	scripts/static-critical
 
 lint:
 	$(RUFF) check src tests
@@ -40,8 +38,22 @@ test:
 scenarios:
 	$(PYTHON) scripts/scenarios --output scenarios-manifest.json
 
+# Regenerate the published terminal demo intentionally.  This is not part of
+# the read-only merge gate because it updates the canonical GIF artifact.
+demo:
+	scripts/render-demo
+
 arch-lint:
 	$(PYTHON) scripts/architecture-lint
+
+static-critical:
+	bash scripts/static-critical
+
+support-matrix-check:
+	$(PYTHON) scripts/support-matrix-check
+
+migration-baseline:
+	$(PYTHON) scripts/verify-migration-baseline
 
 native-build:
 	cargo build --manifest-path native/Cargo.toml --locked --offline
@@ -79,6 +91,31 @@ release-check:
 # Appended (P1.29/P1.30/P1.32): the scenario manifest and the architecture
 # lint are part of the gate.  The kernel router-fallback defect that once
 # made arch-lint run red is fixed; the lint is part of the GREEN gate.
+check: format-check lint typecheck compile static-critical support-matrix-check migration-baseline
+	@set -eu; \
+	check_before="$$(git status --porcelain --untracked-files=no)"; \
+	check_status() { \
+		check_after="$$(git status --porcelain --untracked-files=no)"; \
+		if [ "$$check_before" != "$$check_after" ]; then \
+			echo "make check modified tracked files" >&2; \
+			echo "before:" >&2; echo "$$check_before" >&2; \
+			echo "after:" >&2; echo "$$check_after" >&2; \
+			return 1; \
+		fi; \
+	}; \
+	trap 'check_status_code=$$?; if ! check_status; then check_status_code=1; fi; exit "$$check_status_code"' EXIT; \
+	mkdir -p "$(CHECK_ARTIFACT_DIR)"; \
+	$(PYTEST) -q \
+		tests/unit/affordances/test_validation.py \
+		tests/unit/capabilities/test_synthesis_capability.py \
+		tests/unit/synthesis/test_synthesis.py \
+		tests/unit/models/test_compat_kernel.py \
+		tests/unit/models/test_openai_compat.py \
+		tests/unit/models/test_anthropic.py \
+		tests/unit/capabilities/test_dispatch_many_preflight.py; \
+	$(PYTHON) scripts/scenarios --exclude-family VHS --output "$(CHECK_ARTIFACT_DIR)/scenarios-manifest.json"; \
+	$(PYTHON) scripts/architecture-lint
+
 # Critical correctness contracts (P1.29): invariants protecting state
 # transactions, event idempotency, dispatcher controls/provenance, task
 # failure/finalization, and projection conformance.  Run on every PR.
@@ -102,15 +139,3 @@ performance:
 
 full-test: format-check static-critical lint typecheck compile native-fmt native-clippy
 	$(PYTEST) -q
-
-check: lint typecheck compile
-	$(PYTEST) -q \
-		tests/unit/affordances/test_validation.py \
-		tests/unit/capabilities/test_synthesis_capability.py \
-		tests/unit/synthesis/test_synthesis.py \
-		tests/unit/models/test_compat_kernel.py \
-		tests/unit/models/test_openai_compat.py \
-		tests/unit/models/test_anthropic.py \
-		tests/unit/capabilities/test_dispatch_many_preflight.py
-	$(PYTHON) scripts/scenarios --output /tmp/athena-check-scenarios.json
-	$(PYTHON) scripts/architecture-lint

@@ -108,6 +108,16 @@ class VerificationEnvironment:
             rustc_launcher = Path(rustc).resolve() if rustc else None
             compiler = Path(compiler_command).resolve() if compiler_command else None
             cargo_bin = Path(cargo).absolute().parent if cargo else None
+            # The resolved launcher binaries live inside the resolved parent
+            # directory, but ``cargo_bin`` can be a staging directory of
+            # symlinks (for example release-check's toolchain-bin) whose
+            # targets are NOT otherwise reachable. Bind the real launcher
+            # files themselves so symlink-style PATH entries stay executable
+            # inside the workspace sandbox.
+            rust_launcher_roots = (
+                cargo_launcher,
+                rustc_launcher,
+            )
             rustup_settings = rustup_home / "settings.toml"
             uv_cache_raw = os.environ.get("UV_CACHE_DIR")
             if uv_cache_raw:
@@ -127,6 +137,7 @@ class VerificationEnvironment:
                     rustup_settings if rustup_settings.is_file() else None,
                     rustup_home / "toolchains",
                     compiler,
+                    *rust_launcher_roots,
                 )
                 if path is not None and path.exists()
             )
