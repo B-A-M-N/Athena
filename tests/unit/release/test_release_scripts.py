@@ -175,6 +175,126 @@ def test_support_matrix_generation_executes_against_bound_fixture(tmp_path: Path
     )
 
 
+def test_support_matrix_certification_uses_recorded_output_tail(tmp_path: Path) -> None:
+    """Certification must read the lane receipt shape release-check writes.
+
+    Regression: release-check records lanes via _evidence_record, which
+    strips the raw "output" key and keeps only "output_tail"
+    ("output" is never present). generate-support-matrix read only
+    "output", so the python surface could never certify and
+    --require-certified failed on the first execution that reached it
+    (the stage was unreachable while the visual gates were stale).
+    """
+    source_sha = "b" * 40
+    run_id = "fixture-run"
+    platform_cell = (
+        f"{platform.system().lower()}-{platform.machine().lower().replace('amd64', 'x86_64')}"
+    )
+    matrix = {
+        "schema": 2,
+        "surfaces": {
+            "python": {
+                "claimed_versions": ["3.12"],
+                "claimed_platforms": [platform_cell],
+                "implementation_status": "implemented",
+            }
+        },
+    }
+
+    def lane_record(output_tail: str) -> dict:
+        return {
+            "name": "python-version",
+            "exit_code": 0,
+            "commit_sha": source_sha,
+            "release_run_id": run_id,
+            "output_tail": output_tail,
+        }
+
+    passport = {
+        "kind": "athena_backend_passport",
+        "status": "PASS",
+        "release_sha": source_sha,
+        "release_run_id": run_id,
+        "cells": [{"passed": True}],
+    }
+    shutil.copy2(_ROOT / "pyproject.toml", tmp_path / "pyproject.toml")
+    (tmp_path / "matrix.json").write_text(json.dumps(matrix))
+    (tmp_path / "passport.json").write_text(json.dumps(passport))
+    output = tmp_path / "release-support-matrix.json"
+    command = [
+        sys.executable,
+        str(_ROOT / "scripts" / "generate-support-matrix"),
+        "--matrix",
+        str(tmp_path / "matrix.json"),
+        "--passport",
+        str(tmp_path / "passport.json"),
+        "--release-lanes",
+    ]
+
+    # The exact evidence shape release-check publishes: no "output" key.
+    lanes_path = tmp_path / "lanes.json"
+    lanes_path.write_text(
+        json.dumps(
+            {
+                "commit_sha": source_sha,
+                "release_run_id": run_id,
+                "lanes": [lane_record("[release] python --version\nPython 3.12.240")],
+            }
+        )
+    )
+    result = subprocess.run(
+        [
+            *command,
+            str(lanes_path),
+            "--output",
+            str(output),
+            "--source-sha",
+            source_sha,
+            "--release-run-id",
+            run_id,
+            "--require-certified",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (
+        json.loads(output.read_text())["surfaces"]["python"]["certification_status"] == "certified"
+    )
+
+    # Fail closed when the recorded tail carries no exercised-version proof.
+    lanes_path.write_text(
+        json.dumps(
+            {
+                "commit_sha": source_sha,
+                "release_run_id": run_id,
+                "lanes": [lane_record("")],
+            }
+        )
+    )
+    result = subprocess.run(
+        [
+            *command,
+            str(lanes_path),
+            "--output",
+            str(output),
+            "--source-sha",
+            source_sha,
+            "--release-run-id",
+            run_id,
+            "--require-certified",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert "not certified" in result.stderr
+
+
 def test_migration_baseline_script_executes() -> None:
     result = subprocess.run(
         [

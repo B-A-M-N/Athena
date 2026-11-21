@@ -305,6 +305,11 @@ jobs:
       - name: Run protected release checks
         env:
           PYTHONUNBUFFERED: "1"
+          # The certification desktop session is Xvfb + Openbox, i.e. a real
+          # X11 session; xvfb-run does not set XDG_SESSION_TYPE itself, and
+          # the native support-matrix cell (linux-x86_64-x11-openbox) is
+          # derived from this value in the desktop-acceptance receipt.
+          XDG_SESSION_TYPE: "x11"
           ATHENA_COSIGN: cosign
           COSIGN_CERTIFICATE_IDENTITY: https://github.com/${{ github.workflow_ref }}
           COSIGN_CERTIFICATE_OIDC_ISSUER: https://token.actions.githubusercontent.com
