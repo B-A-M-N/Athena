@@ -55,7 +55,7 @@
     "temporal-failure-owl.png",
     "temporal-recover-owl.png"
   ],
-  "renderer_revision": "2998e1c0cab9fe53f56442b0e4ee642543ec2f62dc82c8f9278e87d647ef9237",
+  "renderer_revision": "1ab0931da61dfb624df47518862e5c3c0e08fce468c12aa42d382eaf93aa3829",
   "golden_hashes": {
     "idle-owl.png": "723c5b6421bba9972ac89a52d5aab9a7600b3403e0919406787b2f0959cce04c",
     "idle-cat.png": "97e209539e1c5afa1c69f9dc741dcb5af7f54285545ed447bcedab87ae5ee7db",
