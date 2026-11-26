@@ -8,10 +8,12 @@ immediately instead of risking duplicate execution.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta
 
 import pytest
 
 from athena.protocol.errors import IllegalStateTransition
+from athena.protocol.messages import utcnow
 from athena.protocol.tasks import TaskStatus
 from athena.state.database import Database
 from athena.state.tasks import TaskStore
@@ -46,6 +48,44 @@ async def test_renew_lease_extends_expiry_for_owner():
         assert await store.renew_lease("t1", worker_id="w1", lease_duration_seconds=600) is True
         renewed = await store.get("t1")
         assert renewed["lease_expires_at"] > claimed["lease_expires_at"]
+    finally:
+        await db.close()
+
+
+@pytest.mark.parametrize("renew", [False, True], ids=["claim", "renewal"])
+async def test_lease_duration_begins_after_waiting_for_the_writer(renew):
+    store, db = await _make_store()
+    try:
+        await _insert_task(store)
+        if renew:
+            assert await store.claim_with_lease((TaskStatus.QUEUED,), worker_id="w1")
+        lease_seconds = 0.05
+        started = asyncio.Event()
+
+        async def write_lease():
+            started.set()
+            if renew:
+                return await store.renew_lease(
+                    "t1", worker_id="w1", lease_duration_seconds=lease_seconds
+                )
+            return await store.claim_with_lease(
+                (TaskStatus.QUEUED,), worker_id="w1", lease_duration_seconds=lease_seconds
+            )
+
+        async with db.transaction():
+            await db.execute_raw("UPDATE tasks SET updated_at = updated_at WHERE id = ?", ("t1",))
+            writer = asyncio.create_task(write_lease())
+            await started.wait()
+            await asyncio.sleep(2 * lease_seconds)
+            assert not writer.done()
+            released_at = utcnow()
+
+        assert await writer
+        row = await store.get("t1")
+        assert row["claimed_by"] == "w1"
+        assert datetime.fromisoformat(row["lease_expires_at"]) >= released_at + timedelta(
+            seconds=lease_seconds
+        )
     finally:
         await db.close()
 
