@@ -148,23 +148,16 @@ class RuntimeSessionStore:
                 ),
             )
         except sqlite3.IntegrityError as exc:
-            # Deterministic runtime session ids ("{runtime}_{task_id}") are
-            # re-derived after every service restart while the durable row of
-            # the previous incarnation survives (recovery marks it dead).
-            # Re-establishing that identical identity is the honest way to
-            # keep crash-recovery truth: a second crash must still find a
-            # live row to reconcile. Anything else remains a hard conflict.
+            # Recovery marks the previous incarnation of a deterministic ID dead.
             if "runtime_sessions.id" not in str(exc):
                 raise
-            existing = await self.get(session_id)
-            if existing is None or existing.get("is_alive"):
+            prior = await self._db.fetch_one(
+                "SELECT * FROM runtime_sessions WHERE id = ?", (session_id,)
+            )
+            if prior is None or prior["is_alive"] or prior["task_id"] != task_id:
                 raise
-            if str(existing.get("task_id") or "") != task_id:
-                raise
-            # Security-sensitive identity (workspace binding and policy) must
-            # be identical across incarnations of the same session id.
-            # Per-incarnation process facts (pid, process identity, runtime
-            # version fingerprints) legitimately describe the new incarnation.
+            existing = _decode(dict(prior))
+            # Workspace binding and policy must survive reincarnation unchanged.
             for column, value in zip(
                 (
                     "backend",
@@ -181,16 +174,17 @@ class RuntimeSessionStore:
                         f"runtime session {session_id} identity changed across "
                         f"re-establishment ({column})"
                     ) from exc
-            merged = dict(existing.get("metadata") or {})
-            merged.update(safe_metadata)
-            merged["reincarnations"] = int(merged.get("reincarnations") or 0) + 1
-            merged["previous_ended_at"] = existing.get("ended_at")
-            merged_safe = sanitize_session_metadata(merged)
-            await self._db.execute(
+            # Keep history counters without reusing the prior process's evidence.
+            previous = existing.get("metadata") or {}
+            safe_metadata["reincarnations"] = int(previous.get("reincarnations") or 0) + 1
+            safe_metadata["previous_ended_at"] = prior["ended_at"]
+            cursor = await self._db.execute(
                 "UPDATE runtime_sessions SET pid = ?, is_alive = 1, "
                 "process_identity = ?, environment_fingerprint = ?, "
                 "runtime_version = ?, start_identity = ?, started_at = ?, "
-                "last_heartbeat = ?, ended_at = NULL, metadata = ? WHERE id = ?",
+                "last_heartbeat = ?, ended_at = NULL, metadata = ? "
+                "WHERE id = ? AND is_alive = 0 AND started_at = ? AND ended_at IS ? "
+                "AND metadata IS ?",
                 (
                     pid,
                     process_identity,
@@ -199,10 +193,15 @@ class RuntimeSessionStore:
                     start_identity,
                     now,
                     now,
-                    json.dumps(merged_safe, default=str),
+                    json.dumps(safe_metadata, default=str),
                     session_id,
+                    prior["started_at"],
+                    prior["ended_at"],
+                    prior["metadata"],
                 ),
             )
+            if cursor.rowcount != 1:
+                raise
 
     async def mark_closed(self, session_id: str, *, metadata: dict | None = None) -> None:
         safe_metadata = sanitize_session_metadata(metadata)

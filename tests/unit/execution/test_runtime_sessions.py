@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 
@@ -162,6 +163,53 @@ async def test_runtime_session_reincarnation_is_counted_repeatedly():
     assert row["is_alive"] is False
     assert row["metadata"]["reincarnations"] == 2
     await db.close()
+
+
+async def test_concurrent_runtime_session_reincarnations_preserve_the_winner():
+    db, store = await _reincarnation_store("t1")
+    try:
+        identity = {"task_id": "t1", "backend": "local", "runtime": "python"}
+        await store.start("python_t1", **identity)
+        await store.mark_dead("python_t1")
+
+        pids = (4242, 4343)
+        results = await asyncio.gather(
+            *(store.start("python_t1", pid=pid, **identity) for pid in pids),
+            return_exceptions=True,
+        )
+
+        winners = [pid for pid, result in zip(pids, results, strict=True) if result is None]
+        assert len(winners) == 1
+        loser = results[1 - pids.index(winners[0])]
+        assert isinstance(loser, sqlite3.IntegrityError)
+        row = await store.get("python_t1")
+        assert row is not None and row["is_alive"]
+        assert row["pid"] == winners[0]
+        assert row["metadata"]["reincarnations"] == 1
+    finally:
+        await db.close()
+
+
+async def test_runtime_session_reincarnation_records_only_current_process_facts():
+    db, store = await _reincarnation_store("t1")
+    try:
+        identity = {"task_id": "t1", "backend": "local", "runtime": "python"}
+        await store.start(
+            "python_t1",
+            **identity,
+            metadata={"start_identity": "old-process", "environment": {"ATHENA_TEST": "old"}},
+        )
+        await store.mark_dead("python_t1")
+        await store.start("python_t1", **identity)
+
+        row = await store.get("python_t1")
+        assert row is not None
+        assert row["start_identity"] is None
+        assert row["environment_fingerprint"] is None
+        assert "environment" not in row["metadata"]
+        assert row["metadata"]["reincarnations"] == 1
+    finally:
+        await db.close()
 
 
 async def test_runtime_session_reincarnation_fails_closed_on_identity_change():
