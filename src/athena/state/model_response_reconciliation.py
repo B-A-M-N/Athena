@@ -17,14 +17,22 @@ async def reject_unresolved_legacy_receipts(
     model: str,
     request_fingerprint: str,
 ) -> None:
-    """Prevent a new fingerprint from silently bypassing an old liability."""
+    """Prevent a new fingerprint from silently bypassing a raw-pending liability.
+
+    Only receipts whose provider call never produced an outcome event
+    (``pending`` or pre-attempt legacy rows) block a new fingerprint.
+    Receipts with an explicit outcome event (``unknown`` or a confirmed
+    resolution) coexist as sibling attempts by design; their liability is
+    governed by the operator-visible provider-outcome recovery machinery.
+    """
     rows = await db.fetch_all_raw(
         "SELECT r.*, a.status AS attempt_status, "
         "a.provider_outcome_status AS attempt_outcome_status "
         "FROM model_response_receipts AS r "
         "LEFT JOIN model_response_attempts AS a ON a.attempt_id = r.attempt_id "
         "WHERE r.task_id = ? AND r.provider = ? AND r.model = ? "
-        "AND r.request_fingerprint != ?",
+        "AND r.request_fingerprint != ? "
+        "AND (r.provider_outcome_status IS NULL OR r.provider_outcome_status = 'pending')",
         (task_id, provider, model, request_fingerprint),
     )
     unresolved = [row for row in rows if _requires_reconciliation(row)]
@@ -52,8 +60,9 @@ async def ensure_attempt_row(
         "reservation_amount, reservation_applied_at, provider_usage_id, "
         "provider_outcome_status, created_at, completed_at, actual_input_tokens, "
         "actual_output_tokens, actual_cost, response_committed_at, accounting_applied_at, idempotency_key, "
-        "idempotency_semantics, provider_outcome_note, provider_outcome_resolved_at"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "idempotency_semantics, provider_outcome_note, provider_outcome_resolved_at, "
+        "retry_authorized_at, retry_authorized_by, replacement_attempt_id"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             row["attempt_id"],
             row["task_id"],
@@ -77,6 +86,9 @@ async def ensure_attempt_row(
             row.get("idempotency_semantics") or idempotency_semantics,
             row.get("provider_outcome_note"),
             row.get("provider_outcome_resolved_at"),
+            row.get("retry_authorized_at"),
+            row.get("retry_authorized_by"),
+            row.get("replacement_attempt_id"),
         ),
     )
 

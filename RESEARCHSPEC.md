@@ -237,9 +237,7 @@ async def run(request: AgentRequest) -> AgentResult:
 
         response = await model.complete(context.model_request)
 
-        await event_store.append(
-            ModelResponseReceived.from_response(task.id, response)
-        )
+        await event_store.append(ModelResponseReceived.from_response(task.id, response))
 
         if response.capability_calls:
             for call in response.capability_calls:
@@ -635,9 +633,7 @@ class AgentRequest:
     attachments: tuple[ArtifactRef, ...] = ()
     requested_capabilities: frozenset[str] | None = None
 
-    metadata: Mapping[str, JSONValue] = field(
-        default_factory=dict
-    )
+    metadata: Mapping[str, JSONValue] = field(default_factory=dict)
 ```
 
 ### Agent result
@@ -695,9 +691,7 @@ class TaskSpec:
 
     delivery: DeliverySpec | None = None
 
-    metadata: Mapping[str, JSONValue] = field(
-        default_factory=dict
-    )
+    metadata: Mapping[str, JSONValue] = field(default_factory=dict)
 ```
 
 Then:
@@ -801,21 +795,17 @@ Provider-specific raw responses may be retained as diagnostic artifacts, but the
 
 ```python
 class ModelProvider(Protocol):
-
-    async def list_models(self) -> Sequence[ModelInfo]:
-        ...
+    async def list_models(self) -> Sequence[ModelInfo]: ...
 
     async def complete(
         self,
         request: ModelRequest,
-    ) -> AsyncIterator[ModelEvent]:
-        ...
+    ) -> AsyncIterator[ModelEvent]: ...
 
     async def cancel(
         self,
         request_id: str,
-    ) -> None:
-        ...
+    ) -> None: ...
 ```
 
 Streaming should be native.
@@ -941,9 +931,7 @@ class ExecutionRequest:
     network_policy: NetworkPolicy | None = None
     resource_limits: ExecutionLimits | None = None
 
-    metadata: Mapping[str, JSONValue] = field(
-        default_factory=dict
-    )
+    metadata: Mapping[str, JSONValue] = field(default_factory=dict)
 ```
 
 Do not call the field `language`.
@@ -991,30 +979,25 @@ This produces the actual result while preserving streaming:
 
 ```python
 class Runtime(Protocol):
-
     async def execute(
         self,
         request: ExecutionRequest,
-    ) -> AsyncIterator[ExecutionEvent]:
-        ...
+    ) -> AsyncIterator[ExecutionEvent]: ...
 
     async def interrupt(
         self,
         execution_id: str,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     async def reset(
         self,
         runtime_session_id: str,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     async def close(
         self,
         runtime_session_id: str,
-    ) -> None:
-        ...
+    ) -> None: ...
 ```
 
 ### Runtime descriptor
@@ -1097,11 +1080,7 @@ FileOperation =
 Patch should support an expected hash:
 
 ```python
-PatchFile(
-    path="src/main.py",
-    expected_sha256="...",
-    patch="..."
-)
+PatchFile(path="src/main.py", expected_sha256="...", patch="...")
 ```
 
 If the file changed:
@@ -1459,18 +1438,15 @@ Core contract:
 
 ```python
 class Computer(Protocol):
-
     async def observe(
         self,
         request: ObservationRequest,
-    ) -> Observation:
-        ...
+    ) -> Observation: ...
 
     async def perform(
         self,
         action: ComputerAction,
-    ) -> ActionResult:
-        ...
+    ) -> ActionResult: ...
 ```
 
 Actions:
@@ -1892,21 +1868,14 @@ TaskSpec(
     acceptance_criteria=...,
     context_refs=...,
     capability_policy=...,
-    resource_budget=...
+    resource_budget=...,
 )
 ```
 
 The child result:
 
 ```python
-TaskResult(
-    status=...,
-    summary=...,
-    evidence=...,
-    artifacts=...,
-    mutations=...,
-    unresolved=...
-)
+TaskResult(status=..., summary=..., evidence=..., artifacts=..., mutations=..., unresolved=...)
 ```
 
 Hermes's current delegation model confirms that fresh-context children, restricted toolsets, separate terminal state and returning only final summaries are workable patterns. citeturn13search1turn13search5

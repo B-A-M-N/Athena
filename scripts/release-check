@@ -254,6 +254,37 @@ def _release_run_id() -> str:
     return uuid.uuid4().hex
 
 
+def _python_imports_xlib(interpreter: str) -> bool:
+    try:
+        probe = subprocess.run(
+            [interpreter, "-c", "import Xlib"],
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return probe.returncode == 0
+
+
+def _resolve_system_python(preferred: str | None) -> str | None:
+    """Pick the interpreter native X11 helpers should run under.
+
+    ``scripts/native-desktop-acceptance`` and every other
+    ``ATHENA_RELEASE_SYSTEM_PYTHON`` consumer needs a system interpreter
+    that can ``import Xlib``. On CI images the first ``python3`` on ``PATH``
+    may be an actions/setup-python interpreter, while ``python3-xlib`` is
+    installed for ``/usr/bin/python3`` only. Mirror ``scripts/cosign-env``:
+    fall back to ``/usr/bin/python3`` when the preferred interpreter lacks
+    Xlib but the system interpreter provides it.
+    """
+    if preferred and _python_imports_xlib(preferred):
+        return preferred
+    system_interpreter = "/usr/bin/python3"
+    if Path(system_interpreter).is_file() and _python_imports_xlib(system_interpreter):
+        return system_interpreter
+    return preferred
+
+
 def _certify_evidence(
     evidence: Path,
     *,
@@ -433,6 +464,8 @@ def main(argv: list[str] | None = None) -> int:
     final_status = "FAIL"
     error: str | None = None
     release_env: dict[str, str] | None = None
+    source_manifest_path: Path | None = None
+    source_tree_digest: str | None = None
     certification_failure: str | None = None
     scenario_gate_passed = False
     try:
@@ -468,6 +501,34 @@ def main(argv: list[str] | None = None) -> int:
         _extract_commit(resolved, checkout, timeout=args.timeout)
         env = dict(os.environ)
         release_env = env
+        source_manifest_path = temp_root / "source-tree-manifest.json"
+        source_manifest_record = _run(
+            [
+                sys.executable,
+                str(checkout / "scripts/source-manifest"),
+                "--root",
+                str(checkout),
+                "--output",
+                str(source_manifest_path),
+                "--source-sha",
+                resolved,
+            ],
+            cwd=checkout,
+            env=env,
+            timeout=args.timeout,
+        )
+        source_manifest_record.update(
+            {"name": "frozen-source-manifest", "commit_sha": resolved, "release_run_id": run_id}
+        )
+        lanes.append(source_manifest_record)
+        if int(source_manifest_record.get("exit_code") or 0) != 0:
+            raise RuntimeError("frozen source manifest creation failed")
+        source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+        source_tree_digest = str(source_manifest.get("tree_sha256") or "")
+        if not source_tree_digest:
+            raise RuntimeError("frozen source manifest has no canonical tree digest")
+        if evidence_dir is not None:
+            shutil.copy2(source_manifest_path, evidence_stage / source_manifest_path.name)
         env["PYTHONPATH"] = str(checkout / "src") + (
             os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
         )
@@ -476,6 +537,8 @@ def main(argv: list[str] | None = None) -> int:
         env["ATHENA_RELEASE_SHA"] = resolved
         env["ATHENA_RELEASE_RUN_ID"] = run_id
         env["ATHENA_FROZEN_SOURCE"] = "1"
+        env["ATHENA_FROZEN_SOURCE_MANIFEST"] = str(source_manifest_path)
+        env["ATHENA_SOURCE_TREE_DIGEST"] = source_tree_digest
         env["ATHENA_RELEASE_GATE"] = "1"
         if args.include_hermes_live:
             env["ATHENA_HERMES_INTEGRATION_GATE"] = "1"
@@ -509,7 +572,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if resolved_cosign:
             env["ATHENA_COSIGN"] = str(Path(resolved_cosign).resolve())
-        resolved_system_python = shutil.which("python3")
+        resolved_system_python = _resolve_system_python(shutil.which("python3"))
         if resolved_system_python:
             env["ATHENA_RELEASE_SYSTEM_PYTHON"] = str(Path(resolved_system_python).resolve())
         if args.bootstrap:
@@ -541,6 +604,46 @@ def main(argv: list[str] | None = None) -> int:
             env["ATHENA_CARGO_DENY_BIN"] = str(cargo_deny_root / "bin" / "cargo-deny")
             if evidence_dir is not None and cargo_deny_receipt.is_file():
                 shutil.copy2(cargo_deny_receipt, evidence_stage / cargo_deny_receipt.name)
+        # Materialize the provisioned-toolchain contract inside the frozen
+        # checkout so release-script tests execute the same environment a
+        # provisioned developer checkout satisfies (scripts/cosign-env and
+        # the toolchain-passport contract).  Entries are gitignored, so the
+        # --require-clean assertions stay valid.
+        provisioned_toolchain = checkout / ".release-toolchain"
+        provisioned_toolchain.mkdir(parents=True, exist_ok=True)
+        provisioned_cosign = provisioned_toolchain / "bin" / "cosign"
+        resolved_cosign_env = (
+            env.get("ATHENA_COSIGN") or env.get("COSIGN_BIN") or shutil.which("cosign")
+        )
+        if resolved_cosign_env and not provisioned_cosign.exists():
+            provisioned_toolchain.joinpath("bin").mkdir(parents=True, exist_ok=True)
+            os.symlink(
+                str(Path(resolved_cosign_env).resolve()),
+                str(provisioned_cosign),
+            )
+        provisioned_cargo_deny = provisioned_toolchain / "cargo-deny" / "bin" / "cargo-deny"
+        resolved_cargo_deny = env.get("ATHENA_CARGO_DENY_BIN")
+        if resolved_cargo_deny and Path(resolved_cargo_deny).is_file() and not provisioned_cargo_deny.exists():
+            provisioned_toolchain.joinpath("cargo-deny", "bin").mkdir(parents=True, exist_ok=True)
+            os.symlink(
+                str(Path(resolved_cargo_deny).resolve()),
+                str(provisioned_cargo_deny),
+            )
+        if not Path(checkout / ".venv").exists():
+            # scripts/cosign-env resolves the release python through the
+            # real project .venv, so the frozen checkout must carry a real
+            # entry point, not a redirect to the lane-private environment.
+            venv_record = _run(
+                [args.uv, "sync", "--frozen"],
+                cwd=checkout,
+                env={**env, "UV_PROJECT_ENVIRONMENT": str(checkout / ".venv")},
+                timeout=args.timeout,
+            )
+            if int(venv_record.get("exit_code") or 0) != 0:
+                raise RuntimeError(
+                    "frozen-checkout project environment sync failed: "
+                    + str(venv_record.get("output") or "")
+                )
         lanes_to_run = release_commands(
             args.uv,
             skip_e2e=args.skip_e2e,
@@ -572,6 +675,32 @@ def main(argv: list[str] | None = None) -> int:
             if name in static_by_name:
                 record = static_by_name[name]
             else:
+                if name == "release-artifacts":
+                    verify_record = _run(
+                        [
+                            sys.executable,
+                            str(checkout / "scripts/source-manifest"),
+                            "--root",
+                            str(checkout),
+                            "--verify",
+                            str(source_manifest_path),
+                            "--source-sha",
+                            resolved,
+                        ],
+                        cwd=checkout,
+                        env=env,
+                        timeout=args.timeout,
+                    )
+                    verify_record.update(
+                        {
+                            "name": "frozen-source-verify",
+                            "commit_sha": resolved,
+                            "release_run_id": run_id,
+                        }
+                    )
+                    lanes.append(verify_record)
+                    if int(verify_record.get("exit_code") or 0) != 0:
+                        raise RuntimeError("frozen source tree changed before artifact packaging")
                 command_timeout = (
                     max(args.timeout, ENDURANCE_TIMEOUT_SECONDS)
                     if name == "endurance"
@@ -606,6 +735,10 @@ def main(argv: list[str] | None = None) -> int:
                 if manifest.get("source_sha") != resolved:
                     raise RuntimeError(
                         "release artifact manifest source_sha does not match frozen commit"
+                    )
+                if manifest.get("source_tree_digest") != source_tree_digest:
+                    raise RuntimeError(
+                        "release artifact manifest source_tree_digest does not match frozen source"
                     )
                 if evidence_dir is not None:
                     manifest["release_run_id"] = run_id
@@ -697,6 +830,11 @@ def main(argv: list[str] | None = None) -> int:
                     str(record.get("output") or ""),
                 )
             if int(record.get("exit_code") or 0) != 0:
+                # Publish the failing lane's output tail before raising so a
+                # red certification names its actual root cause in the run log.
+                output_tail = str(record.get("output") or "")[-4000:]
+                if output_tail:
+                    print(f"[release-check] lane {name} failed; output tail:\n{output_tail}")
                 raise RuntimeError(
                     f"command failed with exit {record['exit_code']}: {' '.join(command)}"
                 )
@@ -825,6 +963,11 @@ def main(argv: list[str] | None = None) -> int:
                     record["release_run_id"] = run_id
                     lanes.append(record)
                     if int(record.get("exit_code") or 0) != 0:
+                        output_tail = str(record.get("output") or "")[-4000:]
+                        if output_tail:
+                            print(
+                                f"[release-check] lane {name} failed; output tail:\n{output_tail}"
+                            )
                         raise RuntimeError(
                             f"command failed with exit {record['exit_code']}: {' '.join(command)}"
                         )

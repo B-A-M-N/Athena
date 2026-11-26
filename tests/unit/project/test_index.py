@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from athena.project.index.builder import ProjectIndexBuilder
 from athena.project.profile import ProjectInspector
 
@@ -135,6 +137,11 @@ def test_project_index_incremental_reparses_changed_file_and_preserves_graph(tmp
     first = builder.build(str(tmp_path))
 
     source.write_text("def value():\n    return 2\n")
+    # Change detection is stat-authoritative (mtime_ns, size); identical size
+    # and coarse/identical timestamps would make this same-tick edit invisible
+    # on some CI filesystems. Observable change means a distinct mtime_ns.
+    bumped = os.stat(source).st_mtime_ns + 1
+    os.utime(source, ns=(bumped, bumped))
     second = builder.incremental(str(tmp_path), first, ["lib.py"])
 
     assert second.source_revision != first.source_revision

@@ -455,10 +455,9 @@ class TaskStore:
             return None
         vals = [s.value for s in target_statuses]
         placeholders = ",".join("?" for _ in target_statuses)
-        now = utcnow()
-        now_iso = now.isoformat()
-        reclaim_deadline = (now - timedelta(seconds=max(reclaim_grace_seconds, 0.0))).isoformat()
         async with self._db.transaction():
+            grace = timedelta(seconds=max(reclaim_grace_seconds, 0.0))
+            reclaim_deadline = (utcnow() - grace).isoformat()
             # Look for a schedulable task: QUEUED/INTERRUPTED first, then
             # RUNNING with expired lease (reclaim abandoned work).
             row = await self._db.fetch_one_raw(
@@ -480,6 +479,8 @@ class TaskStore:
                 return None
             task_id = row["id"]
             current = TaskStatus(row["status"])
+            now = utcnow()
+            now_iso = now.isoformat()
             lease_expires = now + timedelta(seconds=lease_duration_seconds)
             # CAS update: only succeeds if state hasn't changed under us
             if current == TaskStatus.RUNNING:
@@ -512,12 +513,8 @@ class TaskStore:
     ) -> bool:
         """Extend a RUNNING task's lease, CAS on the owning worker.
 
-        Also re-adopts an unowned RUNNING task whose lease window has passed
-        (``claimed_by IS NULL`` with no fresh lease — the state a task is in
-        right after a WAITING_* → RUNNING resume, where the lease was
-        deliberately cleared on park). Adoption is itself a CAS: two
-        concurrent renewers cannot both win, and adoption never races a
-        legitimately-parked task whose resume slot another worker may hold.
+        Also re-adopts a RUNNING task whose owner and lease were cleared on
+        park. The same CAS prevents two renewers from adopting it.
 
         Returns ``True`` only when the update affected exactly one row this
         worker owns (or just adopted) while the task is still RUNNING. A
@@ -525,24 +522,26 @@ class TaskStore:
         was lost to another worker; the caller must stop driving the task
         unless it verifies the task is parked/paused.
         """
-        now = utcnow()
-        new_expiry = (now + timedelta(seconds=lease_duration_seconds)).isoformat()
-        cursor = await self._db.execute(
-            "UPDATE tasks SET lease_expires_at = ?, updated_at = ?, "
-            "claimed_by = ?, claim_started_at = COALESCE(claim_started_at, ?) "
-            "WHERE id = ? AND status = 'RUNNING' "
-            "AND (claimed_by = ? OR (claimed_by IS NULL AND (lease_expires_at IS NULL "
-            "OR lease_expires_at < ?)))",
-            (
-                new_expiry,
-                now.isoformat(),
-                worker_id,
-                now.isoformat(),
-                task_id,
-                worker_id,
-                new_expiry,
-            ),
-        )
+        # Waiting for SQLite's writer must not consume the renewed lease.
+        async with self._db.transaction(mode="IMMEDIATE"):
+            now = utcnow()
+            new_expiry = (now + timedelta(seconds=lease_duration_seconds)).isoformat()
+            cursor = await self._db.execute_raw(
+                "UPDATE tasks SET lease_expires_at = ?, updated_at = ?, "
+                "claimed_by = ?, claim_started_at = COALESCE(claim_started_at, ?) "
+                "WHERE id = ? AND status = 'RUNNING' "
+                "AND (claimed_by = ? OR (claimed_by IS NULL AND (lease_expires_at IS NULL "
+                "OR lease_expires_at < ?)))",
+                (
+                    new_expiry,
+                    now.isoformat(),
+                    worker_id,
+                    now.isoformat(),
+                    task_id,
+                    worker_id,
+                    new_expiry,
+                ),
+            )
         return cursor.rowcount == 1
 
     async def acquire_with_ownership(

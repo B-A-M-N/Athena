@@ -64,7 +64,7 @@ class PackHookSupport:
                 )
             reason = "; ".join(outcome.failures) or f"workflow status: {outcome.status}"
             return await self._finalize(task, state, TaskStatus.FAILED, reason)
-        except Exception as exc:  # workflow failures become truthful task results
+        except Exception as exc:  # rationale: workflow failures become truthful task results
             return await self._finalize(
                 task, state, TaskStatus.FAILED, f"pack hook workflow failed: {exc}"
             )

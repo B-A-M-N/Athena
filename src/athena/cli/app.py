@@ -597,6 +597,20 @@ def _doctor_native(o: "Options", config: Any) -> int:
 
 def _doctor_startup(o: "Options", config: Any) -> int:
     """Start the service briefly and report readiness-owned checks."""
+    del o
+    from athena.affordances.sandbox_doctor import (
+        profile_requires_restricted_execution,
+        sandbox_status,
+    )
+
+    sandbox = sandbox_status(config)
+    sandbox_ready = bool(sandbox["available"])
+    sandbox_detail = str(sandbox["detail"])
+    requires_sandbox = profile_requires_restricted_execution(config)
+    if sandbox_ready:
+        print(f"Sandbox: READY (bubblewrap {sandbox_detail})")
+    else:
+        print(f"Sandbox: UNAVAILABLE (fail-closed: {sandbox_detail})")
     try:
         service = build_service(config)
     except ServiceUnavailable as exc:
@@ -605,7 +619,10 @@ def _doctor_startup(o: "Options", config: Any) -> int:
 
     async def probe() -> dict[str, Any]:
         try:
-            await service.start()
+            # Doctor is a passive preflight. It initializes the durable graph
+            # so readiness can be inspected, but must not start workers,
+            # schedulers, or ambient watch producers.
+            await service.start(activate_runtime=False)
             health = service.startup_health()
             health["operational_matrix"] = service.operational_matrix()
             return health
@@ -614,7 +631,7 @@ def _doctor_startup(o: "Options", config: Any) -> int:
 
     try:
         health = asyncio.run(probe())
-    except Exception as exc:  # pragma: no cover - environment-specific startup failure
+    except Exception as exc:  # broad-exception: startup diagnostics fail closed
         print(f"startup health: failed ({exc})")
         return 1
     print(f"startup health: {health.get('status', 'unknown')}")
@@ -643,6 +660,9 @@ def _doctor_startup(o: "Options", config: Any) -> int:
     memory = matrix.get("memory") or {}
     if isinstance(memory, dict):
         print(f"  semantic-memory: {memory.get('state', 'unknown')}")
+    if requires_sandbox and not sandbox_ready:
+        print("  capability profile: restricted execution is not ready", file=sys.stderr)
+        return 1
     return 0 if health.get("status") == "ok" else 1
 
 
@@ -726,6 +746,16 @@ class Options:
     recovery_resolution: str | None = None
     recovery_provider_response_id: str | None = None
     recovery_actual_cost: str | None = None
+    recovery_authorized_by: str | None = None
+
+
+def _cli_runtime_mode(options: Options) -> bool:
+    """Return whether a CLI command needs background execution producers."""
+    if options.command in {"chat", "run", "resume", "acp", "oi-stream"}:
+        return True
+    # ``self status`` and ``self continue`` are operator reads/mutations. They
+    # must not start the worker or scheduler as an incidental side effect.
+    return options.command == "self" and options.self_action not in {"status", "continue"}
 
 
 def dispatch(o: Options) -> int:
@@ -785,7 +815,7 @@ def dispatch(o: Options) -> int:
         try:
             start = getattr(service, "start", None)
             if start is not None:
-                await start()
+                await start(activate_runtime=_cli_runtime_mode(o))
             return await _run(o, service)
         finally:
             stop = getattr(service, "stop", None)
@@ -2375,6 +2405,7 @@ def _arg_parse(argv: list[str]) -> Options:
         recovery_resolution=getattr(ns, "recovery_resolution", None),
         recovery_provider_response_id=getattr(ns, "recovery_provider_response_id", None),
         recovery_actual_cost=getattr(ns, "recovery_actual_cost", None),
+        recovery_authorized_by=getattr(ns, "recovery_authorized_by", None),
     )
     if command == "doctor":
         o.args = [ns.target]

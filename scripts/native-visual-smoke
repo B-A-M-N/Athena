@@ -46,14 +46,11 @@ import os
 from pathlib import Path
 
 repo_root = Path(os.environ["REPO_ROOT"])
-renderer_files = [
-    "native/src/lib.rs", "native/src/x11.rs", "native/src/buddy/mod.rs",
-    "native/src/buddy/poses.rs", "native/src/render/buddy.rs",
-    "native/src/render/chassis.rs", "native/src/render/frame.rs",
-    "native/src/render/oi.rs", "native/src/render/primitives.rs",
-    "native/src/render/prompt.rs", "native/src/render/terminal.rs",
-    "native/src/render/text.rs", "native/src/render/theme.rs",
-]
+renderer_files = json.loads(
+    (repo_root / "native/assets/oi/visual-goldens/renderer-files.json").read_text(
+        encoding="utf-8"
+    )
+)["renderer_files"]
 
 def renderer_revision():
     digest = hashlib.sha256()
@@ -145,7 +142,7 @@ done
 # OI fixtures remain separate so a content change cannot hide a shell drift.
 "$repo_root/scripts/native-cabinet-golden"
 
-projection='{"schema_version":3,"title":"ATHENA // VISUAL SMOKE","status":"SEARCHING","semantic_state":"search","oi":["SYMBOL GRAPH // FIXED CLOCK"],"current_action":{"kind":"search","label":"workspace","target":"workspace","query":"workspace"},"active_operation":{"id":"op-01","label":"inspect workspace","target":"workspace","state":"running","action_kind":"search","mutation_state":"read-only"},"model_request":{"provider":"local","model":"athena-model","status":"active"},"workspace_tree":[{"id":"workspace","kind":"workspace","label":"/workspace","status":"ready","children":[{"id":"src","kind":"directory","label":"src/athena","status":"ready"},{"id":"native","kind":"file","label":"native.rs","status":"reading"},{"id":"tests","kind":"directory","label":"tests","status":"ready"}]}],"runtime_tree":[{"id":"inspect","kind":"task","label":"inspect workspace","status":"running","children":[{"id":"read","kind":"execution","label":"read native.rs","status":"active"}]}],"entities":[{"id":"root","kind":"operation","label":"workspace","status":"active"},{"id":"child","kind":"task","label":"native.rs","status":"active","parent_id":"root"}],"attention_items":[],"buddy":{"state":"SEARCH","anchor":"right","status":"active","character":"owl"},"trace":["> SEARCH · workspace"],"view":{"mode":"search"}}'
+projection='{"schema_version":5,"title":"ATHENA // VISUAL SMOKE","status":"SEARCHING","semantic_state":"search","oi":["SYMBOL GRAPH // FIXED CLOCK"],"current_action":{"kind":"search","label":"workspace","target":"workspace","query":"workspace"},"active_operation":{"id":"op-01","label":"inspect workspace","target":"workspace","state":"running","action_kind":"search","mutation_state":"read-only"},"model_request":{"provider":"local","model":"athena-model","status":"active"},"workspace_tree":[{"id":"workspace","kind":"workspace","label":"/workspace","status":"ready","children":[{"id":"src","kind":"directory","label":"src/athena","status":"ready"},{"id":"native","kind":"file","label":"native.rs","status":"reading"},{"id":"tests","kind":"directory","label":"tests","status":"ready"}]}],"runtime_tree":[{"id":"inspect","kind":"task","label":"inspect workspace","status":"running","children":[{"id":"read","kind":"execution","label":"read native.rs","status":"active"}]}],"entities":[{"id":"root","kind":"operation","label":"workspace","status":"active"},{"id":"child","kind":"task","label":"native.rs","status":"active","parent_id":"root"}],"attention_items":[],"buddy":{"state":"SEARCH","anchor":"right","status":"active","character":"owl"},"trace":["> SEARCH · workspace"],"view":{"mode":"search"}}'
 
   PROJECTION="$projection" NATIVE_BIN="$native_bin" TMP_DIR="$tmp_dir" \
   GOLDEN_DIR="$golden_dir" UPDATE_GOLDENS="$update_goldens" CHECK_LAYOUT="$repo_root/scripts/check-native-layout.py" \
@@ -154,6 +151,9 @@ projection='{"schema_version":3,"title":"ATHENA // VISUAL SMOKE","status":"SEARC
   xvfb-run -a -s '-screen 0 1920x1080x24 -ac' bash -c '
     set -euo pipefail
     system_python="${ATHENA_RELEASE_SYSTEM_PYTHON:-python3}"
+    RMSE_TABLE="${TMP_DIR}/rmse-table.csv"
+    : > "${RMSE_TABLE}"
+    golden_failures=0
 
     wait_for_window() {
       timeout 10s xdotool search --sync --name "ATHENA" 2>/dev/null | head -1
@@ -293,10 +293,14 @@ PY
           local rmse normalized
           rmse="$(compare -metric RMSE "$golden_path" "$image_path" null: 2>&1 || true)"
           normalized="$(printf "%s\\n" "$rmse" | cut -d "(" -f 2 | cut -d ")" -f 1 | tr -d "[:space:]")"
-          awk -v rmse="$normalized" "BEGIN { exit !(rmse != \"\" && rmse <= 0.08) }" || {
+          # Record every comparison so the full per-fixture RMSE table is
+          # reported even when a fixture is over tolerance; the gate still
+          # fails closed at the end of the capture sequence.
+          printf "%s-%s,%s\\n" "$label" "$mascot" "${normalized:-n/a}" >> "${RMSE_TABLE}"
+          if ! awk -v rmse="$normalized" "BEGIN { exit !(rmse != \"\" && rmse <= 0.08) }"; then
             printf "native-visual-smoke: FAIL — %s exceeds golden RMSE tolerance (%s)\\n" "$label-$mascot" "$normalized" >&2
-            return 1
-          }
+            golden_failures=$((golden_failures + 1))
+          fi
         else
           printf "native-visual-smoke: FAIL — missing golden %s\\n" "$golden_path" >&2
           return 1
@@ -411,10 +415,19 @@ PY
     for scene_mode in idle search code execute failure recover; do
       capture_fixture "temporal-${scene_mode}" "$scene_mode" owl "" 1280x800 animated
     done
+
+    # Golden compliance is evaluated only after the full capture sequence so
+    # the report covers every mandatory fixture, not just the first offender.
+    if [[ "$golden_failures" -gt 0 ]]; then
+      printf "native-visual-smoke: FAIL — %s of 45 fixtures exceed the approved golden RMSE tolerance (0.08); per-fixture table:\\n" "$golden_failures" >&2
+      cat "${RMSE_TABLE}" >&2
+      exit 1
+    fi
   '
 
 if [[ "$update_goldens" == "1" ]]; then
-  MANIFEST_PATH="$manifest_path" GOLDEN_DIR="$golden_dir" REPO_ROOT="$repo_root" "$system_python" -c '
+  MANIFEST_PATH="$manifest_path" GOLDEN_DIR="$golden_dir" REPO_ROOT="$repo_root" \
+  CAPTURE_DIR="$tmp_dir" "$system_python" -c '
 import hashlib
 import json
 import os
@@ -423,20 +436,32 @@ from pathlib import Path
 repo_root = Path(os.environ["REPO_ROOT"])
 manifest_path = Path(os.environ["MANIFEST_PATH"])
 golden_dir = Path(os.environ["GOLDEN_DIR"])
-renderer_files = [
-    "native/src/lib.rs", "native/src/x11.rs", "native/src/buddy/mod.rs",
-    "native/src/buddy/poses.rs", "native/src/render/buddy.rs",
-    "native/src/render/chassis.rs", "native/src/render/frame.rs",
-    "native/src/render/oi.rs", "native/src/render/primitives.rs",
-    "native/src/render/prompt.rs", "native/src/render/terminal.rs",
-    "native/src/render/text.rs", "native/src/render/theme.rs",
-]
+capture_dir = Path(os.environ["CAPTURE_DIR"])
+renderer_files = json.loads(
+    (repo_root / "native/assets/oi/visual-goldens/renderer-files.json").read_text(
+        encoding="utf-8"
+    )
+)["renderer_files"]
 revision = hashlib.sha256()
 for relative in renderer_files:
     revision.update(relative.encode())
     revision.update(b"\0")
     revision.update((repo_root / relative).read_bytes())
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+required_stems = {name[:-4] for name in manifest["required_pngs"]}
+captured_stems = {
+    path.name[:-4]
+    for path in capture_dir.glob("*.png")
+    if not path.name.startswith("operator-persistence")
+    and not path.name.endswith(".oi.png")
+}
+missing = sorted(required_stems - captured_stems)
+unexpected = sorted(captured_stems - required_stems)
+if missing or unexpected:
+    raise SystemExit(
+        "visual golden refresh would not cover the required fixtures: "
+        f"missing={missing} unexpected={unexpected}"
+    )
 manifest["review_status"] = "pending"
 manifest["renderer_revision"] = revision.hexdigest()
 manifest["golden_hashes"] = {

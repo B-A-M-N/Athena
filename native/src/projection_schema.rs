@@ -10,6 +10,7 @@ use serde::Deserialize;
 
 pub(crate) const NATIVE_BRIDGE_SCHEMA_VERSION: u32 = 5;
 pub(crate) const PREVIOUS_NATIVE_BRIDGE_SCHEMA_VERSION: u32 = 4;
+const NATIVE_BRIDGE_SCHEMA_V3: u32 = 3;
 pub(crate) const LEGACY_NATIVE_BRIDGE_SCHEMA_VERSION: u32 = 2;
 
 pub(crate) fn default_bridge_schema_version() -> u32 {
@@ -130,14 +131,10 @@ impl ProjectionFrame {
     pub(crate) fn normalize(mut self) -> Result<Self, String> {
         match self.schema_version {
             NATIVE_BRIDGE_SCHEMA_VERSION => Ok(self),
-            PREVIOUS_NATIVE_BRIDGE_SCHEMA_VERSION => {
-                // v4 has defaults for the v5 additions, so normalize it
-                // explicitly rather than treating arbitrary old frames as
-                // current.
-                self.schema_version = NATIVE_BRIDGE_SCHEMA_VERSION;
-                Ok(self)
-            }
-            LEGACY_NATIVE_BRIDGE_SCHEMA_VERSION => {
+            PREVIOUS_NATIVE_BRIDGE_SCHEMA_VERSION
+            | NATIVE_BRIDGE_SCHEMA_V3
+            | LEGACY_NATIVE_BRIDGE_SCHEMA_VERSION => {
+                // Additive fields default when older producers omit them.
                 self.schema_version = NATIVE_BRIDGE_SCHEMA_VERSION;
                 Ok(self)
             }

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import sqlite3
+
+import pytest
 
 from athena.execution.manager import ExecutionManager
 from athena.state.database import Database
@@ -101,4 +105,164 @@ async def test_runtime_session_redacts_environment_secrets_before_durable_write(
     closed = await store.get("secret-session")
     assert closed is not None
     assert "do-not-persist-on-close" not in json.dumps(closed["metadata"])
+    await db.close()
+
+
+async def _reincarnation_store(*task_ids: str) -> tuple[Database, RuntimeSessionStore]:
+    db = Database(":memory:")
+    await db._ensure_ready()
+    tasks = TaskStore(db)
+    for task_id in task_ids:
+        await tasks.insert_task(task_id, None, None, task_id)
+    return db, RuntimeSessionStore(db)
+
+
+async def test_runtime_session_reincarnation_reestablishes_dead_identity():
+    """A deterministic session id re-created after restart revives its dead row.
+
+    Recovery marks every non-reattachable live row dead at startup.  When the
+    same runtime deterministically re-derives "{runtime}_{task_id}" for the
+    same task, the durable ledger must re-establish the live identity instead
+    of warning-and-dropping the record: a second crash must still find a live
+    row to reconcile (RuntimeStateLost / recovery hints).
+    """
+    db, store = await _reincarnation_store("t1")
+
+    await store.start("python_t1", task_id="t1", backend="local", runtime="python")
+    await store.mark_closed("python_t1")
+    before = await store.get("python_t1")
+    assert before is not None and before["is_alive"] is False
+
+    await store.start(
+        "python_t1",
+        task_id="t1",
+        backend="local",
+        runtime="python",
+        pid=4242,
+        metadata={"start_identity": "second-incarnation"},
+    )
+    revived = await store.get("python_t1")
+    assert revived is not None
+    assert revived["is_alive"] is True
+    assert revived["pid"] == 4242
+    assert revived["ended_at"] is None
+    assert revived["metadata"]["reincarnations"] == 1
+    assert revived["metadata"]["previous_ended_at"] == before["ended_at"]
+    assert revived["metadata"]["start_identity"] == "second-incarnation"
+    assert revived["started_at"] >= before["started_at"]
+    await db.close()
+
+
+async def test_runtime_session_reincarnation_is_counted_repeatedly():
+    db, store = await _reincarnation_store("t9")
+    for _ in range(3):
+        await store.start("shell_t9", task_id="t9", backend="local", runtime="shell")
+        await store.mark_closed("shell_t9")
+    row = await store.get("shell_t9")
+    assert row is not None
+    assert row["is_alive"] is False
+    assert row["metadata"]["reincarnations"] == 2
+    await db.close()
+
+
+async def test_concurrent_runtime_session_reincarnations_preserve_the_winner():
+    db, store = await _reincarnation_store("t1")
+    try:
+        identity = {"task_id": "t1", "backend": "local", "runtime": "python"}
+        await store.start("python_t1", **identity)
+        await store.mark_dead("python_t1")
+
+        pids = (4242, 4343)
+        results = await asyncio.gather(
+            *(store.start("python_t1", pid=pid, **identity) for pid in pids),
+            return_exceptions=True,
+        )
+
+        winners = [pid for pid, result in zip(pids, results, strict=True) if result is None]
+        assert len(winners) == 1
+        loser = results[1 - pids.index(winners[0])]
+        assert isinstance(loser, sqlite3.IntegrityError)
+        row = await store.get("python_t1")
+        assert row is not None and row["is_alive"]
+        assert row["pid"] == winners[0]
+        assert row["metadata"]["reincarnations"] == 1
+    finally:
+        await db.close()
+
+
+async def test_runtime_session_reincarnation_records_only_current_process_facts():
+    db, store = await _reincarnation_store("t1")
+    try:
+        identity = {"task_id": "t1", "backend": "local", "runtime": "python"}
+        await store.start(
+            "python_t1",
+            **identity,
+            metadata={"start_identity": "old-process", "environment": {"ATHENA_TEST": "old"}},
+        )
+        await store.mark_dead("python_t1")
+        await store.start("python_t1", **identity)
+
+        row = await store.get("python_t1")
+        assert row is not None
+        assert row["start_identity"] is None
+        assert row["environment_fingerprint"] is None
+        assert "environment" not in row["metadata"]
+        assert row["metadata"]["reincarnations"] == 1
+    finally:
+        await db.close()
+
+
+async def test_runtime_session_reincarnation_fails_closed_on_identity_change():
+    """Same id with changed workspace binding is a hard conflict, not a revive."""
+    db, store = await _reincarnation_store("t1")
+    await store.start(
+        "python_t1",
+        task_id="t1",
+        backend="local",
+        runtime="python",
+        metadata={"workspace_root": "/workspace/a"},
+    )
+    await store.mark_closed("python_t1")
+
+    with pytest.raises(RuntimeError, match="identity changed across re-establishment"):
+        await store.start(
+            "python_t1",
+            task_id="t1",
+            backend="local",
+            runtime="python",
+            metadata={"workspace_root": "/workspace/b"},
+        )
+    row = await store.get("python_t1")
+    assert row is not None
+    assert row["is_alive"] is False
+    assert row["workspace_identity"] == "/workspace/a"
+    await db.close()
+
+
+async def test_runtime_session_reincarnation_fails_closed_on_live_row():
+    """A live row is never silently superseded: the conflict must propagate."""
+    db, store = await _reincarnation_store("t1")
+    await store.start("python_t1", task_id="t1", backend="local", runtime="python")
+
+    with pytest.raises(sqlite3.IntegrityError, match="runtime_sessions.id"):
+        await store.start("python_t1", task_id="t1", backend="local", runtime="python")
+    rows = await db.fetch_all("SELECT * FROM runtime_sessions")
+    assert len(rows) == 1
+    live = await store.get("python_t1")
+    assert live is not None
+    assert "metadata" in live and live["metadata"].get("reincarnations") is None
+    await db.close()
+
+
+async def test_runtime_session_reincarnation_fails_closed_on_owner_change():
+    """A session id may never migrate to a different task across restart."""
+    db, store = await _reincarnation_store("t1", "t2")
+    await store.start("python_t1", task_id="t1", backend="local", runtime="python")
+    await store.mark_closed("python_t1")
+
+    with pytest.raises(sqlite3.IntegrityError):
+        await store.start("python_t1", task_id="t2", backend="local", runtime="python")
+    row = await store.get("python_t1")
+    assert row is not None
+    assert row["task_id"] == "t1"
     await db.close()

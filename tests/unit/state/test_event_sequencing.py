@@ -127,7 +127,11 @@ async def test_fast_stream_subscriber_is_filtered_and_does_not_backpressure_appe
     # The durable append path must not wait for 500 * 10 ms of presentation
     # work. The bounded queue may coalesce/drop intermediate stream frames.
     assert elapsed < 2.0
-    await asyncio.sleep(0.2)
+    # Delivery is asynchronous; wait bounded rather than racing a fixed sleep
+    # on loaded CI runners.
+    delivery_deadline = time.monotonic() + 5.0
+    while not received and time.monotonic() < delivery_deadline:
+        await asyncio.sleep(0.05)
     assert received
     assert all(item == "ModelDelta" for item in received)
 

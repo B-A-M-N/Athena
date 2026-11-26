@@ -35,10 +35,10 @@ the left operator display retains conversation history.
 `athena.cli.native_bridge` emits those newline-delimited frames from the same
 `ProjectionState` used by hosted Glass and `oi-stream`. The Python bridge does
 not choose pixel placement or stream animation frames; Rust animates the OI
-locally from semantic state. Projection frames use schema 3; schema 2 frames
-are normalized for compatibility and unknown schemas become a visible bridge
-error. The bridge includes the current action kind, label, target/query,
-detail, progress, model identity, runtime tree, recent stream tail, and bounded
+locally from semantic state. The producer emits schema 5. The native reader
+normalizes schemas 2, 3, and 4 for compatibility and reports unknown schemas
+as visible bridge errors. The bridge includes the current action kind, label,
+target/query, detail, progress, model identity, runtime tree, recent stream tail, and bounded
 `attention_items`, so the native OI does not have to guess what the agent is
 doing. Approvals and noteworthy notifications appear in a non-modal right-edge
 rail inside the CRT.

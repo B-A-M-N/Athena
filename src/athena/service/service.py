@@ -28,6 +28,7 @@ import os
 import tempfile
 from dataclasses import replace
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
@@ -151,6 +152,59 @@ _DEFAULT_ANSWER_SCRIPTS = (
 _logger = logging.getLogger("athena.service")
 
 
+def _validated_actual_cost(value: Decimal | str | None) -> Decimal | None:
+    """Validate the operator/API cost at the application boundary."""
+    if value is None:
+        return None
+    try:
+        cost = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError("actual_cost must be a finite, non-negative Decimal") from exc
+    if not cost.is_finite() or cost < 0:
+        raise ValueError("actual_cost must be a finite, non-negative Decimal")
+    return cost
+
+
+_PROVIDER_OUTCOME_CONTRACT: dict[str, dict[str, Any]] = {
+    "confirmed_failed": {
+        "attempt_status": "FAILED",
+        "receipt_status": "FAILED",
+        "reservation": "released",
+        "actual_cost": "not_required",
+        "task_transition": "RECOVERY_REQUIRED -> FAILED",
+        "inference_retry": "no",
+        "operator_revisable": False,
+    },
+    "retry_authorized": {
+        "attempt_status": "UNKNOWN",
+        "receipt_status": "FAILED",
+        "provider_outcome": "unknown",
+        "reservation": "retained as open liability",
+        "actual_cost": "not_required",
+        "task_transition": "RECOVERY_REQUIRED|INTERRUPTED -> RUNNING",
+        "inference_retry": "one replacement attempt",
+        "operator_revisable": False,
+    },
+    "confirmed_succeeded": {
+        "attempt_status": "COMPLETED",
+        "receipt_status": "FAILED",
+        "reservation": "released after actual-cost accounting",
+        "actual_cost": "required finite non-negative Decimal",
+        "task_transition": "RECOVERY_REQUIRED -> FAILED",
+        "inference_retry": "no",
+        "operator_revisable": False,
+    },
+    "abandoned_with_liability": {
+        "attempt_status": "ABANDONED",
+        "receipt_status": "FAILED",
+        "reservation": "retained until manual liability closeout",
+        "actual_cost": "optional/unknown",
+        "task_transition": "RECOVERY_REQUIRED -> FAILED",
+        "inference_retry": "no",
+        "operator_revisable": False,
+    },
+}
+
 _RESERVED_REQUEST_METADATA = frozenset(
     {
         "self_host",
@@ -209,6 +263,10 @@ class AthenaService(ServiceReadinessAPI, ProviderOutcomeRecoveryAPI, ServiceWatc
         }
         self._provider_recovery_runtime = ProviderOutcomeRecoveryAPI.compose(self)
         self._started = False
+        # ``_started`` means the durable service graph is initialized. Runtime
+        # producers (worker, scheduler loop, and watch poller) are activated
+        # separately so control-plane reads cannot consume or mutate work.
+        self._runtime_active = False
         self._recovery_status = "not_started"
         self._recovery_summary: dict[str, int] = {}
         self._recovery_error: str | None = None
@@ -294,6 +352,7 @@ class AthenaService(ServiceReadinessAPI, ProviderOutcomeRecoveryAPI, ServiceWatc
         self._skills: SkillStore | None = None
         self._skill_lifecycle: SkillLifecycle | None = None
         self._scheduler: Scheduler | None = None
+        self._scheduler_event_subscribed = False
         self._schedule_api: Any = None
         self._artifacts: ArtifactStore | None = None
         self._mcp: MCPAdapter | None = None
@@ -427,8 +486,12 @@ class AthenaService(ServiceReadinessAPI, ProviderOutcomeRecoveryAPI, ServiceWatc
     # ------------------------------------------------------------------ #
     # Lifecycle: start / stop
     # ------------------------------------------------------------------ #
-    async def start(self) -> None:
-        return await ServiceLifecycle(self).start()
+    async def start(self, *, activate_runtime: bool = True) -> None:
+        return await ServiceLifecycle(self).start(activate_runtime=activate_runtime)
+
+    async def activate_runtime(self) -> None:
+        """Activate background producers after durable initialization."""
+        return await ServiceLifecycle(self).activate_runtime()
 
     async def _start_impl(self) -> None:
         return await ServiceLifecycle(self)._start_impl()

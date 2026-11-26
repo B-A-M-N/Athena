@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from decimal import Decimal, InvalidOperation
+from collections.abc import Mapping
 from typing import Any
 
 from athena.protocol.failure import FailureInfo
@@ -37,7 +38,8 @@ PROVIDER_OUTCOME_CONTRACT: dict[str, dict[str, Any]] = {
     "retry_authorized": {
         "attempt_status": "UNKNOWN",
         "receipt_status": "FAILED",
-        "reservation": "released",
+        "provider_outcome": "unknown",
+        "reservation": "retained as open liability",
         "actual_cost": "not_required",
         "task_transition": "RECOVERY_REQUIRED|INTERRUPTED -> RUNNING",
         "inference_retry": "one replacement attempt",
@@ -72,7 +74,11 @@ class ProviderOutcomeRecoveryAPI:
     def _provider_recovery_service(self) -> "ProviderOutcomeRecoveryService":
         recovery = getattr(self, "__dict__", {}).get("_provider_recovery_runtime")
         if recovery is None:
-            raise RuntimeError("provider outcome recovery is not composed")
+            recovery = ProviderOutcomeRecoveryAPI.compose(self)
+            try:
+                self._provider_recovery_runtime = recovery
+            except AttributeError:
+                pass
         return recovery
 
     async def list_provider_outcome_recoveries(
@@ -93,6 +99,7 @@ class ProviderOutcomeRecoveryAPI:
         note: str,
         provider_response_id: str | None = None,
         actual_cost: Decimal | str | None = None,
+        authorized_by: str | None = None,
     ) -> dict[str, Any]:
         return await ProviderOutcomeRecoveryAPI._provider_recovery_service(self).resolve(
             attempt_id,
@@ -100,6 +107,7 @@ class ProviderOutcomeRecoveryAPI:
             note=note,
             provider_response_id=provider_response_id,
             actual_cost=actual_cost,
+            authorized_by=authorized_by,
         )
 
     async def close_provider_liability(self, attempt_id: str, *, note: str) -> dict[str, Any]:
@@ -109,6 +117,31 @@ class ProviderOutcomeRecoveryAPI:
 
     async def reconcile_provider_outcomes(self) -> dict[str, int]:
         return await ProviderOutcomeRecoveryAPI._provider_recovery_service(self).reconcile()
+
+    async def _release_provider_reservation(
+        self,
+        store: Any,
+        *,
+        task_id: str,
+        attempt_id: str,
+        amount: Decimal,
+    ) -> None:
+        recovery = ProviderOutcomeRecoveryAPI._provider_recovery_service(self)
+        await recovery._release_provider_reservation(
+            store, task_id=task_id, attempt_id=attempt_id, amount=amount
+        )
+
+    async def _finalize_provider_outcome(
+        self,
+        task_id: str,
+        *,
+        resolution: str,
+        attempt_id: str,
+    ) -> None:
+        recovery = ProviderOutcomeRecoveryAPI._provider_recovery_service(self)
+        await recovery._finalize_provider_outcome(
+            task_id, resolution=resolution, attempt_id=attempt_id
+        )
 
 
 class ProviderOutcomeRecoveryService:
@@ -152,6 +185,7 @@ class ProviderOutcomeRecoveryService:
         note: str,
         provider_response_id: str | None = None,
         actual_cost: Decimal | str | None = None,
+        authorized_by: str | None = None,
     ) -> dict[str, Any]:
         resolution = str(resolution).strip().lower()
         note = str(note).strip()
@@ -173,10 +207,11 @@ class ProviderOutcomeRecoveryService:
             note=note,
             provider_response_id=provider_response_id,
             actual_cost=normalized_cost,
+            authorized_by=authorized_by,
         )
         task_id = str(resolved.get("task_id") or attempt.get("task_id") or "")
         amount = _validated_actual_cost(resolved.get("reservation_amount")) or Decimal("0")
-        if resolution in {"confirmed_failed", "retry_authorized"}:
+        if resolution == "confirmed_failed":
             await self._release_provider_reservation(
                 store, task_id=task_id, attempt_id=str(attempt_id), amount=amount
             )
@@ -228,10 +263,11 @@ class ProviderOutcomeRecoveryService:
         attempt = await store.get_attempt(str(attempt_id))
         if attempt is None:
             raise KeyError(f"unknown inference attempt: {attempt_id}")
-        if str(attempt.get("provider_outcome_status") or "").lower() != (
-            "abandoned_with_liability"
-        ):
-            raise ValueError("only abandoned provider liabilities can be manually closed")
+        if str(attempt.get("provider_outcome_status") or "").lower() not in {
+            "unknown",
+            "abandoned_with_liability",
+        }:
+            raise ValueError("only unresolved provider liabilities can be manually closed")
         amount = _validated_actual_cost(attempt.get("reservation_amount")) or Decimal("0")
         budgets = self._ports.budgets()
         if budgets is not None and amount > 0:
@@ -331,10 +367,26 @@ class ProviderOutcomeRecoveryService:
         recovery.add_done_callback(log_failure(f"provider outcome recovery {task_id}"))
 
     async def _provider_resolution_view(self, resolved: dict[str, Any]) -> dict[str, Any]:
+        return await self.resolution_view(resolved, PROVIDER_OUTCOME_CONTRACT)
+
+    async def resolution_view(
+        self,
+        resolved: Mapping[str, Any],
+        contract: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Return a disposition plus its operator-relevant consequences."""
         view = dict(resolved)
         resolution = str(view.get("provider_outcome_status") or "")
-        if resolution in PROVIDER_OUTCOME_CONTRACT:
-            view["disposition_contract"] = dict(PROVIDER_OUTCOME_CONTRACT[resolution])
+        recovery_action = (
+            "retry_authorized"
+            if resolution == "unknown"
+            and view.get("retry_authorized_at")
+            and view.get("reservation_released_at") is None
+            else resolution
+        )
+        view["recovery_action"] = recovery_action
+        if recovery_action in contract:
+            view["disposition_contract"] = dict(contract[recovery_action])
         task_id = str(view.get("task_id") or "")
         tasks = self._ports.tasks()
         if tasks is not None and task_id:
@@ -347,7 +399,9 @@ class ProviderOutcomeRecoveryService:
             view.get("actual_cost") if resolution == "confirmed_succeeded" else "0"
         )
         view["next_actions"] = (
-            ["manually close provider liability"]
+            ["reconcile original provider outcome or explicitly close provider liability"]
+            if resolution == "unknown" and view.get("reservation_released_at") is None
+            else ["manually close provider liability"]
             if resolution == "abandoned_with_liability"
             else []
         )
@@ -360,6 +414,11 @@ class ProviderOutcomeRecoveryService:
         for attempt in await store.list_resolved_attempts():
             try:
                 resolution = str(attempt.get("provider_outcome_status") or "")
+                retry_authorized = (
+                    resolution == "unknown"
+                    and bool(attempt.get("retry_authorized_at"))
+                    and attempt.get("reservation_released_at") is None
+                )
                 task_id = str(attempt.get("task_id") or "")
                 amount = _validated_actual_cost(attempt.get("reservation_amount")) or Decimal("0")
                 attempt_id = str(attempt.get("attempt_id") or "")
@@ -368,15 +427,16 @@ class ProviderOutcomeRecoveryService:
                     request_fingerprint=str(attempt.get("request_fingerprint") or ""),
                 )
                 if (
-                    resolution == "retry_authorized"
+                    retry_authorized
                     and receipt is not None
                     and str(receipt.get("attempt_id") or "") != attempt_id
                 ):
                     replayed += 1
                     continue
-                if resolution in {"confirmed_failed", "retry_authorized"} and not attempt.get(
-                    "reservation_released_at"
-                ):
+                # A retry-authorized attempt keeps the original unknown
+                # outcome's reservation as open liability; only a confirmed
+                # failed outcome releases it during reconciliation.
+                if resolution == "confirmed_failed" and not attempt.get("reservation_released_at"):
                     await self._release_provider_reservation(
                         store, task_id=task_id, attempt_id=attempt_id, amount=amount
                     )
@@ -398,7 +458,7 @@ class ProviderOutcomeRecoveryService:
                         await store.mark_budget_accounted(attempt_id=attempt_id)
                     if not attempt.get("reservation_released_at"):
                         await store.mark_reservation_released(attempt_id=attempt_id)
-                if resolution == "retry_authorized":
+                if retry_authorized:
                     await self._launch_provider_retry(task_id)
                 elif resolution in {
                     "confirmed_failed",

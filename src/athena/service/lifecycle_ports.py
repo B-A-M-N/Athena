@@ -33,6 +33,8 @@ class LifecyclePorts:
             "_store_tasks",
             "_store_input_requests",
             "_started",
+            "_runtime_active",
+            "_scheduler_event_subscribed",
             "_skill_lifecycle",
             "_skill_discovery_status",
             "_scheduler",

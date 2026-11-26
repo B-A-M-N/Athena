@@ -29,6 +29,20 @@ def test_workflow_verification_and_publish_depend_on_core_evidence():
     assert "name: athena-release-verified-${{ github.sha }}" in text
 
 
+def test_workflow_certification_declares_x11_session():
+    """The desktop-acceptance receipt's X11 cell needs XDG_SESSION_TYPE.
+
+    Regression: certification runs under `xvfb-run`, which does not set
+    XDG_SESSION_TYPE, so the native surface certified as bare
+    linux-x86_64 instead of the claimed linux-x86_64-x11-openbox cell and
+    generate-support-matrix failed closed on the first execution that
+    reached it.
+    """
+    text = WORKFLOW.read_text(encoding="utf-8")
+
+    assert 'XDG_SESSION_TYPE: "x11"' in text
+
+
 def test_workflow_uploads_structured_optional_hermes_evidence():
     text = WORKFLOW.read_text(encoding="utf-8")
 

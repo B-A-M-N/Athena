@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import shutil
 
 import pytest
@@ -157,6 +158,56 @@ async def test_self_host_sandbox_exposes_frozen_python_and_rust_toolchains(tmp_p
     assert result.status is ExecutionExitStatus.EXITED
     assert result.exit_code == 0
     assert "Python " in result.stdout
+    assert "cargo " in result.stdout
+    assert "rustc " in result.stdout
+
+
+async def test_self_host_sandbox_resolves_staged_toolchain_symlinks(tmp_path, monkeypatch):
+    """The candidate sandbox must bind the real launcher binaries.
+
+    release-check stages ``cargo``/``rustc`` as symlinks onto ``PATH`` whose
+    targets (the rustup launcher) are outside the staged directory. The
+    trusted toolchain bind reachable from the staging directory is not
+    enough: the launcher target itself must be bound, or every staged tool
+    name becomes a dangling symlink inside the workspace namespace.
+    """
+    project_root = Path(__file__).resolve().parents[3]
+    real_cargo = Path(shutil.which("cargo")).resolve()
+    real_rustc = Path(shutil.which("rustc")).resolve()
+    stage = tmp_path / "toolchain-bin"
+    stage.mkdir()
+    (stage / "cargo").symlink_to(real_cargo)
+    (stage / "rustc").symlink_to(real_rustc)
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    for name in ("pyproject.toml", "uv.lock"):
+        (candidate / name).write_text(
+            (project_root / name).read_text(encoding="utf-8"), encoding="utf-8"
+        )
+    monkeypatch.setenv("PATH", f"{stage}{os.pathsep}{os.environ.get('PATH', '')}")
+    verification = VerificationEnvironment.from_project(
+        str(project_root), include_project_root=True, include_rust=True
+    )
+    manager = ExecutionManager()
+    manager.register_runtime(ShellRuntime())
+
+    result = await manager.execute(
+        ExecutionRequest(
+            runtime="shell",
+            source="cargo --version; rustc --version",
+            task_id="candidate-staged-toolchains",
+            workspace_id="candidate",
+            backend="shadow",
+            cwd=str(candidate),
+            workspace_root=str(candidate),
+            network_policy=NetworkPolicy.DENY,
+            env=verification.for_workspace(str(candidate)),
+            toolchain_paths=verification.readonly_mounts,
+        )
+    )
+
+    assert result.status is ExecutionExitStatus.EXITED
+    assert result.exit_code == 0, result.stderr
     assert "cargo " in result.stdout
     assert "rustc " in result.stdout
 
