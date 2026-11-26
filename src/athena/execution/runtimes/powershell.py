@@ -51,6 +51,7 @@ class PowerShellRuntime(BaseRuntime):
         network_policy=None,
         writable_paths=None,
         read_only_paths=(),
+        resource_limits=None,
     ) -> "_PSSession":
         cmd = "pwsh" if shutil.which("pwsh") else "powershell"
         sess = _PSSession(
@@ -61,6 +62,7 @@ class PowerShellRuntime(BaseRuntime):
             network_policy=network_policy,
             writable_paths=writable_paths,
             read_only_paths=read_only_paths,
+            resource_limits=resource_limits,
         )
         sess.start()
         return sess
@@ -87,6 +89,7 @@ class _PSSession:
         network_policy=None,
         writable_paths=None,
         read_only_paths=(),
+        resource_limits=None,
     ):
         self.env = env or {}
         self.cwd = cwd
@@ -95,6 +98,7 @@ class _PSSession:
         self.network_policy = network_policy
         self.writable_paths = writable_paths
         self.read_only_paths = read_only_paths
+        self.resource_limits = resource_limits
         self.process: subprocess.Popen | None = None
         self.output_queue: queue.Queue = queue.Queue()
         self.done = threading.Event()
@@ -111,6 +115,7 @@ class _PSSession:
             network_policy=self.network_policy,
             writable_paths=self.writable_paths,
             read_only_paths=self.read_only_paths,
+            resource_limits=self.resource_limits,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -134,7 +139,7 @@ class _PSSession:
                     self.process.stdin.close()
                 if self.process.stdout is not None:
                     self.process.stdout.close()
-            except Exception:
+            except Exception:  # rationale: closing a dead process stream is best effort
                 pass
             self.process = None
 
@@ -193,7 +198,7 @@ class _PSSession:
                 raise BrokenPipeError("PowerShell stdin is unavailable")
             process.stdin.write(wrapped + "\n")
             process.stdin.flush()
-        except Exception:
+        except Exception:  # rationale: worker I/O loss becomes an ExecutionEvent
             yield ExecutionEvent(
                 type=ExecutionEventType.STDERR,
                 execution_id=execution_id,

@@ -28,6 +28,80 @@ def test_clean_install_release_script_executes_n1_preflight() -> None:
     assert "PREFLIGHT PASS" in result.stdout
 
 
+def test_release_check_requires_every_required_scenario_to_pass() -> None:
+    release_check = runpy.run_path(str(_ROOT / "scripts" / "release-check"))
+
+    failures = release_check["_required_scenario_failures"](
+        {
+            "scenarios": [
+                {"scenario": "GOOD-001", "required": True, "status": "passed"},
+                {
+                    "scenario": "HOST-001",
+                    "required": True,
+                    "status": "environment_unavailable",
+                },
+                {"scenario": "OPTIONAL-001", "required": False, "status": "missing"},
+            ]
+        }
+    )
+
+    assert failures == ["HOST-001"]
+
+
+def test_system_python_resolution_prefers_xlib_capable_interpreter(monkeypatch) -> None:
+    """The system interpreter chosen for native X11 lanes must import Xlib.
+
+    Regression: on certification runners, actions/setup-python's interpreter
+    shadows /usr/bin/python3 on PATH, so ``shutil.which("python3")`` picked
+    an interpreter without the apt-installed python3-xlib and
+    ``native-desktop-acceptance`` failed closed with "python3-xlib is
+    required for EWMH state normalization".
+    """
+    release_check = runpy.run_path(str(_ROOT / "scripts" / "release-check"))
+    resolve = release_check["_resolve_system_python"]
+    # runpy.run_path copies the namespace, so patch the function's real
+    # module globals rather than the returned mapping.
+    script_globals = resolve.__globals__
+
+    xlib_capable_paths = {"/usr/bin/python3", "/opt/hostedtoolcache/python-with-xlib/bin/python3"}
+
+    def xlib_capable(interpreter: str) -> bool:
+        return interpreter in xlib_capable_paths
+
+    monkeypatch.setitem(script_globals, "_python_imports_xlib", xlib_capable)
+
+    # The CI failure signature: PATH python3 lacks Xlib -> fall back to the
+    # system interpreter that provides it.
+    assert resolve("/opt/hostedtoolcache/python/bin/python3") == "/usr/bin/python3"
+
+    # An Xlib-capable PATH interpreter is kept as-is.
+    assert (
+        resolve("/opt/hostedtoolcache/python-with-xlib/bin/python3")
+        == "/opt/hostedtoolcache/python-with-xlib/bin/python3"
+    )
+
+    # No interpreter provides Xlib: keep the PATH interpreter rather than
+    # changing behavior the contract does not require.
+    monkeypatch.setitem(script_globals, "_python_imports_xlib", lambda _interpreter: False)
+    assert (
+        resolve("/opt/hostedtoolcache/python/bin/python3")
+        == "/opt/hostedtoolcache/python/bin/python3"
+    )
+
+    # A missing PATH interpreter with a working system interpreter is usable.
+    monkeypatch.setitem(script_globals, "_python_imports_xlib", xlib_capable)
+    assert resolve(None) == "/usr/bin/python3"
+
+
+def test_system_python_resolution_returns_none_without_path_interpreter(monkeypatch) -> None:
+    release_check = runpy.run_path(str(_ROOT / "scripts" / "release-check"))
+    resolve = release_check["_resolve_system_python"]
+    # No python3 on PATH and system /usr/bin/python3 cannot import Xlib:
+    # resolution stays None (the lane then fails closed with its own message).
+    monkeypatch.setitem(resolve.__globals__, "_python_imports_xlib", lambda _interpreter: False)
+    assert resolve(None) is None
+
+
 def test_support_matrix_generation_executes_against_bound_fixture(tmp_path: Path) -> None:
     source_sha = "a" * 40
     run_id = "fixture-run"
@@ -99,6 +173,126 @@ def test_support_matrix_generation_executes_against_bound_fixture(tmp_path: Path
     assert (
         json.loads(output.read_text())["surfaces"]["python"]["certification_status"] == "certified"
     )
+
+
+def test_support_matrix_certification_uses_recorded_output_tail(tmp_path: Path) -> None:
+    """Certification must read the lane receipt shape release-check writes.
+
+    Regression: release-check records lanes via _evidence_record, which
+    strips the raw "output" key and keeps only "output_tail"
+    ("output" is never present). generate-support-matrix read only
+    "output", so the python surface could never certify and
+    --require-certified failed on the first execution that reached it
+    (the stage was unreachable while the visual gates were stale).
+    """
+    source_sha = "b" * 40
+    run_id = "fixture-run"
+    platform_cell = (
+        f"{platform.system().lower()}-{platform.machine().lower().replace('amd64', 'x86_64')}"
+    )
+    matrix = {
+        "schema": 2,
+        "surfaces": {
+            "python": {
+                "claimed_versions": ["3.12"],
+                "claimed_platforms": [platform_cell],
+                "implementation_status": "implemented",
+            }
+        },
+    }
+
+    def lane_record(output_tail: str) -> dict:
+        return {
+            "name": "python-version",
+            "exit_code": 0,
+            "commit_sha": source_sha,
+            "release_run_id": run_id,
+            "output_tail": output_tail,
+        }
+
+    passport = {
+        "kind": "athena_backend_passport",
+        "status": "PASS",
+        "release_sha": source_sha,
+        "release_run_id": run_id,
+        "cells": [{"passed": True}],
+    }
+    shutil.copy2(_ROOT / "pyproject.toml", tmp_path / "pyproject.toml")
+    (tmp_path / "matrix.json").write_text(json.dumps(matrix))
+    (tmp_path / "passport.json").write_text(json.dumps(passport))
+    output = tmp_path / "release-support-matrix.json"
+    command = [
+        sys.executable,
+        str(_ROOT / "scripts" / "generate-support-matrix"),
+        "--matrix",
+        str(tmp_path / "matrix.json"),
+        "--passport",
+        str(tmp_path / "passport.json"),
+        "--release-lanes",
+    ]
+
+    # The exact evidence shape release-check publishes: no "output" key.
+    lanes_path = tmp_path / "lanes.json"
+    lanes_path.write_text(
+        json.dumps(
+            {
+                "commit_sha": source_sha,
+                "release_run_id": run_id,
+                "lanes": [lane_record("[release] python --version\nPython 3.12.240")],
+            }
+        )
+    )
+    result = subprocess.run(
+        [
+            *command,
+            str(lanes_path),
+            "--output",
+            str(output),
+            "--source-sha",
+            source_sha,
+            "--release-run-id",
+            run_id,
+            "--require-certified",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (
+        json.loads(output.read_text())["surfaces"]["python"]["certification_status"] == "certified"
+    )
+
+    # Fail closed when the recorded tail carries no exercised-version proof.
+    lanes_path.write_text(
+        json.dumps(
+            {
+                "commit_sha": source_sha,
+                "release_run_id": run_id,
+                "lanes": [lane_record("")],
+            }
+        )
+    )
+    result = subprocess.run(
+        [
+            *command,
+            str(lanes_path),
+            "--output",
+            str(output),
+            "--source-sha",
+            source_sha,
+            "--release-run-id",
+            run_id,
+            "--require-certified",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert "not certified" in result.stderr
 
 
 def test_migration_baseline_script_executes() -> None:
@@ -248,6 +442,9 @@ def test_architecture_lint_rejects_unwaived_baseline_widening(tmp_path: Path) ->
     (tmp_path / "src" / "athena").mkdir(parents=True)
     (tmp_path / "src" / "athena" / "__init__.py").write_text("\n")
     (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "architecture-dependency-baseline.json").write_text(
+        json.dumps({"schema": 1, "cycles": []})
+    )
     baseline_path = tmp_path / "docs" / "architecture-size-baseline.json"
     baseline_path.write_text(json.dumps({"schema": 1, "python": {"legacy.py": 2000}, "rust": {}}))
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)

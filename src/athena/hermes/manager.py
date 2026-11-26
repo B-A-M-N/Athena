@@ -30,10 +30,10 @@ from athena.policy.credentials import (
     user_secret_dir,
     write_user_secret,
 )
-from athena.service.config import (
+from athena.hermes.config import (
     HermesSupervisionMode,
     global_config_path,
-    load_config,
+    load_settings,
     load_toml_file,
     write_toml_atomic_private,
 )
@@ -81,7 +81,7 @@ class HermesRefereeManager:
         return (self.config_path or global_config_path()).expanduser()
 
     def _settings(self) -> Any:
-        return load_config(explicit_path=str(self._config_file()))
+        return load_settings(self._config_file())
 
     def _endpoint(self) -> str:
         if self.endpoint.strip():
@@ -151,7 +151,7 @@ class HermesRefereeManager:
         root = self._root()
         argv = [str(self._python(root)), "-m", "hermes_cli.main", *args]
         stdin = asyncio.subprocess.PIPE if secret is not None else asyncio.subprocess.DEVNULL
-        process = await asyncio.create_subprocess_exec(  # architecture-lint: allow subprocess-outside-approved-backends reason=owned Hermes referee service
+        process = await asyncio.create_subprocess_exec(  # architecture-lint: allow subprocess-outside-approved-backends reason=owned Hermes referee service; architecture-exception: hermes-referee
             *argv,
             cwd=str(root),
             env=self._environment(root),

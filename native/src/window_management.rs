@@ -1,31 +1,116 @@
-use super::{
-    Display, EWMH_GESTURE_GRACE, ResizeZone, Window, WindowDragKind, XButtonEvent,
-    window_parent_position, window_root_position,
+use crate::platform::{
+    CUint, Display, RESIZE_EDGE, Window, XButtonEvent, XDefaultScreen, XGetWindowAttributes,
+    XRootWindow, XTranslateCoordinates, XWindowAttributes, c_long,
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+pub(crate) const EWMH_GESTURE_GRACE: Duration = Duration::from_millis(80);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct WindowDrag {
-    pub(super) kind: WindowDragKind,
-    pub(super) start_root_x: i32,
-    pub(super) start_root_y: i32,
-    pub(super) start_window_x: i32,
-    pub(super) start_window_y: i32,
-    pub(super) start_parent_x: i32,
-    pub(super) start_parent_y: i32,
-    pub(super) start_width: i32,
-    pub(super) start_height: i32,
+pub(crate) enum ResizeZone {
+    TopLeft,
+    Top,
+    TopRight,
+    Right,
+    BottomRight,
+    Bottom,
+    BottomLeft,
+    Left,
+}
+
+impl ResizeZone {
+    pub(crate) fn direction(self) -> c_long {
+        match self {
+            Self::TopLeft => 0,
+            Self::Top => 1,
+            Self::TopRight => 2,
+            Self::Right => 3,
+            Self::BottomRight => 4,
+            Self::Bottom => 5,
+            Self::BottomLeft => 6,
+            Self::Left => 7,
+        }
+    }
+
+    pub(crate) fn cursor_shape(self) -> CUint {
+        match self {
+            Self::TopLeft => 134,
+            Self::Top => 138,
+            Self::TopRight => 136,
+            Self::Right => 96,
+            Self::BottomRight => 14,
+            Self::Bottom => 16,
+            Self::BottomLeft => 12,
+            Self::Left => 70,
+        }
+    }
+}
+
+pub(crate) fn resize_zone(x: i32, y: i32, width: i32, height: i32) -> Option<ResizeZone> {
+    let left = x <= RESIZE_EDGE;
+    let right = x >= width.saturating_sub(RESIZE_EDGE + 1);
+    let top = y <= RESIZE_EDGE;
+    let bottom = y >= height.saturating_sub(RESIZE_EDGE + 1);
+    match (left, top, right, bottom) {
+        (true, true, _, _) => Some(ResizeZone::TopLeft),
+        (_, true, true, _) => Some(ResizeZone::TopRight),
+        (true, _, _, true) => Some(ResizeZone::BottomLeft),
+        (_, _, true, true) => Some(ResizeZone::BottomRight),
+        (_, true, _, _) => Some(ResizeZone::Top),
+        (_, _, _, true) => Some(ResizeZone::Bottom),
+        (true, _, _, _) => Some(ResizeZone::Left),
+        (_, _, true, _) => Some(ResizeZone::Right),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct PendingEwmhGesture {
-    pub(super) drag: WindowDrag,
-    pub(super) configure_events_at_start: u64,
-    pub(super) deadline: Instant,
+pub(crate) enum WindowDragKind {
+    Move,
+    Resize(ResizeZone),
+}
+
+pub(crate) fn window_root_position(display: *mut Display, window: Window) -> (i32, i32) {
+    let root = unsafe { XRootWindow(display, XDefaultScreen(display)) };
+    let mut x = 0;
+    let mut y = 0;
+    let mut child = 0;
+    let translated =
+        unsafe { XTranslateCoordinates(display, window, root, 0, 0, &mut x, &mut y, &mut child) };
+    if translated == 0 { (0, 0) } else { (x, y) }
+}
+
+pub(crate) fn window_parent_position(display: *mut Display, window: Window) -> (i32, i32) {
+    let mut attributes = unsafe { std::mem::zeroed::<XWindowAttributes>() };
+    if unsafe { XGetWindowAttributes(display, window, &mut attributes) } != 0 {
+        (attributes.x, attributes.y)
+    } else {
+        window_root_position(display, window)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WindowDrag {
+    pub(crate) kind: WindowDragKind,
+    pub(crate) start_root_x: i32,
+    pub(crate) start_root_y: i32,
+    pub(crate) start_window_x: i32,
+    pub(crate) start_window_y: i32,
+    pub(crate) start_parent_x: i32,
+    pub(crate) start_parent_y: i32,
+    pub(crate) start_width: i32,
+    pub(crate) start_height: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PendingEwmhGesture {
+    pub(crate) drag: WindowDrag,
+    pub(crate) configure_events_at_start: u64,
+    pub(crate) deadline: Instant,
 }
 
 impl PendingEwmhGesture {
-    pub(super) fn new(drag: WindowDrag, configure_events: u64) -> Self {
+    pub(crate) fn new(drag: WindowDrag, configure_events: u64) -> Self {
         Self {
             drag,
             configure_events_at_start: configure_events,
@@ -33,7 +118,7 @@ impl PendingEwmhGesture {
         }
     }
 
-    pub(super) fn geometry_changed(self, x: i32, y: i32, width: i32, height: i32) -> bool {
+    pub(crate) fn geometry_changed(self, x: i32, y: i32, width: i32, height: i32) -> bool {
         x != self.drag.start_window_x
             || y != self.drag.start_window_y
             || width != self.drag.start_width
@@ -42,7 +127,7 @@ impl PendingEwmhGesture {
 }
 
 impl WindowDrag {
-    pub(super) fn new(
+    pub(crate) fn new(
         display: *mut Display,
         window: Window,
         button: &XButtonEvent,
@@ -65,7 +150,7 @@ impl WindowDrag {
         }
     }
 
-    pub(super) fn geometry(self, root_x: i32, root_y: i32) -> (i32, i32, i32, i32) {
+    pub(crate) fn geometry(self, root_x: i32, root_y: i32) -> (i32, i32, i32, i32) {
         let dx = root_x.saturating_sub(self.start_root_x);
         let dy = root_y.saturating_sub(self.start_root_y);
         match self.kind {

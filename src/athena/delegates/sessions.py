@@ -281,7 +281,7 @@ class ExternalDelegateManager:
                 workspace=workspace,
                 task_policy=task_policy,
                 task_budget=task_budget,
-                _directives=DispatchDirectives(),
+                directives=DispatchDirectives(),
             )
             return {
                 "ok": result.status.value == "ok",
@@ -370,7 +370,7 @@ class _SubprocessTransport:
                 "ATHENA_WORKSPACE_ROOT": os.path.realpath(workspace.root),
             }
         )
-        process = await asyncio.create_subprocess_exec(  # architecture-lint: allow subprocess-outside-approved-backends reason=owned specialist transport
+        process = await asyncio.create_subprocess_exec(  # architecture-lint: allow subprocess-outside-approved-backends reason=owned specialist transport; architecture-exception: delegate-specialist-transport
             *spec.command,
             cwd=os.path.realpath(workspace.root),
             stdin=asyncio.subprocess.PIPE,

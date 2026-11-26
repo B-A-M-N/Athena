@@ -13,7 +13,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from athena.capabilities.dispatcher import SuspendedCall
+from athena.protocol.continuations import SuspendedCall
 from athena.protocol.capabilities import (
     CapabilityRequest,
     CapabilityRequestOrigin,
@@ -34,6 +34,27 @@ __all__ = [
 
 class GeneratedHostError(RuntimeError):
     """A governed host call could not be completed for generated code."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_class: str = "governance_failure",
+        recovery_action: str = "inspect_and_revalidate",
+        code: str = "generated_host_failure",
+    ) -> None:
+        super().__init__(message)
+        self.failure_class = failure_class
+        self.recovery_action = recovery_action
+        self.code = code
+
+    def to_record(self) -> dict[str, str]:
+        return {
+            "code": self.code,
+            "failure_class": self.failure_class,
+            "recovery_action": self.recovery_action,
+            "message": str(self),
+        }
 
 
 class PersistentGeneratedSession:
@@ -59,7 +80,7 @@ class PersistentGeneratedSession:
     async def start(self) -> None:
         if self._process is not None:
             return
-        self._process = await asyncio.create_subprocess_exec(  # architecture-lint: allow subprocess-outside-approved-backends reason=generated runtime worker
+        self._process = await asyncio.create_subprocess_exec(  # architecture-lint: allow subprocess-outside-approved-backends reason=generated runtime worker; architecture-exception: synthesis-runtime-worker
             *self._argv,
             env=self._env,
             stdin=asyncio.subprocess.PIPE,
@@ -142,7 +163,13 @@ class PersistentGeneratedSession:
         if process is None:
             return ProcessKillOutcome(proven_dead=True, already_dead=True)
         outcome = await kill_tree_async(process, timeout=1.0)
-        if outcome.proven_dead:
+        # A process that exited before cleanup cannot satisfy the stronger
+        # process-tree proof contract, but its session handle must still be
+        # retired when no owned descendants remain.  Keeping a dead handle in
+        # the session map would allow a later call to reuse a runtime that no
+        # longer exists; the conservative cleanup obligation remains owned by
+        # the process-tree outcome.
+        if outcome.proven_dead or (outcome.already_dead and not outcome.survivors):
             self._process = None
         if outcome.proven_dead and self._stderr_task is not None:
             self._stderr_task.cancel()
@@ -162,7 +189,18 @@ class PersistentGeneratedSession:
             value = await host.call(request["capability_id"], request["arguments"])
             return {"ok": True, "value": value}
         except Exception as exc:  # noqa: BLE001 - child receives a failed call
-            return {"ok": False, "error": str(exc)}
+            if isinstance(exc, GeneratedHostError):
+                return {"ok": False, "error": str(exc), "failure": exc.to_record()}
+            return {
+                "ok": False,
+                "error": str(exc),
+                "failure": {
+                    "code": "host_bridge_exception",
+                    "failure_class": "infrastructure_failure",
+                    "recovery_action": "inspect_environment_and_retry",
+                    "message": str(exc),
+                },
+            }
 
     async def _read_stderr(self, stream: asyncio.StreamReader) -> None:
         try:
@@ -245,7 +283,7 @@ class GeneratedToolHost:
                 task_budget=self.task_budget,
                 _generated_call_depth=self.call_depth + 1,
                 _generated_call_chain=(*self.call_chain, capability_id),
-                _directives=DispatchDirectives(
+                directives=DispatchDirectives(
                     inherited_effects=self.inherited_effects,
                     inherited_capability_id=self.inherited_capability_id,
                 ),

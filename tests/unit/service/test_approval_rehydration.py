@@ -10,6 +10,7 @@ from athena.protocol.capabilities import EffectClass
 from athena.protocol.policy import ApprovalScope, PolicyRequest, Principal
 from athena.protocol.tasks import WorkspaceSpec
 from athena.service.service import AthenaService
+from athena.service.interaction import OperatorInteractionService
 
 
 class _Approvals:
@@ -38,6 +39,7 @@ class _Continuations:
 @pytest.mark.asyncio
 async def test_rehydrate_call_grant_only_for_unconsumed_continuation():
     service = AthenaService.__new__(AthenaService)
+    service._interaction = OperatorInteractionService(service)
     service._policy = PolicyEngine()
 
     await service._rehydrate_approval_grants(_Approvals(), _Continuations())

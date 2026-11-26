@@ -11,31 +11,9 @@ import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any
 
-
-class AffordanceScope(str, Enum):
-    SCRATCH = "scratch"
-    TASK = "task"
-    CANDIDATE = "candidate"
-    PROJECT = "project"
-    USER = "user"
-    SYSTEM = "system"
-
-
-@dataclass(frozen=True)
-class DependencyRequirement:
-    """A dependency request that can be inspected/resolved by policy."""
-
-    name: str
-    manager: str = "python"
-    version: str | None = None
-    reason: str = ""
-    required_for: str | None = None
-
-    def key(self) -> str:
-        return f"{self.manager}:{self.name}:{self.version or '*'}"
+from athena.protocol.affordances import AffordanceScope, DependencyRequirement
 
 
 @dataclass(frozen=True)

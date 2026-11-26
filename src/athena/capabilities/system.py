@@ -10,6 +10,7 @@ CPU/memory/disk/network/ports/environment/toolchain. No mutation ops.
 """
 
 from __future__ import annotations
+from athena.capabilities.operations import native_descriptor
 
 import json
 import os
@@ -19,10 +20,9 @@ import shutil
 import subprocess
 from typing import Any, ClassVar
 
-from athena.execution.async_call import run_blocking
+from athena.concurrency import run_blocking
 from athena.execution.process_tree import process_start_identity
 from athena.protocol.capabilities import (
-    CapabilityDescriptor,
     CapabilityOrigin,
     CapabilityRequest,
     CapabilityResult,
@@ -67,7 +67,7 @@ def _valid_unit_name(value: str) -> bool:
 class ProcessCapability:
     """Inspect host processes; mutate only Athena-owned runtime processes."""
 
-    descriptor = CapabilityDescriptor(
+    descriptor = native_descriptor(
         id="process",
         description=(
             "Process control: list processes, inspect one (cmdline/exe/cwd/"
@@ -259,7 +259,7 @@ class ProcessCapability:
                 finally:
                     os.close(fd_handle)
 
-            await run_blocking(_write)
+            await run_blocking(_write, _pool="long")
             return _result(request, output="written")
 
         if op == "signal":
@@ -279,7 +279,7 @@ class ProcessCapability:
                 os.kill(pid, sig)
 
             try:
-                await run_blocking(_kill)
+                await run_blocking(_kill, _pool="long")
             except ProcessLookupError:
                 return _result(request, ok=False, error=f"no such pid {pid}")
             except PermissionError:
@@ -299,7 +299,7 @@ class ProcessCapability:
                     time.sleep(0.1)
                 return not os.path.exists(f"/proc/{pid}")
 
-            exited = await run_blocking(_wait)
+            exited = await run_blocking(_wait, _pool="long")
             return _result(
                 request,
                 ok=exited,
@@ -318,7 +318,7 @@ class ProcessCapability:
 class MachineCapability:
     """Read-only introspection of the host machine."""
 
-    descriptor = CapabilityDescriptor(
+    descriptor = native_descriptor(
         id="machine",
         description=(
             "Machine introspection: OS/kernel/arch, CPU load & cores, memory, "

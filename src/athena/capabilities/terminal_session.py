@@ -17,6 +17,7 @@ Operations:
 """
 
 from __future__ import annotations
+from athena.capabilities.operations import native_descriptor
 
 import importlib
 import logging
@@ -27,11 +28,10 @@ import time
 from typing import Any
 import warnings
 
-from athena.execution.async_call import run_blocking
+from athena.concurrency import run_blocking
 from athena.execution.process_tree import sandbox_argv
 from athena.protocol.capabilities import (
     Availability,
-    CapabilityDescriptor,
     CapabilityOrigin,
     CapabilityRequest,
     CapabilityResult,
@@ -233,7 +233,7 @@ class _Session:
 class TerminalSessionCapability:
     """Interactive PTY sessions with screen awareness."""
 
-    descriptor = CapabilityDescriptor(
+    descriptor = native_descriptor(
         id="terminal_session",
         description=(
             "Operate interactive terminals under a PTY: TUIs, REPLs, shells, "
@@ -414,6 +414,7 @@ class TerminalSessionCapability:
                     cmd,
                     rows,
                     cols,
+                    _pool="long",
                     cwd=cwd,
                     workspace_root=workspace_root,
                     network_policy=network_policy,
@@ -445,7 +446,7 @@ class TerminalSessionCapability:
             return _result(request, ok=False, error="unknown or unowned session")
 
         if op == "screen":
-            data = await run_blocking(session.drain)
+            data = await run_blocking(session.drain, _pool="long")
             row, col = session.cursor()
             screen_text = _tail_text(data)
             # Large screen renders (busy TUIs, dense scrollbacks) are ambient
@@ -457,9 +458,7 @@ class TerminalSessionCapability:
                     EV["RUNTIME_SCREEN_CHANGED"],
                     session,
                     screen_chars=len(screen_text),
-                    # Keep the observation useful to the interpreter while
-                    # bounding event size. The capability result remains the
-                    # full normal screen response.
+                    # Bound event size; the capability result remains full.
                     screen_text=_tail_text(data, limit=16_000),
                     cursor_row=row,
                     cursor_col=col,
@@ -480,28 +479,28 @@ class TerminalSessionCapability:
             )
 
         if op == "write":
-            await run_blocking(session.child.write, str(args.get("text") or ""))
+            await run_blocking(session.child.write, str(args.get("text") or ""), _pool="long")
             return _result(request, output="ok", meta={"session": session.id})
 
         if op == "send":
-            await run_blocking(session.child.sendline, str(args.get("text") or ""))
+            await run_blocking(session.child.sendline, str(args.get("text") or ""), _pool="long")
 
             def _drain_send():
                 time.sleep(0.15)
                 return session.drain()
 
-            data = await run_blocking(_drain_send)
+            data = await run_blocking(_drain_send, _pool="long")
             return _result(request, output=_tail_text(data), meta={"session": session.id})
 
         if op == "keys":
             raw = self._escape_keys(str(args.get("keys") or ""))
-            await run_blocking(session.child.send, raw)
+            await run_blocking(session.child.send, raw, _pool="long")
 
             def _drain_keys():
                 time.sleep(0.15)
                 return session.drain()
 
-            data = await run_blocking(_drain_keys)
+            data = await run_blocking(_drain_keys, _pool="long")
             return _result(request, output=_tail_text(data), meta={"session": session.id})
 
         if op == "wait_for":
@@ -536,7 +535,7 @@ class TerminalSessionCapability:
                     _time.sleep(0.05)
                 return False
 
-            matched = await run_blocking(_wait)
+            matched = await run_blocking(_wait, _pool="long")
             data = _tail_text(session.screen())
             if matched:
                 return _result(request, output=data, meta={"session": session.id, "matched": True})
@@ -554,7 +553,7 @@ class TerminalSessionCapability:
             cols = max(int(args.get("cols") or 80), 10)
             if rows > 200 or cols > 300:
                 return _result(request, ok=False, error="rows/cols outside safe bounds")
-            await run_blocking(session.child.setwinsize, rows, cols)
+            await run_blocking(session.child.setwinsize, rows, cols, _pool="long")
             session.rows, session.cols = rows, cols
             if getattr(session, "screen_obj", None) is not None:
                 try:
@@ -564,7 +563,7 @@ class TerminalSessionCapability:
             return _result(request, output="ok", meta={"session": session.id})
 
         if op == "kill":
-            await run_blocking(session.child.terminate, True)
+            await run_blocking(session.child.terminate, True, _pool="long")
             self._sessions.pop(session.id, None)
             await self._emit_runtime(EV["RUNTIME_STATE_LOST"], session, reason="closed")
             return _result(request, output=f"terminated {session.id}")
@@ -580,7 +579,7 @@ class TerminalSessionCapability:
         errors: list[dict[str, Any]] = []
         for session in sessions:
             try:
-                await run_blocking(session.child.terminate, True)
+                await run_blocking(session.child.terminate, True, _pool="long")
                 if session.alive():
                     unproven.append(
                         {"session_id": session.id, "pid": getattr(session.child, "pid", None)}

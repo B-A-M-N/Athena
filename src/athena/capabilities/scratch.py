@@ -16,6 +16,8 @@ from typing import Any
 from athena.affordances.scratch import ScratchManager
 from athena.capabilities.synthesis import infer_input_schema
 from athena.protocol.capabilities import (
+    CapabilityFailure,
+    CapabilityFailureCode,
     CapabilityDescriptor,
     CapabilityOrigin,
     CapabilityRequest,
@@ -217,12 +219,23 @@ def _result(
     error: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> CapabilityResult:
-    return CapabilityResult(
-        request.call_id,
-        request.capability_id,
-        CapabilityResultStatus.OK if ok else CapabilityResultStatus.FAILED,
+    if ok:
+        return CapabilityResult(
+            request.call_id,
+            request.capability_id,
+            CapabilityResultStatus.OK,
+            output=output,
+            error=error,
+            metadata=dict(metadata or {}),
+        )
+    return CapabilityResult.failure(
+        request,
+        CapabilityFailure(
+            code=CapabilityFailureCode.DOMAIN_REJECTED,
+            detail=error or "operation failed",
+            stage="invoke",
+        ),
         output=output,
-        error=error,
         metadata=dict(metadata or {}),
     )
 

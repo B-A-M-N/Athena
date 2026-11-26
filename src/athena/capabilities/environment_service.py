@@ -3,7 +3,7 @@
 Mutations require approval; recovery contracts live with the family."""
 
 from athena.capabilities import environment as _facade
-from athena.protocol.capabilities import CapabilityDescriptor
+from athena.capabilities.operations import native_descriptor
 from athena.protocol.capabilities import CapabilityOrigin
 from athena.protocol.capabilities import CapabilityRequest
 from athena.protocol.capabilities import CapabilityResult
@@ -36,7 +36,7 @@ from athena.capabilities.environment_common import _service_request_digest
 class ServiceCapability:
     """systemd service control (user + system scopes)."""
 
-    descriptor = CapabilityDescriptor(
+    descriptor = native_descriptor(
         id="service",
         description=(
             "Operating-system service control via systemd: list services, "

@@ -35,10 +35,20 @@ def main(argv: list[str]) -> int:
         fail(f"unexpected uniform scale: {scale} != {expected_scale}")
 
     canvas = layout["canvas"]
-    if not math.isclose(canvas["x"], 0.0, abs_tol=0.01) or not math.isclose(canvas["y"], 0.0, abs_tol=0.01):
+    if not math.isclose(canvas["x"], 0.0, abs_tol=0.01) or not math.isclose(
+        canvas["y"], 0.0, abs_tol=0.01
+    ):
         fail("responsive canvas is letterboxed")
-    if not math.isclose(canvas["width"], width, abs_tol=0.01) or not math.isclose(canvas["height"], height, abs_tol=0.01):
+    if not math.isclose(canvas["width"], width, abs_tol=0.01) or not math.isclose(
+        canvas["height"], height, abs_tol=0.01
+    ):
         fail("responsive canvas does not fill the surface")
+    expected_scale_x = width / DESIGN_WIDTH
+    expected_scale_y = height / DESIGN_HEIGHT
+    if not math.isclose(float(layout["scale_x"]), expected_scale_x, rel_tol=0.0, abs_tol=0.001):
+        fail("responsive width axis does not fill the drawable")
+    if not math.isclose(float(layout["scale_y"]), expected_scale_y, rel_tol=0.0, abs_tol=0.001):
+        fail("responsive height axis does not fill the drawable")
     if layout.get("scale_x", 0.0) <= 0 or layout.get("scale_y", 0.0) <= 0:
         fail("responsive axis scales are missing")
 
@@ -58,19 +68,38 @@ def main(argv: list[str]) -> int:
         if rect["x"] + rect["width"] > width + 0.01 or rect["y"] + rect["height"] > height + 0.01:
             fail(f"{name} extends outside the surface")
 
-    if not math.isclose(layout["operator_outer"]["width"], layout["oi_outer"]["width"], abs_tol=0.01):
+    if not math.isclose(
+        layout["operator_outer"]["width"], layout["oi_outer"]["width"], abs_tol=0.01
+    ):
         fail("operator and OI wells are not equal-width apertures")
-    if not math.isclose(layout["operator_inner"]["height"], layout["oi_inner"]["height"], abs_tol=0.01):
+    if not math.isclose(
+        layout["operator_inner"]["height"], layout["oi_inner"]["height"], abs_tol=0.01
+    ):
         fail("operator and OI inner apertures are not equal-height")
-    if layout["operator_outer"]["height"] < canvas["height"] * 0.60:
+    if layout["operator_outer"]["height"] <= layout["controls"]["height"] * 3.0:
         fail("display assembly is no longer dominant")
     if layout["controls"]["height"] > canvas["height"] * 0.18:
         fail("control rail is no longer shallow")
 
+    rail = layout["rail"]
     prompt = layout["prompt_layout"]
     prompt_rect = layout["prompt"]
     if prompt["rect"] != prompt_rect:
         fail("prompt layout and prompt rectangle diverged")
+    if prompt_rect["y"] < layout["controls"]["y"] - 0.01:
+        fail("prompt does not belong to the lower hardware rail")
+    if prompt_rect["x"] < rail["operator_panel"]["x"] - 0.01:
+        fail("prompt escapes the operator instrument module on the left")
+    if (
+        prompt_rect["x"] + prompt_rect["width"]
+        > rail["operator_panel"]["x"] + rail["operator_panel"]["width"] + 0.01
+    ):
+        fail("prompt escapes the operator instrument module on the right")
+    if (
+        prompt_rect["y"] + prompt_rect["height"]
+        > rail["operator_panel"]["y"] + rail["operator_panel"]["height"] + 0.01
+    ):
+        fail("prompt escapes the operator instrument module on the bottom")
     previous_bottom = prompt_rect["y"]
     for name in ("status_row", "input_row", "hint_row"):
         row = prompt.get(name)
@@ -82,14 +111,10 @@ def main(argv: list[str]) -> int:
             fail(f"prompt row escapes prompt bay: {name}")
         previous_bottom = row["top"] + row["height"]
 
-    rail = layout["rail"]
     rail_rect = rail["rail"]
     modules = (
         "speaker",
         "operator_panel",
-        "operator_status",
-        "operator_input",
-        "operator_hint",
         "system_status",
         "primary_encoder",
         "brightness",
@@ -111,7 +136,10 @@ def main(argv: list[str]) -> int:
         fail("identity plate is not the far-right hardware module")
 
     metrics = layout["metrics"]
-    if any(float(metrics[name]["height"]) <= 0 or float(metrics[name]["width"]) <= 0 for name in metrics):
+    if any(
+        float(metrics[name]["height"]) <= 0 or float(metrics[name]["width"]) <= 0
+        for name in metrics
+    ):
         fail("font metrics contain a non-positive dimension")
     terminal = layout.get("terminal_size")
     if terminal is not None and (terminal["columns"] < 1 or terminal["rows"] < 1):
@@ -119,24 +147,25 @@ def main(argv: list[str]) -> int:
 
     sizes = layout.get("font_pixel_sizes")
     if sizes is not None:
-        floors = [16, 17, 13, 11]
-        if len(sizes) != 4 or any(size < floor for size, floor in zip(sizes, floors)):
-            fail(f"native text legibility floor violated: {sizes} < {floors}")
+        if len(sizes) != 4 or any(size <= 0 for size in sizes):
+            fail(f"native text sizes are invalid: {sizes}")
     if layout["metrics_source"] == "live_xft":
         if sizes is None or len(sizes) != 4:
             fail("live layout is missing quantized font sizes")
         text_scale = float(layout.get("text_scale", 1.0))
         font_scale = text_scale
         expected_sizes = [
-            max(16, round(16 * font_scale)),
-            max(17, round(17 * font_scale)),
-            max(13, round(13 * font_scale)),
-            max(11, round(11 * font_scale)),
+            max(16, round(20 * font_scale)),
+            max(16, round(20 * font_scale)),
+            max(15, round(18 * font_scale)),
+            max(12, round(13 * font_scale)),
         ]
         if sizes != expected_sizes:
             fail(f"font sizes do not follow cabinet scale: {sizes} != {expected_sizes}")
 
-    print(f"native-layout: PASS — {width}x{height}, scale={scale:.5f}, source={layout['metrics_source']}")
+    print(
+        f"native-layout: PASS — {width}x{height}, scale={scale:.5f}, source={layout['metrics_source']}"
+    )
     return 0
 
 

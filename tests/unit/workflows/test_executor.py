@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from athena.capabilities.dispatcher import SuspendedCall
-from athena.kernel.dispatch import DispatchResult
+from athena.kernel.dispatch import CapabilityDispatchShim, DispatchResult
 from athena.kernel.kernel import AgentKernel
 from athena.protocol.capabilities import (
     CapabilityDescriptor,
@@ -927,7 +927,7 @@ async def test_same_process_approval_replay_keeps_workflow_identity(tmp_path):
             self.directives = None
 
         async def dispatch_many(self, requests, **kwargs):
-            self.directives = kwargs["_directives_by_call_id"]
+            self.directives = kwargs.get("directives_by_call_id")
             captured_kwargs.update(kwargs)
             return [
                 CapabilityResult(
@@ -948,10 +948,10 @@ async def test_same_process_approval_replay_keeps_workflow_identity(tmp_path):
 
     replay = _ReplayDispatcher()
     run_store = _RunStore()
-    shim = SimpleNamespace(
-        _dispatcher=replay,
-        _workspace=WorkspaceSpec(id="repo", root=str(tmp_path)),
-        _profile=None,
+    shim = CapabilityDispatchShim(
+        replay,
+        WorkspaceSpec(id="repo", root=str(tmp_path)),
+        profile=None,
     )
     # A protocol-faithful TaskSpec: replay must restore the same authority
     # the original dispatch ran under, not a partial double.
@@ -1053,7 +1053,16 @@ async def test_workflow_approval_resolves_outer_call_after_child_result(tmp_path
             self.outer = None
 
         async def dispatch_many(self, requests, **kwargs):
-            del kwargs
+            if requests[0].capability_id == "workflow":
+                self.outer = requests[0]
+                return [
+                    CapabilityResult(
+                        requests[0].call_id,
+                        requests[0].capability_id,
+                        CapabilityResultStatus.OK,
+                        output=json.dumps({"workflow_id": "workflow-1", "status": "completed"}),
+                    )
+                ]
             return [
                 CapabilityResult(
                     requests[0].call_id,
@@ -1080,10 +1089,10 @@ async def test_workflow_approval_resolves_outer_call_after_child_result(tmp_path
 
     replay = _ReplayDispatcher()
     run_store = _RunStore()
-    shim = SimpleNamespace(
-        _dispatcher=replay,
-        _workspace=WorkspaceSpec(id="repo", root=str(tmp_path)),
-        _profile=None,
+    shim = CapabilityDispatchShim(
+        replay,
+        WorkspaceSpec(id="repo", root=str(tmp_path)),
+        profile=None,
     )
     task = SimpleNamespace(
         id="workflow-task",
@@ -1211,6 +1220,28 @@ async def test_durable_workflow_approval_resume_reconstructs_outer_call(tmp_path
             self.outer = None
             self.kwargs = None
 
+        async def dispatch_many(self, requests, **kwargs):
+            self.kwargs = kwargs
+            request = requests[0]
+            if request.capability_id == "workflow":
+                self.outer = request
+                return [
+                    CapabilityResult(
+                        request.call_id,
+                        request.capability_id,
+                        CapabilityResultStatus.OK,
+                        output=json.dumps({"status": "completed"}),
+                    )
+                ]
+            return [
+                CapabilityResult(
+                    request.call_id,
+                    request.capability_id,
+                    CapabilityResultStatus.OK,
+                    output="approved",
+                )
+            ]
+
         async def dispatch(self, request, **kwargs):
             if request.capability_id == "workflow":
                 self.outer = request
@@ -1231,10 +1262,10 @@ async def test_durable_workflow_approval_resume_reconstructs_outer_call(tmp_path
     continuation = _ContinuationStore()
     dispatcher = _Dispatcher()
     run_store = _RunStore()
-    shim = SimpleNamespace(
-        _dispatcher=dispatcher,
-        _workspace=WorkspaceSpec(id="repo", root=str(tmp_path)),
-        _profile=None,
+    shim = CapabilityDispatchShim(
+        dispatcher,
+        WorkspaceSpec(id="repo", root=str(tmp_path)),
+        profile=None,
     )
     task = TaskSpec(
         id="workflow-task",

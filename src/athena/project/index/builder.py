@@ -661,7 +661,7 @@ def _relative_change(value: object, root: Path) -> str:
 def _git_inventory(root: Path) -> list[Path] | None:
     """Use Git's own tracked/unignored inventory for a Git workspace."""
     try:
-        result = subprocess.run(  # architecture-lint: allow subprocess-outside-approved-backends reason=read-only git project inventory
+        result = subprocess.run(  # architecture-lint: allow subprocess-outside-approved-backends reason=read-only git project inventory; architecture-exception: project-git-inventory
             [
                 "git",
                 "-C",

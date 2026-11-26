@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from athena.execution.manager import ExecutionManager
 from athena.execution.runtimes.base import BaseRuntime
 from athena.protocol.execution import (
@@ -69,3 +71,63 @@ async def test_explicit_session_preserves_workspace_and_network_scope(tmp_path):
         network_policy=NetworkPolicy.ALLOW,
     )
     assert not runtime._request_matches_session(changed, session)
+
+    with pytest.raises(PermissionError, match="security-sensitive identity"):
+        events = runtime.execute(changed, "exec-changed")
+        [event async for event in events]
+
+
+async def test_manager_rejects_foreign_explicit_session_before_runtime_execution(tmp_path):
+    runtime = _ScopeRuntime()
+    manager = ExecutionManager()
+    manager.register_runtime(runtime)
+    session_id = await manager.create_session(
+        task_id="owner",
+        runtime=runtime.name,
+        workspace_root=str(tmp_path),
+        network_policy="deny",
+    )
+
+    request = ExecutionRequest(
+        runtime=runtime.name,
+        source="must not run",
+        task_id="different-task",
+        workspace_id="workspace",
+        runtime_session_id=session_id,
+        workspace_root=str(tmp_path),
+        network_policy=NetworkPolicy.DENY,
+    )
+    with pytest.raises(PermissionError, match="belongs to task owner"):
+        await manager.execute(request)
+
+
+async def test_base_runtime_session_locks_are_released_after_execution():
+    runtime = _ScopeRuntime()
+    for index in range(250):
+        request = ExecutionRequest(
+            runtime=runtime.name,
+            source="",
+            task_id=f"task-{index}",
+            workspace_id="workspace",
+        )
+        events = [event async for event in runtime.execute(request, f"exec-{index}")]
+        assert events[-1].type is ExecutionEventType.EXITED
+    assert len(runtime._session_locks) == 0
+
+
+async def test_base_runtime_rejects_implicit_session_identity_changes(tmp_path):
+    runtime = _ScopeRuntime()
+    await runtime.create_session(
+        task_id="task-scope",
+        workspace_root=str(tmp_path),
+        network_policy="deny",
+    )
+
+    with pytest.raises(PermissionError, match="security-sensitive identity"):
+        await runtime.create_session(
+            task_id="task-scope",
+            workspace_root=str(tmp_path / "different"),
+            network_policy="deny",
+        )
+
+    assert list(runtime._sessions) == ["scope-test_task-scope"]

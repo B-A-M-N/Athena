@@ -12,18 +12,19 @@ Only this shim talks to the capability layer. No model block can bypass it
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import Any
 
-from athena.capabilities.dispatcher import (
-    CapabilityDispatcher,
-    SuspendedCall,
-    WAITING_APPROVAL,
-)
+from athena.protocol.capabilities import DispatchProvenance
+from athena.capabilities.dispatcher import CapabilityDispatcher
 from athena.protocol.capabilities import (
     CapabilityRequest,
+    CapabilityRequestOrigin,
     CapabilityResult,
     CapabilityResultStatus,
+    DispatchDirectives,
 )
+from athena.protocol.continuations import SuspendedCall
 from athena.protocol.messages import (
     CapabilityCallBlock,
     CapabilityResultBlock,
@@ -32,10 +33,13 @@ from athena.protocol.tasks import TaskSpec, WorkspaceSpec
 
 __all__ = [
     "CapabilityDispatchShim",
+    "DispatchScope",
     "DispatchResult",
     "SuspendedCall",
     "WAITING_APPROVAL",
 ]
+
+WAITING_APPROVAL = "WAITING_APPROVAL"
 
 
 @dataclass(frozen=True)
@@ -57,6 +61,14 @@ class DispatchResult:
         return bool(self.suspended)
 
 
+@dataclass(frozen=True)
+class DispatchScope:
+    """Public, immutable context for the task's canonical dispatch boundary."""
+
+    workspace: WorkspaceSpec
+    profile: str | None
+
+
 class CapabilityDispatchShim:
     """Facade turning model blocks into authorized capability execution.
 
@@ -74,11 +86,15 @@ class CapabilityDispatchShim:
         profile: str | None = None,
     ) -> None:
         self._dispatcher = dispatcher
-        self._workspace = workspace
-        self._profile = profile
+        self.scope = DispatchScope(workspace=workspace, profile=profile)
 
     async def dispatch(
-        self, task: TaskSpec, calls, *, runtime_remaining_s: float | None = None
+        self,
+        task: TaskSpec,
+        calls,
+        *,
+        runtime_remaining_s: float | None = None,
+        provenance: "DispatchProvenance | None" = None,
     ) -> DispatchResult:
         """Dispatch all capability calls for one assistant turn.
 
@@ -92,17 +108,18 @@ class CapabilityDispatchShim:
             return DispatchResult()
 
         requests = [_to_request(task, call) for call in calls]
-        workspace = task.workspace or self._workspace
+        workspace = getattr(task, "workspace", None) or self.scope.workspace
 
         outcome = await self._dispatcher.dispatch_many(
             requests,
             workspace=workspace,
-            profile=self._profile,
+            profile=self.scope.profile,
             task_policy=task.capability_policy,
             model_policy=task.model_policy,
             task_budget=task.resource_budget,
             task_deadline=task.deadline,
             runtime_remaining_s=runtime_remaining_s,
+            provenance=provenance,
         )
 
         results: list[CapabilityResultBlock] = []
@@ -114,6 +131,106 @@ class CapabilityDispatchShim:
                 results.append(_result_to_block(item))
 
         return DispatchResult(results=tuple(results), suspended=tuple(suspended))
+
+    async def resume_requests(
+        self,
+        task: TaskSpec,
+        requests,
+        *,
+        runtime_remaining_s: float | None = None,
+        provenance: "DispatchProvenance | None" = None,
+        task_policy=None,
+        model_policy=None,
+        task_budget=None,
+        task_deadline=None,
+        _directives_by_call_id: dict | None = None,
+        verification_environment: Any = None,
+    ) -> DispatchResult:
+        """Resume canonical requests with explicit replay authority.
+
+        Approvals bind canonical requests, not model blocks.  Trusted
+        orchestration resumes them through the same shim boundary, preserving
+        task policy and directives without exposing dispatcher internals.
+        """
+        requests = list(requests)
+        if not requests:
+            return DispatchResult()
+
+        workspace = getattr(task, "workspace", None) or self.scope.workspace
+        outcome = await self._dispatcher.dispatch_many(
+            requests,
+            workspace=workspace,
+            profile=self.scope.profile,
+            task_policy=task_policy
+            if task_policy is not None
+            else getattr(task, "capability_policy", None),
+            model_policy=model_policy
+            if model_policy is not None
+            else getattr(task, "model_policy", None),
+            task_budget=task_budget
+            if task_budget is not None
+            else getattr(task, "resource_budget", None),
+            task_deadline=task_deadline
+            if task_deadline is not None
+            else getattr(task, "deadline", None),
+            runtime_remaining_s=runtime_remaining_s,
+            provenance=provenance,
+            directives_by_call_id=_directives_by_call_id or {},
+            verification_environment=verification_environment,
+        )
+
+        results: list[CapabilityResultBlock] = []
+        suspended: list[SuspendedCall] = []
+        for item in outcome:
+            if isinstance(item, SuspendedCall):
+                suspended.append(item)
+            else:
+                results.append(_result_to_block(item))
+        return DispatchResult(results=tuple(results), suspended=tuple(suspended))
+
+    async def resume_request(
+        self,
+        task: TaskSpec,
+        request: CapabilityRequest,
+        *,
+        directives: "DispatchDirectives | None" = None,
+        provenance: "DispatchProvenance | None" = None,
+        **replay_context,
+    ) -> "CapabilityResult | SuspendedCall":
+        """Resume one approved canonical request without model-block repair."""
+        request = replace(
+            request,
+            origin=CapabilityRequestOrigin.TRUSTED_ORCHESTRATION,
+            metadata=dict(request.metadata or {}),
+        )
+        outcome = await self.resume_requests(
+            task,
+            [request],
+            provenance=provenance,
+            _directives_by_call_id={request.call_id: directives} if directives else None,
+            **replay_context,
+        )
+        if outcome.results:
+            return _result_from_block(outcome.results[0])
+        if outcome.suspended:
+            return outcome.suspended[0]
+        raise RuntimeError("resume_request returned no result")
+
+    def resolve_effects(self, request: CapabilityRequest, workspace: WorkspaceSpec):
+        """Resolve declared effects without authorization or execution."""
+        return self._dispatcher.resolve_effects(request, workspace)
+
+
+def _result_from_block(block: CapabilityResultBlock) -> CapabilityResult:
+    return CapabilityResult(
+        block.call_id,
+        block.capability_id,
+        CapabilityResultStatus.OK if block.ok else CapabilityResultStatus.FAILED,
+        output=block.output,
+        error=block.error,
+        metadata=dict(block.metadata or {}),
+        ref_uri=block.ref_uri,
+    )
 
 
 def _to_request(task: TaskSpec, call: CapabilityCallBlock) -> CapabilityRequest:

@@ -32,10 +32,12 @@ import queue as thread_queue
 import threading
 from typing import Any, AsyncIterator, Mapping, cast
 
+from athena.concurrency import ReferenceCountedKeyedLocks
 from athena.protocol.execution import (
     ExecutionEvent,
     ExecutionRequest,
 )
+from athena.protocol.tasks import NetworkPolicy
 
 __all__ = ["BaseRuntime"]
 
@@ -44,22 +46,24 @@ class BaseRuntime(metaclass=abc.ABCMeta):
     """Abstract base for persistent, process-backed runtimes."""
 
     name: str = ""  # required: unique runtime name
+    supports_resource_limits: bool = os.name != "nt"
     aliases: tuple[str, ...] = ()
     persistence: str = "persistent"
 
     def __init__(self) -> None:
         self._sessions: dict[str, Any] = {}
+        self._session_tasks: dict[str, str] = {}
         # execution_id -> session id (interrupt registry, BHV-061 ownership).
         self._exec_owner: dict[str, str] = {}
-        # Serializes overlapping executions on the same runtime session
-        # (BHV-058/059/060): concurrent run() on one session must not interleave.
-        self._session_locks: dict[str, asyncio.Lock] = {}
+        # Serialize one session at a time; the keyed lock is released after each execution.
+        self._session_locks = ReferenceCountedKeyedLocks()
 
     # ------------------------------------------------------------------ #
     # Concrete session bookkeeping (shared scaffolding)
     # ------------------------------------------------------------------ #
-    def _register_session(self, runtime_session_id: str, session: Any) -> None:
+    def _register_session(self, runtime_session_id: str, session: Any, *, task_id: str) -> None:
         self._sessions[runtime_session_id] = session
+        self._session_tasks[runtime_session_id] = task_id
 
     def _session_for(self, runtime_session_id: str) -> Any:
         return self._sessions[runtime_session_id]
@@ -75,26 +79,37 @@ class BaseRuntime(metaclass=abc.ABCMeta):
         on task cancellation.
         """
         sid = request.runtime_session_id
-        if sid and sid in self._sessions:
-            session = self._sessions[sid]
-            if self._request_matches_session(request, session):
-                return sid, session
-            # An explicit session id was requested with differing env/cwd: close
-            # the old one and spawn a fresh session under the same id.
-            self._close_session(session)
-            self._sessions.pop(sid, None)
-            self._register_session(sid, self._make_session_for_request(request))
-            return sid, self._sessions[sid]
-        existing_sid = f"{self.name}_{request.task_id}"
+        if sid:
+            session = self._sessions.get(sid)
+            if session is None:
+                raise PermissionError(f"unknown runtime session {sid}")
+            if self._session_tasks.get(sid) != request.task_id:
+                raise PermissionError(
+                    f"runtime session {sid} belongs to task "
+                    f"{self._session_tasks.get(sid)}, not {request.task_id}"
+                )
+            if not self._request_matches_session(request, session):
+                raise PermissionError(
+                    f"security-sensitive identity of runtime session {sid} cannot be changed"
+                )
+            return sid, session
+        scope = str(request.metadata.get("__runtime_session_scope") or "")
+        existing_sid = (
+            f"{self.name}_{scope}:{request.task_id}" if scope else f"{self.name}_{request.task_id}"
+        )
         if existing_sid in self._sessions:
             existing = self._sessions[existing_sid]
             if self._request_matches_session(request, existing):
                 return existing_sid, existing
-            runtime_session_id = f"{self.name}_{request.task_id}_{len(self._sessions) + 1}"
-            self._register_session(runtime_session_id, self._make_session_for_request(request))
-            return runtime_session_id, self._sessions[runtime_session_id]
+            raise PermissionError(
+                f"security-sensitive identity of runtime session {existing_sid} cannot be changed"
+            )
         runtime_session_id = existing_sid
-        self._register_session(runtime_session_id, self._make_session_for_request(request))
+        self._register_session(
+            runtime_session_id,
+            self._make_session_for_request(request),
+            task_id=request.task_id,
+        )
         return runtime_session_id, self._sessions[runtime_session_id]
 
     def _make_session_for_request(self, request: ExecutionRequest) -> Any:
@@ -110,6 +125,7 @@ class BaseRuntime(metaclass=abc.ABCMeta):
             "read_only_paths": request.read_only_paths,
             "toolchain_paths": request.toolchain_paths,
             "writable_toolchain_paths": request.writable_toolchain_paths,
+            "resource_limits": request.resource_limits,
         }
         return self._make_session_compatible(kwargs)
 
@@ -153,6 +169,8 @@ class BaseRuntime(metaclass=abc.ABCMeta):
             getattr(session, "writable_toolchain_paths", ()) or ()
         ):
             return False
+        if request.resource_limits != getattr(session, "resource_limits", None):
+            return False
         return True
 
     # ------------------------------------------------------------------ #
@@ -166,11 +184,39 @@ class BaseRuntime(metaclass=abc.ABCMeta):
         cwd: str | None = None,
         env: Mapping[str, str] | None = None,  # noqa: N802
         workspace_root: str | None = None,
-        network_policy: str | None = None,
+        network_policy: NetworkPolicy | str | None = None,
+        resource_limits=None,
         writable_paths: tuple[str, ...] | None = None,
         read_only_paths: tuple[str, ...] = (),
     ) -> str:
         runtime_session_id = f"{self.name}_{task_id}"
+        existing = self._sessions.get(runtime_session_id)
+        if existing is not None:
+            if self._session_tasks.get(runtime_session_id) != task_id:
+                raise PermissionError(
+                    f"runtime session {runtime_session_id} has an ownership mismatch"
+                )
+            request = ExecutionRequest(
+                runtime=self.name,
+                source="",
+                task_id=task_id,
+                workspace_id="",
+                cwd=cwd,
+                env=env or {},
+                workspace_root=workspace_root,
+                network_policy=(
+                    NetworkPolicy(network_policy) if network_policy is not None else None
+                ),
+                resource_limits=resource_limits,
+                writable_paths=writable_paths,
+                read_only_paths=read_only_paths,
+            )
+            if not self._request_matches_session(request, existing):
+                raise PermissionError(
+                    f"security-sensitive identity of runtime session {runtime_session_id} "
+                    "cannot be changed"
+                )
+            return runtime_session_id
         self._register_session(
             runtime_session_id,
             self._make_session_compatible(
@@ -179,10 +225,12 @@ class BaseRuntime(metaclass=abc.ABCMeta):
                     "cwd": cwd,
                     "sandbox_root": workspace_root,
                     "network_policy": network_policy,
+                    "resource_limits": resource_limits,
                     "writable_paths": writable_paths,
                     "read_only_paths": read_only_paths,
                 }
             ),
+            task_id=task_id,
         )
         return runtime_session_id
 
@@ -192,10 +240,9 @@ class BaseRuntime(metaclass=abc.ABCMeta):
         """Default async-gen bridge over the blocking ``_run`` generator."""
         sid, session = self._adopt_or_create(request)
         self._exec_owner[execution_id] = sid
-        lock = self._session_locks.setdefault(sid, asyncio.Lock())
         reported = False
         try:
-            async with lock:
+            async with self._session_locks.lock(sid):
                 gen = self._run(session, request, execution_id)
                 async for event in self._bridge_sync_generator(gen):
                     if not reported:
@@ -242,6 +289,7 @@ class BaseRuntime(metaclass=abc.ABCMeta):
 
     async def close(self, runtime_session_id: str) -> None:
         session = self._sessions.pop(runtime_session_id, None)
+        self._session_tasks.pop(runtime_session_id, None)
         if session is not None:
             self._close_session(session)
 
@@ -298,7 +346,7 @@ class BaseRuntime(metaclass=abc.ABCMeta):
             try:
                 for item in gen:
                     queue.put(("item", item))
-            except BaseException as exc:  # surface to async side
+            except BaseException as exc:  # broad-exception: bridge worker failures to async side
                 queue.put(("error", exc))
             finally:
                 done.set()

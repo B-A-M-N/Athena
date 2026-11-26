@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol
 
 from athena.protocol.capabilities import (
+    CapabilityFailure,
+    CapabilityFailureCode,
     CapabilityDescriptor,
     CapabilityOrigin,
     CapabilityRequest,
@@ -878,9 +880,9 @@ def _sha256_file(path: Path) -> str:
 
 
 def _runtime_identity() -> str:
-    from athena.execution.dependencies import _python_runtime_identity
+    from athena.execution.dependencies import python_runtime_identity
 
-    return _python_runtime_identity()
+    return python_runtime_identity()
 
 
 def _write_lock(context, record: dict) -> None:
@@ -915,12 +917,23 @@ def _write_lock(context, record: dict) -> None:
 
 
 def _result(request, *, ok=True, output="", error=None, metadata=None):
-    return CapabilityResult(
-        request.call_id,
-        request.capability_id,
-        CapabilityResultStatus.OK if ok else CapabilityResultStatus.FAILED,
+    if ok:
+        return CapabilityResult(
+            request.call_id,
+            request.capability_id,
+            CapabilityResultStatus.OK,
+            output=output,
+            error=error,
+            metadata=dict(metadata or {}),
+        )
+    return CapabilityResult.failure(
+        request,
+        CapabilityFailure(
+            code=CapabilityFailureCode.PERMANENT_RUNTIME,
+            detail=error or "operation failed",
+            stage="invoke",
+        ),
         output=output,
-        error=error,
         metadata=dict(metadata or {}),
     )
 

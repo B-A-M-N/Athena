@@ -1,4 +1,13 @@
-use super::*;
+use super::ffi::{
+    Atom, CURRENT_TIME, Display, PROP_MODE_REPLACE, SELECTION_CLEAR, SELECTION_NOTIFY,
+    SELECTION_REQUEST, Window, XChangeProperty, XConvertSelection, XDeleteProperty, XEvent, XFlush,
+    XFree, XGetWindowProperty, XSelectionEvent, XSelectionRequestEvent, XSendEvent,
+    XSetSelectionOwner,
+};
+use std::ffi::c_int;
+use std::ptr;
+
+use crate::x11::intern_atom;
 
 pub(crate) struct Clipboard {
     clipboard: Atom,

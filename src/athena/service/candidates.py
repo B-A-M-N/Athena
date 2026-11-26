@@ -42,15 +42,84 @@ _logger = logging.getLogger("athena.service.candidates")
 __all__ = ["CandidateService"]
 
 
+class CandidatePorts:
+    """Explicit service-resource ports consumed by candidate lifecycle APIs.
+
+    This allowlist is the ownership contract: candidate mechanisms may access
+    only the named durable/runtime resources below plus two narrow owner
+    factories for shadow and fusion orchestration. Values resolve at call time
+    so lifecycle resources stay authoritative.
+    """
+
+    _RESOURCE_NAMES = {
+        "store_tasks": "_store_tasks",
+        "store_events": "_store_events",
+        "store_approvals": "_store_approvals",
+        "self_host_missions": "_self_host_missions",
+        "reality_gate": "_reality_gate",
+        "project_index_coordinator": "_project_index_coordinator",
+        "kernel": "_kernel",
+        "provider_usage_store": "_provider_usage_store",
+        "hermes_referee": "_hermes_referee",
+        "hermes_supervision_active": "_hermes_supervision_active",
+        "hermes_supervision_mode": "_hermes_supervision_mode",
+        "fusion": "_fusion",
+    }
+    _APPLICATION_OPERATIONS = {
+        "shadow_engine": "shadow_engine",
+        "fusion_orchestrator": "fusion_orchestrator",
+    }
+
+    def __init__(self, owner: "AthenaService") -> None:
+        self._owner = owner
+
+    def __getattr__(self, name: str) -> Any:
+        resource_name = self._RESOURCE_NAMES.get(name)
+        if resource_name is None:
+            resource_name = self._APPLICATION_OPERATIONS.get(name)
+        if resource_name is None:
+            raise AttributeError(f"candidate port is not allowed: {name}")
+        return getattr(self._owner, resource_name, None)
+
+
 class CandidateService:
     """Candidate review/promotion mechanism owned by the AthenaService facade."""
 
-    def __init__(self, service: AthenaService) -> None:
-        self._svc = service
+    def __init__(self, service: AthenaService, *, ports: CandidatePorts | None = None) -> None:
+        self._ports = ports or CandidatePorts(service)
 
-    def _candidate_branch(self, task_id: str):
-        """Return the durable operator-review candidate for one task."""
-        branches = getattr(self._svc.shadow_engine(), "list_branches", lambda: ())()
+    def candidate_branch(self, task_id: str):
+        """Return the durable operator-review candidate for one task.
+
+        When a comparison record explicitly selects a branch, that identity
+        wins over "most recently created". Losing verified branches are
+        discarded by select_candidate, but even a stale retained loser cannot
+        shadow the explicit selection.
+        """
+        shadow = self._ports.shadow_engine()
+        branches = getattr(shadow, "list_branches", lambda: ())()
+        selection_store = (
+            getattr(self._ports.fusion, "selection_store", None)
+            if self._ports.fusion is not None
+            else None
+        )
+        identity = None
+        if selection_store is not None:
+            identity = selection_store.selected_identity_for_task(task_id)
+        # A kernel/operator selection is exact. Missing or mismatched branches
+        # are integrity errors, never opportunities to fall back to "latest".
+        if identity is not None:
+            selected_id = str(identity.get("branch_id") or "")
+            branch = shadow.get_branch(selected_id)
+            if branch is None or getattr(branch, "task_id", None) != task_id:
+                raise RuntimeError(
+                    "selection_integrity_error: selected branch is missing or invalid"
+                )
+            if branch.status != "VERIFIED":
+                raise RuntimeError(
+                    f"selection_integrity_error: selected branch is {branch.status}, not VERIFIED"
+                )
+            return branch
         for branch in reversed(branches):
             if getattr(branch, "task_id", None) != task_id:
                 continue
@@ -65,9 +134,34 @@ class CandidateService:
             return branch
         return None
 
+    async def compare_candidates(self, *, task_id: str, proposals: list[list[dict]], **kwargs):
+        return await self._ports.fusion_orchestrator().compare(
+            task_id=task_id,
+            proposals=proposals,
+            **kwargs,
+        )
+
+    async def select_candidate(self, comparison_id: str, branch_id: str):
+        """Service-owned exact selection transition; model cannot bypass this."""
+        orch = self._ports.fusion_orchestrator()
+        store = getattr(orch, "selection_store", None)
+        record = store.get(comparison_id) if store is not None else None
+        if record is not None and record.task_id:
+            # Reject stale selections while a newer comparison remains open.
+            newer = store.latest_for_task(record.task_id) if store is not None else None
+            if (
+                newer is not None
+                and newer.comparison_id != comparison_id
+                and newer.lifecycle == "COMPARING"
+            ):
+                raise RuntimeError(
+                    "selection_integrity_error: latest comparison for task is still COMPARING"
+                )
+        return await orch.select_candidate(comparison_id, branch_id)
+
     async def operator_candidate(self, task_id: str) -> dict | None:
         """Return a review bundle for a retained verified candidate."""
-        branch = self._candidate_branch(task_id)
+        branch = self.candidate_branch(task_id)
         if branch is None:
             return None
         certificate = getattr(branch, "verification_certificate", {})
@@ -81,8 +175,8 @@ class CandidateService:
         verification = list(getattr(branch, "verification", ()) or ())
         expected_authority = None
         task_row = (
-            await self._svc._store_tasks.get(task_id)
-            if self._svc._store_tasks is not None
+            await self._ports.store_tasks.get(task_id)
+            if self._ports.store_tasks is not None
             else None
         )
         task_metadata = (task_row or {}).get("metadata") or {}
@@ -90,7 +184,7 @@ class CandidateService:
             raw_bundle = task_metadata.get("_athena_gate_bundle")
             if isinstance(raw_bundle, Mapping):
                 expected_authority = raw_bundle
-        missions = self._svc._self_host_missions
+        missions = self._ports.self_host_missions
         mission = await missions.for_task(task_id) if missions is not None else None
         if expected_authority is None and mission is not None:
             expected_authority = {
@@ -140,14 +234,14 @@ class CandidateService:
         if candidate is None:
             return None
         task_row = (
-            await self._svc._store_tasks.get(task_id)
-            if self._svc._store_tasks is not None
+            await self._ports.store_tasks.get(task_id)
+            if self._ports.store_tasks is not None
             else None
         )
         metadata = (task_row or {}).get("metadata") or {}
         if not isinstance(metadata, dict) or not metadata.get("_athena_self_host"):
             return candidate.get("independent_review")
-        mission_store = self._svc._self_host_missions
+        mission_store = self._ports.self_host_missions
         if mission_store is None:
             return None
         mission = await mission_store.for_task(task_id)
@@ -159,14 +253,14 @@ class CandidateService:
             and existing.get("certificate_hash") == candidate.get("certificate_hash")
             and (candidate.get("integrity_review") or {}).get("eligible") is True
             and (
-                not self._svc._hermes_supervision_active
+                not self._ports.hermes_supervision_active
                 or isinstance(existing.get("hermes"), Mapping)
             )
         ):
             return existing
-        review = await self._run_self_host_reviewer(task_row or {}, candidate)
-        if self._svc._hermes_supervision_active:
-            review = await self._run_hermes_candidate_referee(
+        review = await self.run_self_host_reviewer(task_row or {}, candidate)
+        if self._ports.hermes_supervision_active:
+            review = await self.run_hermes_candidate_referee(
                 mission,
                 task_row or {},
                 candidate,
@@ -175,7 +269,7 @@ class CandidateService:
         plan = dict(mission.get("plan") or {})
         plan["review"] = review
         await mission_store.update(mission["id"], status="review", plan=plan)
-        await self._candidate_review_event(
+        await self.persist_candidate_review_event(
             "CANDIDATE_READY_FOR_REVIEW",
             task_id,
             candidate,
@@ -183,7 +277,7 @@ class CandidateService:
         )
         return review
 
-    async def _run_hermes_candidate_referee(
+    async def run_hermes_candidate_referee(
         self,
         mission: Mapping[str, Any],
         task_row: Mapping[str, Any],
@@ -191,7 +285,7 @@ class CandidateService:
         review: Mapping[str, Any],
     ) -> dict[str, Any]:
         """Run the optional external referee over one canonical review packet."""
-        referee = self._svc._hermes_referee
+        referee = self._ports.hermes_referee
         if referee is None:
             return dict(review)
         try:
@@ -251,7 +345,7 @@ class CandidateService:
                     "fingerprint": candidate.get("candidate_fingerprint"),
                     "certificate_hash": candidate.get("certificate_hash"),
                 },
-                diff=await self._candidate_diff_text(str(candidate.get("task_id") or "")),
+                diff=await self.candidate_diff_text(str(candidate.get("task_id") or "")),
                 frozen_contract_context=context,
                 verification_results=tuple(
                     value
@@ -277,7 +371,7 @@ class CandidateService:
             )
         result = dict(review)
         result["hermes"] = verdict.to_record()
-        if self._svc._hermes_supervision_mode is HermesSupervisionMode.REQUIRED:
+        if self._ports.hermes_supervision_mode is HermesSupervisionMode.REQUIRED:
             if verdict.decision not in {
                 HermesDecision.PASS,
                 HermesDecision.READY_FOR_HUMAN_REVIEW,
@@ -288,17 +382,17 @@ class CandidateService:
         result["evidence_hash"] = _json_hash(result)
         return result
 
-    async def _run_self_host_reviewer(
+    async def run_self_host_reviewer(
         self,
         task_row: Mapping[str, Any],
         candidate: Mapping[str, Any],
     ) -> dict[str, Any]:
         """Ask the configured reviewer role for structured evidence."""
         integrity = dict(candidate.get("integrity_review") or {})
-        kernel = self._svc._kernel
+        kernel = self._ports.kernel
         if kernel is None:
             return _review_failure(candidate, integrity, "reviewer runtime unavailable")
-        usage_store = self._svc._provider_usage_store
+        usage_store = self._ports.provider_usage_store
         if usage_store is None:
             return _review_failure(candidate, integrity, "provider usage evidence unavailable")
         try:
@@ -334,7 +428,7 @@ class CandidateService:
         prompt = _self_host_review_prompt(
             task_row,
             candidate,
-            await self._candidate_diff_text(str(candidate.get("task_id") or "")),
+            await self.candidate_diff_text(str(candidate.get("task_id") or "")),
             design_context=design_context,
         )
         response = await kernel.utility_inference(
@@ -427,13 +521,13 @@ class CandidateService:
         evidence["evidence_hash"] = _json_hash(evidence)
         return evidence
 
-    async def _candidate_diff_text(self, task_id: str) -> str:
+    async def candidate_diff_text(self, task_id: str) -> str:
         """Build a bounded, read-only textual diff for the reviewer prompt."""
-        branch = self._candidate_branch(task_id)
+        branch = self.candidate_branch(task_id)
         if branch is None:
             return "(candidate unavailable)"
         try:
-            changes = await self._svc.shadow_engine()._diff_trees_async(branch)
+            changes = await self._ports.shadow_engine()._diff_trees_async(branch)
         except Exception:
             return "(candidate diff unavailable)"
         chunks: list[str] = []
@@ -476,7 +570,7 @@ class CandidateService:
         plan_digest: str,
     ) -> str | None:
         """Persist operator approval for one exact candidate commit plan."""
-        approvals = self._svc._store_approvals
+        approvals = self._ports.store_approvals
         if approvals is None or not getattr(branch, "task_id", None):
             return None
 
@@ -509,10 +603,10 @@ class CandidateService:
             arguments={"branch_id": branch.id, "plan_digest": plan_digest},
             metadata=metadata,
         )
-        if self._svc._store_events is not None:
+        if self._ports.store_events is not None:
             from athena.protocol.events import EV
 
-            await self._svc._store_events.append_event(
+            await self._ports.store_events.append_event(
                 EV["APPROVAL_REQUESTED"],
                 {
                     "approval_id": approval_id,
@@ -526,8 +620,8 @@ class CandidateService:
             )
         return approval_id
 
-    async def _candidate_apply_approval_matches(self, approval_id: str, branch) -> bool:
-        approvals = self._svc._store_approvals
+    async def candidate_apply_approval_matches(self, approval_id: str, branch) -> bool:
+        approvals = self._ports.store_approvals
         if approvals is None:
             return False
         record = await approvals.get(approval_id)
@@ -544,13 +638,13 @@ class CandidateService:
 
     async def apply_candidate(self, task_id: str, approval_id: str | None = None) -> dict:
         """Apply a reviewed candidate through the existing shadow commit path."""
-        branch = self._candidate_branch(task_id)
+        branch = self.candidate_branch(task_id)
         if branch is None:
             return {"status": "missing", "error": "no retained candidate"}
         if branch.status != "VERIFIED":
             return {"status": "refused", "error": branch.error or f"candidate is {branch.status}"}
         if branch.commit_state == "AWAITING_APPROVAL":
-            if not approval_id or not await self._candidate_apply_approval_matches(
+            if not approval_id or not await self.candidate_apply_approval_matches(
                 approval_id, branch
             ):
                 return {
@@ -561,8 +655,8 @@ class CandidateService:
                 }
         review = await self.operator_candidate(task_id) or {}
         task_row = (
-            await self._svc._store_tasks.get(task_id)
-            if self._svc._store_tasks is not None
+            await self._ports.store_tasks.get(task_id)
+            if self._ports.store_tasks is not None
             else None
         )
         self_host = bool(((task_row or {}).get("metadata") or {}).get("_athena_self_host"))
@@ -575,7 +669,7 @@ class CandidateService:
                     "branch": branch.id,
                     "error": "independent reviewer evidence is not eligible for promotion",
                 }
-        await self._candidate_review_event(
+        await self.persist_candidate_review_event(
             "CANDIDATE_APPLY_REQUESTED", task_id, review, {"operator": "local"}
         )
         # A retained candidate is normally active so reads remain coherent
@@ -584,24 +678,24 @@ class CandidateService:
         # requests back into the shadow and the final proof can never match
         # the real workspace.  Reattach every non-committed outcome so stale
         # or conflicted candidates remain recoverable.
-        if self._svc._reality_gate is not None:
-            await self._svc._reality_gate.deactivate_branch(task_id)
+        if self._ports.reality_gate is not None:
+            await self._ports.reality_gate.deactivate_branch(task_id)
         try:
-            outcome = await self._svc.shadow_engine().commit(branch, approval_id=approval_id)
+            outcome = await self._ports.shadow_engine().commit(branch, approval_id=approval_id)
         except Exception as exc:
-            await self._candidate_review_event(
+            await self.persist_candidate_review_event(
                 "CANDIDATE_APPLY_FAILED",
                 task_id,
                 review,
                 {"status": "exception", "error": str(exc)},
             )
-            if self._svc._reality_gate is not None and branch.status == "VERIFIED":
-                self._svc._reality_gate.activate_branch(branch)
+            if self._ports.reality_gate is not None and branch.status == "VERIFIED":
+                self._ports.reality_gate.activate_branch(branch)
             raise
-        if outcome.get("status") != "committed" and self._svc._reality_gate is not None:
+        if outcome.get("status") != "committed" and self._ports.reality_gate is not None:
             if branch.status in {"VERIFIED", "CONFLICTED", "RECOVERY_REQUIRED"}:
-                self._svc._reality_gate.activate_branch(branch)
-        await self._candidate_review_event(
+                self._ports.reality_gate.activate_branch(branch)
+        await self.persist_candidate_review_event(
             "CANDIDATE_APPLIED"
             if outcome.get("status") == "committed"
             else "CANDIDATE_APPLY_FAILED",
@@ -609,7 +703,7 @@ class CandidateService:
             review,
             outcome,
         )
-        missions = self._svc._self_host_missions
+        missions = self._ports.self_host_missions
         if missions is not None:
             mission = await missions.for_task(task_id)
             if mission is not None:
@@ -635,15 +729,15 @@ class CandidateService:
                             }
                         except (OSError, RuntimeError, TypeError, ValueError) as exc:
                             _logger.warning("self-host authority refresh failed: %s", exc)
-                    if self._svc._project_index_coordinator is not None and root:
-                        self._svc._project_index_coordinator.mark_stale(root)
+                    if self._ports.project_index_coordinator is not None and root:
+                        self._ports.project_index_coordinator.mark_stale(root)
                         try:
                             changed_paths = [
                                 str(resource.get("path") or resource.get("resource") or "")
                                 for resource in review.get("changed_resources") or ()
                                 if isinstance(resource, Mapping)
                             ]
-                            await self._svc._project_index_coordinator.refresh(
+                            await self._ports.project_index_coordinator.refresh(
                                 root,
                                 changed_paths=changed_paths,
                             )
@@ -666,16 +760,18 @@ class CandidateService:
 
     async def discard_candidate(self, task_id: str) -> dict:
         """Discard a retained candidate through the existing shadow engine."""
-        branch = self._candidate_branch(task_id)
+        branch = self.candidate_branch(task_id)
         if branch is None:
             return {"status": "missing", "error": "no retained candidate"}
         review = await self.operator_candidate(task_id) or {}
-        outcome = await self._svc.shadow_engine().discard(branch, reason="discarded by operator")
-        if outcome.get("status") == "discarded" and self._svc._reality_gate is not None:
-            await self._svc._reality_gate.deactivate_branch(task_id)
+        outcome = await self._ports.shadow_engine().discard(branch, reason="discarded by operator")
+        if outcome.get("status") == "discarded" and self._ports.reality_gate is not None:
+            await self._ports.reality_gate.deactivate_branch(task_id)
         if outcome.get("status") == "discarded":
-            await self._candidate_review_event("CANDIDATE_DISCARDED", task_id, review, outcome)
-            missions = self._svc._self_host_missions
+            await self.persist_candidate_review_event(
+                "CANDIDATE_DISCARDED", task_id, review, outcome
+            )
+            missions = self._ports.self_host_missions
             if missions is not None:
                 mission = await missions.for_task(task_id)
                 if mission is not None:
@@ -688,11 +784,11 @@ class CandidateService:
                     )
         return outcome
 
-    async def _candidate_review_event(
+    async def persist_candidate_review_event(
         self, event_key: str, task_id: str, review: Mapping[str, Any], outcome: Mapping[str, Any]
     ) -> None:
         """Persist operator review decisions alongside candidate evidence."""
-        events = self._svc._store_events
+        events = self._ports.store_events
         if events is None:
             return
         payload = {
@@ -705,8 +801,8 @@ class CandidateService:
             "outcome": dict(outcome),
         }
         task_row = (
-            await self._svc._store_tasks.get(task_id)
-            if self._svc._store_tasks is not None
+            await self._ports.store_tasks.get(task_id)
+            if self._ports.store_tasks is not None
             else None
         )
         metadata = (task_row or {}).get("metadata") or {}
@@ -731,10 +827,7 @@ class CandidateService:
         )
 
 
-# ----------------------------------------------------------------------
-# Review parsing/formatting helpers (verbatim from the facade; shared
-# definitions live in athena.service._parsing).
-# ----------------------------------------------------------------------
+CandidateService._candidate_branch = CandidateService.candidate_branch  # type: ignore[attr-defined]
 
 
 def _review_failure(

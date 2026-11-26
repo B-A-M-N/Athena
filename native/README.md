@@ -27,9 +27,9 @@ deep-bezel displays, semantic OI view, and a quantized Buddy. Mouse selection,
 Ctrl-Shift-C/Ctrl-Shift-V clipboard round-trips, scrollback, navigation keys,
 and explicit prompt states are supported. The lower prompt is a Rust-owned
 Unicode line editor and the PTY receives only completed lines. Ctrl-C cancels
-the foreground task without closing the session; `/exit` closes it. Projection
-schema 3 carries current action/query/progress context, while schema 2 is
-normalized and unknown schemas are rendered as bridge errors. Font-derived
+the foreground task without closing the session; `/exit` closes it. The Python
+bridge emits projection schema 5. The reader normalizes schemas 2, 3, and 4
+and renders unknown schemas as bridge errors. Font-derived
 metrics are the source of truth for layout, text, hit testing, and PTY size;
 motion-only OI updates use a retained dirty region. The canonical cabinet
 design space is 1672×941; responsive axes fill the real drawable while

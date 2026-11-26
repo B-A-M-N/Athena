@@ -246,7 +246,7 @@
     "buddy_status": "paused",
     "buddy_character": "owl",
     "attention_rail": true,
-    "unobscured_right": 244,
+    "unobscured_right": 376,
     "failure_diagnostic_locations": []
   },
   "failure": {
@@ -271,7 +271,7 @@
     "buddy_status": "blocked",
     "buddy_character": "owl",
     "attention_rail": true,
-    "unobscured_right": 244,
+    "unobscured_right": 376,
     "failure_diagnostic_locations": ["src/main.rs:42"]
   },
   "recover": {

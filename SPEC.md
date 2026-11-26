@@ -424,8 +424,7 @@ Normalize every model backend to:
 
 ```python
 class ModelProvider:
-    async def complete(request: ModelRequest) -> ModelResponse:
-        ...
+    async def complete(request: ModelRequest) -> ModelResponse: ...
 ```
 
 Provider-specific message conversion belongs inside adapters.
@@ -438,12 +437,7 @@ Replace tightly coupled compression with:
 
 ```python
 class ContextStrategy:
-    async def build(
-        session,
-        budget,
-        task
-    ) -> ModelContext:
-        ...
+    async def build(session, budget, task) -> ModelContext: ...
 ```
 
 Implementations may include:
@@ -647,11 +641,7 @@ This is the single most important OI concept.
 Athena should expose:
 
 ```python
-execute(
-    language="python",
-    code="...",
-    session="default"
-)
+execute(language="python", code="...", session="default")
 ```
 
 This capability replaces enormous numbers of bespoke tools.
@@ -901,11 +891,7 @@ Proposed API:
 
 ```python
 class AgentKernel:
-    async def run(
-        self,
-        request: AgentRequest
-    ) -> AgentResult:
-        ...
+    async def run(self, request: AgentRequest) -> AgentResult: ...
 ```
 
 ---

@@ -20,6 +20,7 @@ descriptor contract.
 """
 
 from __future__ import annotations
+from athena.capabilities.operations import native_descriptor
 
 import importlib
 import json
@@ -30,10 +31,9 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping, Protocol
 from urllib.parse import urlsplit
 
-from athena.execution.async_call import run_blocking
+from athena.concurrency import run_blocking
 from athena.protocol.capabilities import (
     Availability,
-    CapabilityDescriptor,
     CapabilityOrigin,
     CapabilityRequest,
     CapabilityResult,
@@ -549,7 +549,7 @@ def _result(
     )
 
 
-_BROWSER_DESCRIPTOR = CapabilityDescriptor(
+_BROWSER_DESCRIPTOR = native_descriptor(
     id="browser",
     description=(
         "Structured browser automation (SPEC 65 — prefer structure over "

@@ -23,25 +23,24 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import json
 import logging
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Mapping
 
+from athena.concurrency import ReferenceCountedKeyedLocks
 from athena.context.compiler import CompiledContext, ContextCompiler
 from athena.models.registry import ProviderRegistry
 from athena.models.tokens import ModelTokenEstimator
 from athena.models.router import (
     ModelSelection,
 )
+from athena.protocol.capabilities import DispatchProvenance
 from athena.protocol.errors import (
-    ContextIntegrityError,
-    ProviderOutcomeUnknown,
     ProviderError,
     RequestCancelled,
-    TaskBudgetExceeded,
-    TaskDeadlineExceeded,
 )
 from athena.protocol.ids import new_id
 from athena.protocol.messages import (
@@ -50,7 +49,6 @@ from athena.protocol.messages import (
     ContentBlock,
     Message,
     Provenance,
-    Role,
     SourceType,
     TextBlock,
     TrustClass,
@@ -75,18 +73,23 @@ from athena.state.tasks import TaskStore
 
 from athena.tasks.budgets import BudgetStateUnavailable
 from athena.kernel.inference_broker import InferenceBroker
+from athena.kernel.messages import assistant_message as _assistant_message
 from athena.kernel.run_finalizer import RunFinalizer
 from athena.kernel.continuations_coordinator import (
     ContinuationCoordinator,
 )
-from athena.kernel.dispatch import DispatchResult, SuspendedCall
+from athena.kernel.recovery_dispatch import RecoveryDispatchMechanism
+from athena.kernel.steering_support import SteeringSupport
+from athena.kernel.context_support import ContextSupport
+from athena.kernel.pack_hook_support import PackHookSupport
+from athena.kernel.retry_recovery import GeneratedRetryMechanism
+from athena.kernel.dispatch import DispatchResult
+from athena.kernel.dispatch_corrections import ToolInputCorrectionMechanism
+from athena.kernel.observation_dispatch import ObservationDispatchMechanism
 from athena.kernel.lifecycle import TaskLifecycle
-from athena.kernel.termination import (
-    TerminationDecision,
-    TerminationEvaluator,
-    WorkEvidence,
-    result_qualifies_as_work_evidence,
-)
+from athena.evidence import WorkEvidence, result_qualifies_as_work_evidence
+from athena.kernel.termination import TerminationDecision, TerminationEvaluator
+from athena.protocol.workflows import WorkflowRunner
 from athena.interpreter.context import InterpreterContext  # noqa: F401 (annotation)
 from athena.interpreter.protocol import InterpreterProposal  # noqa: F401 (annotation)
 from athena.interpreter.triggering import (  # noqa: F401 (re-exported for tests)
@@ -222,6 +225,38 @@ class RunState:
     # counts every failed result after the normal path has run.
     interpreter_failure_counts: dict[str, int] = field(default_factory=dict)
     work_evidence: list[WorkEvidence] = field(default_factory=list)
+    # Fusion supplies evidence; this state records the kernel-owned recovery
+    # boundary.  It is deliberately bounded and does not construct proposals.
+    speculative_failure_records: list[dict[str, Any]] = field(default_factory=list)
+    speculative_recovery_attempts: int = 0
+    speculative_recovery_rejections: int = 0
+    speculative_recovery_pending: bool = False
+    speculative_recovery_limit: int = 1
+    generated_recovery_records: list[dict[str, Any]] = field(default_factory=list)
+    generated_recovery_attempts: int = 0
+    generated_recovery_pending: bool = False
+    generated_recovery_limit: int = 1
+    generated_recovery_original: dict[str, Any] | None = None
+    generated_recovery_retried: bool = False
+    generated_recovery_retry_status: str = "not_started"
+    generated_recovery_retry_error: str | None = None
+    generated_recovery_repair_fingerprints: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        raw_limit = (self.task.metadata or {}).get("speculation_recovery_attempts", 1)
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            limit = 1
+        # A task may narrow the bound, but no request can turn this into an
+        # unbounded autonomous loop.
+        self.speculative_recovery_limit = max(0, min(limit, 2))
+        raw_generated_limit = (self.task.metadata or {}).get("generated_recovery_attempts", 1)
+        try:
+            generated_limit = int(raw_generated_limit)
+        except (TypeError, ValueError):
+            generated_limit = 1
+        self.generated_recovery_limit = max(0, min(generated_limit, 2))
 
     @property
     def elapsed_ms(self) -> int:
@@ -283,82 +318,12 @@ def _escalated_quality_floor(policy: ModelPolicy, state: RunState | None) -> Mod
 # --------------------------------------------------------------------------- #
 # Message / result builders
 # --------------------------------------------------------------------------- #
-def _assistant_message(task: TaskSpec, response: ModelResponse) -> Message:
-    """Build the durable assistant message preserving ALL blocks.
-
-    A mixed assistant response — text + capability calls, or reasoning +
-    text + tool calls — must keep every block: providers (Anthropic
-    tool_use, OpenAI tool_calls) require the assistant turn to contain the
-    call before the matching result arrives. Stripping non-text blocks
-    breaks provider replay (BHV provider-history invariant).
-    """
-    blocks = tuple(response.blocks or ())
-    metadata: dict[str, Any] = {"task_id": task.id}
-    if task.session_id:
-        metadata["session_id"] = task.session_id
-    try:
-        from athena.models.compat.caching import InferenceReceipt
-
-        receipt = InferenceReceipt(
-            call_id=response.request_id,
-            provider_profile_id=str(
-                response.metadata.get("provider_profile_id", response.provider)
-            ),
-            model_id=response.model,
-            response_id=response.metadata.get("response_id"),
-            tool_ids=tuple(
-                b.call_id
-                for b in response.blocks
-                if isinstance(b, CapabilityCallBlock) and b.call_id
-            ),
-            provider_metadata=dict(response.metadata),
-            usage=(dict(vars(response.usage)) if response.usage is not None else {}),
-        )
-        metadata["inference_receipt"] = receipt.to_dict()
-    except Exception as exc:
-        _logger.warning("could not build inference receipt: %s", exc)
-    if response.request_id:
-        identity = hashlib.sha256(
-            f"assistant-response\0{task.id}\0{response.request_id}".encode("utf-8")
-        ).hexdigest()[:32]
-        message_id = f"msg_assistant_{identity}"
-        metadata["response_identity"] = f"{task.id}:{response.request_id}"
-    else:
-        message_id = new_id("msg")
-    return Message(
-        id=message_id,
-        role=Role.ASSISTANT,
-        blocks=blocks,
-        created_at=utcnow(),
-        provenance=Provenance(source_type=SourceType.GENERATED, trust=TrustClass.AGENT_CURATED),
-        metadata=metadata,
-    )
-
-
-def _results_message(task: TaskSpec, blocks) -> Message:
-    return Message(
-        id=new_id("msg"),
-        role=Role.CAPABILITY,
-        blocks=tuple(blocks),
-        created_at=utcnow(),
-        provenance=Provenance(source_type=SourceType.CAPABILITY),
-        metadata={
-            "task_id": task.id,
-            **({"session_id": task.session_id} if task.session_id else {}),
-        },
-    )
 
 
 def _deny_result(suspended) -> CapabilityResultBlock:
-    call_id = getattr(suspended, "call_id", "")
-    req = getattr(suspended, "request", None)
-    capability_id = getattr(req, "capability_id", "") if req is not None else ""
-    return CapabilityResultBlock(
-        call_id=call_id,
-        capability_id=capability_id,
-        ok=False,
-        error="denied: approval not granted",
-    )
+    from athena.kernel.policy_context import deny_result
+
+    return deny_result(suspended)
 
 
 def _block_of(suspended) -> CapabilityCallBlock:
@@ -372,105 +337,91 @@ def _block_of(suspended) -> CapabilityCallBlock:
     )
 
 
-def _observation_from_result(task, result: CapabilityResultBlock):
-    """Build a typed InterpreterObservation from a failed capability result.
+def _json_fingerprint(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
-    Keeps the payload small (audit P0.2: producers artifactize anything
-    large); None when there is nothing interpretive to offer. Whether the
-    observation actually warrants a subturn is the triggering policy's
-    decision (P1-13), made at the offer site.
-    """
-    from athena.interpreter.protocol import (
-        BodyObservationKind,
-        InterpreterObservation,
-    )
 
-    error_text = (result.error or "")[:2000]
-    output_text = (result.output or "")[:4000]
-    if not error_text and not output_text:
+def _fusion_candidate_payload(call: CapabilityCallBlock) -> tuple[list[Any], str] | None:
+    """Return candidate proposals plus the model's recovery explanation."""
+    if call.capability_id != "fusion":
         return None
-    return InterpreterObservation(
-        kind=BodyObservationKind.CAPABILITY_FAILED,
-        payload={
-            "call_id": result.call_id,
-            "capability_id": result.capability_id,
-            "error": error_text,
-            "output": output_text,
-            "generated_failure": dict((result.metadata or {}).get("generated_failure") or {}),
-        },
-        task_id=task.id,
-        session_id=task.session_id,
-    )
+    arguments = dict(call.arguments or {})
+    operation = str(arguments.get("operation") or "")
+    if operation == "run":
+        proposal = arguments.get("proposal")
+        return ([proposal] if isinstance(proposal, list) else []), str(
+            arguments.get("changes_from_previous") or ""
+        ).strip()
+    if operation == "compare":
+        proposals = arguments.get("proposals")
+        return (
+            [item for item in proposals if isinstance(item, list)]
+            if isinstance(proposals, list)
+            else [],
+            str(arguments.get("changes_from_previous") or "").strip(),
+        )
+    return None
 
 
-def _repeated_failure_observation(task, result: CapabilityResultBlock, attempts: int):
-    """Build a REPEATED_FAILURE observation when a capability keeps failing.
-
-    The primary loop's normal tool-correction path repairs input-shape
-    errors; when the same capability keeps failing past that, the loop is
-    circling and the failure pattern is worth one interpretive look.
-    Returns None below the policy threshold (the count is tracked
-    regardless, so the threshold is evaluated against true attempts).
-    """
-    from athena.interpreter.protocol import (
-        BodyObservationKind,
-        InterpreterObservation,
-    )
-    from athena.interpreter.triggering import _REPEATED_FAILURE_THRESHOLD
-
-    if attempts < _REPEATED_FAILURE_THRESHOLD:
-        return None
-    return InterpreterObservation(
-        kind=BodyObservationKind.REPEATED_FAILURE,
-        payload={
-            "capability_id": result.capability_id,
-            "attempts": attempts,
-            "last_error": (result.error or "")[:500],
-        },
-        task_id=task.id,
-        session_id=task.session_id,
-    )
+def _failed_proposal_fingerprints(records: list[dict[str, Any]]) -> set[str]:
+    fingerprints: set[str] = set()
+    for record in records:
+        operation = record.get("failed_operation")
+        if isinstance(operation, list):
+            fingerprints.add(_json_fingerprint(operation))
+    return fingerprints
 
 
-def _runtime_completed_observation(task, result: CapabilityResultBlock):
-    """Build a RUNTIME_COMPLETED observation from an execute-style result.
+def _recovery_hint(state: RunState) -> dict[str, Any]:
+    record = state.speculative_failure_records[-1] if state.speculative_failure_records else {}
+    remaining = max(state.speculative_recovery_limit - state.speculative_recovery_attempts, 0)
+    budget = record.get("remaining_execution_budget")
+    compact = {
+        "failed_operation": record.get("failed_operation", []),
+        "verification_results": record.get("verification_results", []),
+        "violated_invariants": record.get("violated_invariants", []),
+        "workspace_changes": record.get("workspace_changes", []),
+        "remaining_execution_budget": budget,
+    }
+    return {
+        "kind": "speculative_failure_recovery",
+        "remaining_attempts": remaining,
+        "failure": compact,
+        "message": (
+            "The previous Fusion candidate failed canonical verification. "
+            "Use the structured failure evidence below. If a meaningful alternative "
+            "remains, make exactly one materially different proposal and include a "
+            "non-empty changes_from_previous explanation. Do not repeat the failed "
+            "proposal. Stop if no meaningful alternative remains or the budget is "
+            "exhausted. Fusion executes the proposal; the kernel owns this decision. "
+            + json.dumps(compact, sort_keys=True, default=str)[:6000]
+        ),
+    }
 
-    Covers the successful-but-voluminous case the failure-only trigger
-    misses: a run that exited 0 but produced more output than the primary
-    transcript should absorb (the tails and artifact ref go in the payload;
-    triggering policy decides whether the size or the exit status warrants
-    a subturn). None for results that are not execution-shaped.
-    """
-    from athena.interpreter.protocol import (
-        BodyObservationKind,
-        InterpreterObservation,
-    )
 
-    metadata = result.metadata or {}
-    if "exit_code" not in metadata and "resolved_effects" not in metadata:
-        return None
-    is_execute = result.capability_id in {"execute", "shell", "process"} or (
-        "execute" in set(metadata.get("resolved_effects") or ())
-    )
-    if not is_execute:
-        return None
-    output_text = (result.output or "")[:4000]
-    return InterpreterObservation(
-        kind=BodyObservationKind.RUNTIME_COMPLETED,
-        payload={
-            "call_id": result.call_id,
-            "capability_id": result.capability_id,
-            "exit_code": metadata.get("exit_code"),
-            "timed_out": (result.error or "") == "execution timed out",
-            "interrupted": (result.error or "") == "execution interrupted",
-            "output_chars": len(result.output or ""),
-            "stdout_tail": output_text,
-            "artifact_uri": getattr(result, "ref_uri", None),
-        },
-        task_id=task.id,
-        session_id=task.session_id,
-        artifact_uri=getattr(result, "ref_uri", None),
-    )
+def _generated_recovery_hint(state: RunState) -> dict[str, Any]:
+    record = state.generated_recovery_records[-1] if state.generated_recovery_records else {}
+    remaining = max(state.generated_recovery_limit - state.generated_recovery_attempts, 0)
+    compact = {
+        "target_capability_id": record.get("target_capability_id"),
+        "failure_class": record.get("failure_class"),
+        "recovery_action": record.get("recovery_action"),
+        "evidence": record.get("evidence", {}),
+    }
+    return {
+        "kind": "generated_tool_failure_recovery",
+        "remaining_attempts": remaining,
+        "failure": compact,
+        "message": (
+            "A generated capability failed in a source-repairable way. Use at most one "
+            "bounded correction through the canonical synthesis capability with operation "
+            "repair, capability_id equal to the target, and a complete repaired code "
+            "payload. The synthesis capability will validate, re-admit, and preserve "
+            "provenance. Do not repair dependency, environment, policy, or authority "
+            "failures by rewriting source. Stop when the budget is exhausted."
+        ),
+    }
 
 
 class AgentKernel:
@@ -507,6 +458,7 @@ class AgentKernel:
         secret_manager=None,
         workflow_store=None,
         workflow_fabric=None,
+        workflow_runner: WorkflowRunner | None = None,
     ) -> None:
         self._task_store = task_store
         self._events = events
@@ -551,8 +503,7 @@ class AgentKernel:
         # acceptance evidence to an active candidate branch and promote only
         # proven reality.
         self._reality_coordinator = reality_coordinator
-        self._workflow_store = workflow_store
-        self._workflow_fabric = workflow_fabric
+        self._workflow_runner = workflow_runner
         # Kernel-owned interpreter fusion hook (audit P0.2). The extension
         # itself carries no authority — it receives observations and returns
         # proposals; every subturn and every dispatch routes through the
@@ -582,7 +533,43 @@ class AgentKernel:
         # fresh worker must be launched.  The per-task lock closes the final
         # timeout/notification handoff window.
         self._resume_armed: set[str] = set()
-        self._resume_locks: dict[str, asyncio.Lock] = {}
+        self._resume_locks = ReferenceCountedKeyedLocks()
+        # A durable input/approval wakeup may relaunch while the previous
+        # parked run is still unwinding. Serialize entry per task so only one
+        # kernel run can own the task at a time.
+        self._run_locks = ReferenceCountedKeyedLocks()
+        self._recovery_dispatch = RecoveryDispatchMechanism(
+            emit=self._emit,
+            update_metadata=self._task_store.update_metadata,
+            candidate_payload=_fusion_candidate_payload,
+            failed_fingerprints=_failed_proposal_fingerprints,
+        )
+        self._tool_input_corrections = ToolInputCorrectionMechanism()
+        self._observation_dispatch = ObservationDispatchMechanism(self._offer_observation)
+        self._steering_support = SteeringSupport(
+            store=self._steering_store,
+            messages=self._messages,
+            emit=self._emit,
+        )
+        self._context_support = ContextSupport(
+            compiler=self._compiler,
+            messages=self._messages,
+            runs=self._runs,
+            emit=self._emit,
+            recovery_hint=_recovery_hint,
+            generated_recovery_hint=_generated_recovery_hint,
+            textable_messages=_textable_messages,
+        )
+        self._pack_hook_support = PackHookSupport(
+            workflow_runner=self._workflow_runner,
+            transition=self._transition,
+            paused_result=self._paused_result,
+            finalize=self._finalize,
+        )
+        self._generated_retry = GeneratedRetryMechanism(
+            update_metadata=self._task_store.update_metadata,
+            emit=self._emit,
+        )
         # Ephemeral duplicate-append fast path only; durable message receipts
         # remain the correctness boundary across restarts.
         self._response_append_cache: set[str] = set()
@@ -605,36 +592,44 @@ class AgentKernel:
     # Public API
     # ------------------------------------------------------------------ #
     async def run_task(self, task_id: str) -> TaskResult:
-        completion = self._completion_events.setdefault(task_id, asyncio.Event())
-        completion.clear()
-        task = await self._lifecycle.acquire(task_id)
-        state = self._runs.get(task_id) or RunState(task)
-        self._runs[task_id] = state
-        begin_compute = getattr(self._budgets, "begin_compute", None)
-        end_compute = getattr(self._budgets, "end_compute", None)
-        compute_started = False
-        try:
-            if begin_compute is not None:
-                await begin_compute(task.id)
-                compute_started = True
-            await self._bootstrap(task, state)
-            invocation = (task.metadata or {}).get("_pack_hook_invocation")
-            if invocation is not None:
-                return await self._run_pack_hook_workflow(task, state, invocation)
-            return await self._loop(task, state)
-        except BudgetStateUnavailable as exc:
-            return await self._finalize(
-                task,
-                state,
-                TaskStatus.RECOVERY_REQUIRED,
-                f"budget state unavailable; recovery required: {exc}",
-            )
-        finally:
-            if end_compute is not None and compute_started:
-                await end_compute(task.id)
-            self._runs.pop(task_id, None)
-            self._resume_armed.discard(task_id)
-            completion.set()
+        async with self._run_locks.lock(task_id):
+            completion = self._completion_events.setdefault(task_id, asyncio.Event())
+            completion.clear()
+            task = await self._lifecycle.acquire(task_id)
+            state = self._runs.get(task_id) or RunState(task)
+            self._runs[task_id] = state
+            begin_compute = getattr(self._budgets, "begin_compute", None)
+            end_compute = getattr(self._budgets, "end_compute", None)
+            compute_started = False
+            try:
+                if begin_compute is not None:
+                    await begin_compute(task.id)
+                    compute_started = True
+                await self._bootstrap(task, state)
+                if state.generated_recovery_retry_status in {"dispatching", "uncertain"}:
+                    return await self._finalize(
+                        task,
+                        state,
+                        TaskStatus.RECOVERY_REQUIRED,
+                        "generated repair retry outcome is uncertain; recovery required before retry",
+                    )
+                invocation = (task.metadata or {}).get("_pack_hook_invocation")
+                if invocation is not None:
+                    return await self._run_pack_hook_workflow(task, state, invocation)
+                return await self._loop(task, state)
+            except BudgetStateUnavailable as exc:
+                return await self._finalize(
+                    task,
+                    state,
+                    TaskStatus.RECOVERY_REQUIRED,
+                    f"budget state unavailable; recovery required: {exc}",
+                )
+            finally:
+                if end_compute is not None and compute_started:
+                    await end_compute(task.id)
+                self._runs.pop(task_id, None)
+                self._resume_armed.discard(task_id)
+                completion.set()
 
     async def _run_pack_hook_workflow(
         self,
@@ -642,116 +637,7 @@ class AgentKernel:
         state: RunState,
         invocation: Mapping[str, Any],
     ) -> TaskResult:
-        """Execute a pack hook's declared workflow without model mediation."""
-        workflow_id = str(invocation.get("workflow_id") or "")
-        pack_id = str(invocation.get("pack_id") or "")
-        if not workflow_id or not pack_id or self._workflow_store is None:
-            return await self._finalize(
-                task,
-                state,
-                TaskStatus.FAILED,
-                "pack hook workflow invocation is incomplete",
-            )
-        workspace = task.workspace
-        if workspace is None:
-            return await self._finalize(
-                task,
-                state,
-                TaskStatus.FAILED,
-                "pack hook workflow requires a workspace",
-            )
-        try:
-            workflow = await self._workflow_store.get(
-                workflow_id,
-                task_id=task.id,
-                project_id=workspace.id,
-                user_id=None,
-            )
-            if workflow is None:
-                raise ValueError(f"declared pack hook workflow not found: {workflow_id}")
-            provenance = dict(workflow.provenance or {})
-            if provenance.get("pack_id") != pack_id:
-                raise ValueError("pack hook workflow provenance does not match its pack")
-            if not workflow.enabled or workflow.lifecycle_state != "ACTIVE":
-                raise ValueError("declared pack hook workflow is not active")
-            if self._workflow_fabric is None or self._dispatch_factory is None:
-                raise RuntimeError("pack hook workflow execution is not wired")
-
-            from athena.capabilities.workflow import WorkflowCapability
-            from athena.workflows.executor import WorkflowExecutor
-
-            shim = self._dispatch_factory(task)
-            dispatcher = getattr(shim, "_dispatcher", None)
-            if dispatcher is None:
-                raise RuntimeError("pack hook workflow dispatcher is unavailable")
-            workflow_capability = WorkflowCapability(
-                self._workflow_store,
-                dispatcher,
-                self._workflow_fabric,
-                run_store=self._workflow_run_store,
-            )
-            graph = await workflow_capability._load_graph(  # noqa: SLF001
-                workflow,
-                task_id=task.id,
-                project_id=workspace.id,
-                user_id=None,
-            )
-
-            def resolver(identifier):
-                nested = graph.get(identifier)
-                if nested is not None:
-                    return nested
-                return self._workflow_fabric.executor_for(
-                    identifier,
-                    task_id=task.id,
-                    project_id=workspace.id,
-                    user_id=None,
-                ).descriptor
-
-            event_payload = invocation.get("event_payload")
-            inputs = {
-                "event": dict(event_payload) if isinstance(event_payload, Mapping) else {},
-                "event_id": str(invocation.get("event_id") or ""),
-                "hook_id": str(invocation.get("hook_id") or ""),
-                "pack_id": pack_id,
-            }
-            outcome = await WorkflowExecutor(
-                dispatcher,
-                resolver=resolver,
-                run_store=self._workflow_run_store,
-            ).run(
-                graph[workflow.id],
-                task_id=task.id,
-                workspace=workspace,
-                session_id=task.session_id,
-                inputs=inputs,
-                task_policy=task.capability_policy,
-                task_budget=task.resource_budget,
-            )
-            if outcome.suspended is not None:
-                await self._transition(task, TaskStatus.WAITING_APPROVAL)
-                return await self._paused_result(
-                    task,
-                    state,
-                    TaskStatus.WAITING_APPROVAL,
-                    "pack hook workflow is awaiting approval",
-                )
-            if outcome.status == "completed":
-                return await self._finalize(
-                    task,
-                    state,
-                    TaskStatus.COMPLETE,
-                    f"pack hook workflow {workflow.id} completed",
-                )
-            reason = "; ".join(outcome.failures) or f"workflow status: {outcome.status}"
-            return await self._finalize(task, state, TaskStatus.FAILED, reason)
-        except Exception as exc:  # workflow failures become truthful task results
-            return await self._finalize(
-                task,
-                state,
-                TaskStatus.FAILED,
-                f"pack hook workflow failed: {exc}",
-            )
+        return await self._pack_hook_support.run(task, state, invocation)
 
     async def wait_for_completion(self, task_id: str, *, timeout: float | None = None) -> None:
         """Wait until the kernel has finished post-result cleanup for a run."""
@@ -772,6 +658,39 @@ class AgentKernel:
             await self._transition(task, TaskStatus.RUNNING)
         elif status == TaskStatus.QUEUED:
             await self._transition(task, TaskStatus.RUNNING)
+        self._restore_generated_recovery(task, state)
+
+    def _restore_generated_recovery(self, task: TaskSpec, state: RunState) -> None:
+        """Restore a pending generated repair without re-authorizing it."""
+        metadata = task.metadata or {}
+        if not metadata.get("generated_recovery_pending"):
+            return
+        record = metadata.get("generated_recovery")
+        if not isinstance(record, Mapping) or not record.get("target_capability_id"):
+            state.generated_recovery_pending = False
+            return
+        state.generated_recovery_records = [dict(record)]
+        original = metadata.get("generated_recovery_original")
+        state.generated_recovery_original = (
+            dict(original) if isinstance(original, Mapping) else None
+        )
+        state.generated_recovery_retried = bool(metadata.get("generated_recovery_retried"))
+        state.generated_recovery_retry_status = str(
+            metadata.get("generated_recovery_retry_status") or "not_started"
+        )
+        state.generated_recovery_retry_error = metadata.get("generated_recovery_retry_error")
+        state.generated_recovery_repair_fingerprints = [
+            str(item) for item in (metadata.get("generated_recovery_repair_fingerprints") or ())
+        ][-4:]
+        state.generated_recovery_attempts = max(
+            0, int(metadata.get("generated_recovery_attempts") or 0)
+        )
+        state.generated_recovery_limit = max(
+            0, min(int(metadata.get("generated_recovery_limit") or 1), 2)
+        )
+        state.generated_recovery_pending = (
+            state.generated_recovery_attempts < state.generated_recovery_limit
+        )
 
     def cancel_task(self, task_id: str) -> None:
         """Hierarchical, idempotent cancellation (§20). Safe to call twice.
@@ -790,7 +709,7 @@ class AgentKernel:
         if cancellations is not None:
             try:
                 cancellations.set_token(task_id, "cancelled by kernel")
-            except Exception as exc:
+            except Exception as exc:  # rationale: boundary converts subordinate failure into observable recovery/fallback
                 # P1-11: a cancellation bookkeeping failure can leave a token
                 # un-set; operators must see why a task kept running.
                 _bookkeeping_failure("cancellation token set", task_id, exc)
@@ -798,7 +717,7 @@ class AgentKernel:
             try:
                 provider = self._registry.provider_for(state.provider)
                 asyncio.create_task(provider.cancel(state.request_id))
-            except Exception as exc:
+            except Exception as exc:  # rationale: boundary converts subordinate failure into observable recovery/fallback
                 # P1-11: best-effort stream interrupt, but the miss is visible.
                 _bookkeeping_failure("provider stream interrupt", task_id, exc)
 
@@ -808,7 +727,7 @@ class AgentKernel:
             await cancel_release(task_id)
         self._resume_decision[task_id] = decision
         event = self._resume.setdefault(task_id, asyncio.Event())
-        async with self._resume_locks.setdefault(task_id, asyncio.Lock()):
+        async with self._resume_locks.lock(task_id):
             armed = task_id in self._resume_armed
             event.set()
         return armed
@@ -829,7 +748,7 @@ class AgentKernel:
         if callable(cancel_release):
             await cancel_release(task_id)
         event = self._resume.setdefault(task_id, asyncio.Event())
-        async with self._resume_locks.setdefault(task_id, asyncio.Lock()):
+        async with self._resume_locks.lock(task_id):
             armed = task_id in self._resume_armed
             event.set()
         return armed
@@ -850,22 +769,9 @@ class AgentKernel:
 
     @staticmethod
     def _replay_policy_context(task) -> dict:
-        """Canonical extraction of the authority context approval replay needs.
+        from athena.kernel.policy_context import replay_policy_context
 
-        Replay paths must restore the SAME authority the original dispatch ran
-        under: model policy, capability policy, task budget, deadline. One
-        helper keeps that contract in one place instead of ad-hoc attribute
-        reads scattered across ``_approval_path``, ``_resume_durable_continuation``
-        and ``_resume_workflow_parent``. Fields absent from a partial test
-        double default to permissive-None, which the dispatcher treats as
-        unset — never as a widened grant.
-        """
-        return {
-            "task_policy": getattr(task, "capability_policy", None),
-            "model_policy": getattr(task, "model_policy", None),
-            "task_budget": getattr(task, "resource_budget", None),
-            "task_deadline": getattr(task, "deadline", None),
-        }
+        return replay_policy_context(task)
 
     def _park_wait(self, task, state):
         return ContinuationCoordinator(self)._park_wait(task, state)
@@ -886,7 +792,7 @@ class AgentKernel:
             result = handler(task_id)
             if inspect.isawaitable(result):
                 await result
-        except Exception as exc:  # parked cleanup is evidence, not a resume blocker
+        except Exception as exc:  # parked cleanup is evidence, not a resume blocker  # rationale: boundary converts subordinate failure into observable recovery/fallback
             _logger.warning("parked resource release cancellation failed for %s: %s", task_id, exc)
 
     async def _release_parked_resources(self, task) -> None:
@@ -897,7 +803,7 @@ class AgentKernel:
             outcome = releaser(task.id)
             if inspect.isawaitable(outcome):
                 await outcome
-        except Exception as exc:  # parked cleanup is evidence, not a crash path
+        except Exception as exc:  # parked cleanup is evidence, not a crash path  # rationale: boundary converts subordinate failure into observable recovery/fallback
             _logger.warning("parked resource release failed for %s: %s", task.id, exc)
 
     async def _paused_result(self, task, state, status: TaskStatus, reason: str) -> TaskResult:
@@ -916,132 +822,9 @@ class AgentKernel:
         return ContinuationCoordinator(self)._resume_paused_entry(task, state)
 
     async def _loop(self, task: TaskSpec, state: RunState) -> TaskResult:
-        budget = task.resource_budget or ResourceBudget()
+        from athena.kernel.reasoning_loop import ReasoningLoop
 
-        # Relaunched-entry resume (P1-17): a task relaunched after slot
-        # release or process restart re-enters here while durably paused.
-        # Consume durable state BEFORE the first model call — an answered
-        # question becomes a user turn; an open question or unresolved
-        # approval re-parks (bounded) — so the relaunch never re-asks the
-        # model for information the kernel already holds.
-        entry = await self._resume_paused_entry(task, state)
-        if entry is not None:
-            return entry
-
-        while True:
-            try:
-                await self._lifecycle.assert_runnable(task)
-            except RequestCancelled:
-                return await self._finalize(task, state, TaskStatus.CANCELLED, "task cancelled")
-            except TaskBudgetExceeded:
-                return await self._finalize(
-                    task, state, TaskStatus.PARTIAL, "resource budget exhausted"
-                )
-            await self._refresh_runtime_budget(task, state)
-            state.iterations += 1
-            if self._budgets is not None:
-                # Iteration usage is checkpointed before any model/provider
-                # work. A process restart therefore cannot make a previously
-                # admitted loop look unused to recovery or budget checks.
-                self._budgets.consume(task.id, iterations=1)
-                persist_budget = getattr(self._budgets, "_persist_usage", None)
-                if persist_budget is not None:
-                    await persist_budget(task.id)
-            await self._emit("TaskIterationStarted", {"iteration": state.iterations}, task)
-
-            if self._deadline_passed(task):
-                return await self._finalize(task, state, TaskStatus.PARTIAL, "deadline exceeded")
-            if _budget_exhausted(state, budget):
-                return await self._finalize(
-                    task, state, TaskStatus.PARTIAL, "resource budget exhausted"
-                )
-
-            # If approval was resolved while this process was down, the
-            # service requeues the same task. Consume the durable canonical
-            # call before asking the model for another turn; otherwise the
-            # assistant tool call would be replayed as a new request and could
-            # be repaired/executed twice.
-            resumed = await self._resume_durable_continuation(task)
-            if isinstance(resumed, SuspendedCall):
-                approval_result = await self._approval_path(
-                    task, state, DispatchResult(suspended=(resumed,))
-                )
-                if approval_result is not None:
-                    return approval_result
-                continue
-
-            await self._apply_pending_steering(task)
-
-            try:
-                compiled = await self._compile(task)
-            except ContextIntegrityError as exc:
-                return await self._finalize(
-                    task,
-                    state,
-                    TaskStatus.RECOVERY_REQUIRED,
-                    f"canonical context unavailable; recovery required: {exc}",
-                )
-            # Rebuild the observable-work bit from durable results when a
-            # process restarted or an approval continuation resumed. The
-            # in-memory RunState is intentionally disposable.
-            for evidence in _compiled_work_evidence(compiled, task.id):
-                if evidence.call_id not in {item.call_id for item in state.work_evidence}:
-                    state.work_evidence.append(evidence)
-            selection = await self._select_model(task, compiled, state=state)
-
-            try:
-                response = await self._invoke(task, state, selection, compiled)
-            except RequestCancelled:
-                return await self._finalize(task, state, TaskStatus.CANCELLED, "task cancelled")
-            except TaskDeadlineExceeded:
-                return await self._finalize(task, state, TaskStatus.PARTIAL, "deadline exceeded")
-            except TaskBudgetExceeded as exc:
-                return await self._finalize(task, state, TaskStatus.PARTIAL, str(exc))
-            except ProviderOutcomeUnknown as exc:
-                attempt_id = state.inference_attempt_id or "unknown"
-                return await self._finalize(
-                    task,
-                    state,
-                    TaskStatus.RECOVERY_REQUIRED,
-                    "provider outcome unknown; recovery required before retry "
-                    f"(attempt={attempt_id}, provider={state.provider or 'unknown'}, "
-                    f"request={state.request_id or 'unknown'}): {exc}",
-                )
-            except ProviderError:
-                return await self._finalize(task, state, TaskStatus.FAILED, "model unavailable")
-            except Exception as exc:  # kernel never crashes; truthful terminal.
-                return await self._finalize(
-                    task, state, TaskStatus.FAILED, f"kernel failure: {exc}"
-                )
-
-            calls = [b for b in response.blocks if isinstance(b, CapabilityCallBlock)]
-
-            if calls:
-                # Persist the assistant turn (text/reasoning + calls) BEFORE
-                # dispatch: provider history requires the tool_use/tool_call
-                # to precede its result. The dispatch path appends results
-                # after; ordering is the replay invariant.
-                await self._append_response(task, response)
-                outcome = await self._dispatch(task, state, response, calls)
-                if outcome is not None:
-                    return outcome
-                continue
-
-            decision = await self._termination.evaluate(
-                task,
-                response,
-                iterations=state.iterations,
-                max_iterations=budget.max_agent_iterations,
-                budget_exhausted=_budget_exhausted(state, budget),
-                cancelled=state.cancel.is_set(),
-                completion_mode=compiled.strategy.completion_mode,
-                work_evidence=tuple(state.work_evidence),
-            )
-            if decision.terminal:
-                await self._append_final_response(task, response)
-                return await self._finalize_decision(task, state, decision)
-
-            await self._append_response(task, response)
+        return await ReasoningLoop(self).run(task, state)
 
     # ------------------------------------------------------------------ #
     # Steps
@@ -1049,126 +832,10 @@ class AgentKernel:
     async def _compile(
         self, task: TaskSpec, *, context_window: int | None = None
     ) -> CompiledContext:
-        recent: list[Message] = []
-        if task.session_id:
-            try:
-                loader = getattr(self._messages, "list_causal_messages", None)
-                if loader is not None:
-                    recent = await loader(task.session_id, task.id)
-                else:
-                    loader = getattr(self._messages, "list_task_messages", None)
-                    if loader is not None:
-                        recent = await loader(task.session_id, task.id)
-                    else:
-                        loader = getattr(self._messages, "list_recent_session_messages", None)
-                        if loader is None:
-                            loader = self._messages.list_session_messages
-                        recent = await loader(task.session_id)
-            except Exception as exc:
-                raise ContextIntegrityError(
-                    f"canonical transcript unavailable for session {task.session_id}",
-                    cause=exc,
-                    session_id=task.session_id,
-                ) from exc
-        compiled = await self._compiler.compile(
-            task,
-            recent_messages=_textable_messages(recent),
-            workspace=task.workspace.root if task.workspace else None,
-            context_window=context_window,
-        )
-        strategy = compiled.strategy
-        await self._emit("StrategySelected", strategy.to_dict(), task)
-        if compiled.degradations:
-            # P1-6: optional-context failures are visible, not silent. Empty
-            # memory/skills/transcript must be distinguishable from a store
-            # that raised; this is the diagnostic that says which it was.
-            await self._emit(
-                "DiagnosticsProduced",
-                {
-                    "kind": "context_degradation",
-                    "degradations": [
-                        {"source": d.source, "scope": d.scope, "detail": d.detail}
-                        for d in compiled.degradations
-                    ],
-                    "count": len(compiled.degradations),
-                },
-                task,
-            )
-        if strategy.missing_affordance:
-            await self._emit(
-                "AffordanceGapDetected",
-                {
-                    "missing_affordance": strategy.missing_affordance,
-                    "route": strategy.route,
-                },
-                task,
-            )
-        return compiled
+        return await self._context_support.compile(task, context_window=context_window)
 
     async def _apply_pending_steering(self, task: TaskSpec) -> None:
-        """Materialize queued steering as durable user content at a safe boundary."""
-        store = self._steering_store
-        if store is None or not task.session_id:
-            return
-        for item in await store.list_pending(task.id):
-            message_id = f"msg_steer_{item['id']}"
-            source = str(item.get("source") or "").strip().lower()
-            if not source:
-                source = "parent_task" if item.get("source_task_id") else "operator"
-            if source == "parent_task":
-                source_type = SourceType.TASK
-                trust = TrustClass.AGENT_CURATED
-                prefix = "[Parent-task steering for the current task; consider it at this reasoning boundary]\n"
-            elif source == "system":
-                source_type = SourceType.SYSTEM
-                trust = TrustClass.AUTHORITY
-                prefix = "[System steering for the current task]\n"
-            else:
-                source_type = SourceType.USER
-                trust = TrustClass.USER_CONTENT
-                prefix = "[Operator steering for the current task; consider it at this reasoning boundary]\n"
-            message = Message(
-                id=message_id,
-                role=Role.USER,
-                blocks=(
-                    TextBlock(
-                        text=(prefix + str(item["text"])),
-                        provenance=Provenance(
-                            source_type=source_type,
-                            source_id=str(item["id"]),
-                            trust=trust,
-                            scope=f"task:{task.id}",
-                            created_at=utcnow(),
-                        ),
-                    ),
-                ),
-                created_at=utcnow(),
-                provenance=Provenance(
-                    source_type=source_type,
-                    source_id=str(item["id"]),
-                    trust=trust,
-                    scope=f"task:{task.id}",
-                    created_at=utcnow(),
-                ),
-                metadata={
-                    "session_id": task.session_id,
-                    "task_id": task.id,
-                    "steering_id": item["id"],
-                    "source_task_id": item.get("source_task_id"),
-                    "source": source,
-                },
-            )
-            await self._messages.append_user_turn(task.session_id, message)
-            await store.mark_consumed(item["id"])
-            await self._emit(
-                "TaskSteered",
-                {
-                    "steering_id": item["id"],
-                    "principal_id": item["principal_id"],
-                    "source_task_id": item.get("source_task_id"),
-                },
-                task,
-            )
+        return await self._steering_support.apply(task)
 
     async def _select_model(
         self,
@@ -1304,17 +971,18 @@ class AgentKernel:
         # as the primary dispatch path does (kernel._dispatch). RunState.provider
         # is set by _invoke for the most recent inference — which, at this
         # point, is the interpreter subturn that produced the proposal.
-        dispatcher = getattr(shim, "_dispatcher", None)
-        if dispatcher is not None and hasattr(dispatcher, "set_inference_provenance"):
-            dispatcher.set_inference_provenance(
-                provider_profile_id=context.run_state.provider,
-                model_id=None,
-                repair_mode=None,
-            )
-        dispatch_kwargs = {}
+        # Provenance is invocation state, not dispatcher state, so concurrent
+        # tasks cannot overwrite each other's repair identity (P0).
+        dispatch_kwargs: dict[str, float | None | DispatchProvenance] = {}
         if "runtime_remaining_s" in inspect.signature(shim.dispatch).parameters:
             dispatch_kwargs["runtime_remaining_s"] = self._remaining_runtime_seconds(
                 task, context.run_state
+            )
+        if "provenance" in inspect.signature(shim.dispatch).parameters:
+            dispatch_kwargs["provenance"] = DispatchProvenance(
+                provider_profile_id=context.run_state.provider,
+                model_id=None,
+                repair_mode=None,
             )
         return await shim.dispatch(task, [call], **dispatch_kwargs)
 
@@ -1498,6 +1166,44 @@ class AgentKernel:
     async def _relay_delta(self, task: TaskSpec, delta: ModelDelta) -> None:
         return await InferenceBroker(self)._relay_delta(task, delta)
 
+    async def _record_speculative_failure(
+        self, task: TaskSpec, state: RunState, result: CapabilityResultBlock
+    ) -> bool:
+        return await self._recovery_dispatch.record_speculative_failure(task, state, result)
+
+    async def _record_generated_failure(
+        self,
+        task: TaskSpec,
+        state: RunState,
+        result: CapabilityResultBlock,
+        call: CapabilityCallBlock | None = None,
+    ) -> bool:
+        return await self._recovery_dispatch.record_generated_failure(task, state, result, call)
+
+    async def _validate_generated_recovery(
+        self, task: TaskSpec, state: RunState, calls: list[CapabilityCallBlock]
+    ) -> str | None:
+        return await self._recovery_dispatch.validate_generated_recovery(task, state, calls)
+
+    async def _retry_repaired_generated_operation(
+        self,
+        task: TaskSpec,
+        state: RunState,
+        results: tuple[CapabilityResultBlock, ...],
+        shim: Any,
+    ) -> DispatchResult | None:
+        return await self._generated_retry.retry(
+            task,
+            state,
+            results,
+            shim.dispatch,
+        )
+
+    def _validate_speculative_recovery(
+        self, state: RunState, calls: list[CapabilityCallBlock]
+    ) -> str | None:
+        return self._recovery_dispatch.validate_speculative_recovery(state, calls)
+
     async def _dispatch(self, task, state, response, calls):
         # A model-issued clarification request is kernel-owned, not a capability
         # execution: intercept it before the dispatcher so the task can park in
@@ -1542,99 +1248,131 @@ class AgentKernel:
             await self._append_results(task, not_executed, calls=calls)
             return None
 
+        recovery_error = self._validate_speculative_recovery(state, calls)
+        generated_recovery_error = await self._validate_generated_recovery(task, state, calls)
+        if generated_recovery_error is not None:
+            recovery_error = recovery_error or generated_recovery_error
+        if recovery_error is not None:
+            rejected = [
+                CapabilityResultBlock(
+                    call_id=call.call_id,
+                    capability_id=call.capability_id,
+                    ok=False,
+                    error=recovery_error,
+                    metadata={
+                        "diagnostic": {
+                            "failure_class": "speculative_recovery_boundary",
+                            "recovery_action": "stop",
+                            "permitted_recovery": ["stop"],
+                        }
+                    },
+                )
+                for call in calls
+            ]
+            await self._append_results(task, rejected, calls=calls)
+            await self._emit(
+                "SpeculativeRecoveryStopped",
+                {
+                    "reason": recovery_error,
+                    "rejections": state.speculative_recovery_rejections,
+                },
+                task,
+            )
+            return await self._finalize(task, state, TaskStatus.FAILED, recovery_error)
+
         # The dispatcher may create and publish an approval request before it
         # returns a SuspendedCall.  Arm the task's resume boundary before that
         # call so an operator decision cannot arrive into an unarmed window.
         self._arm_resume_wait(task.id)
         shim = self._dispatch_factory(task)
         # Bind the producing inference turn to repair receipts before any
-        # capability request is translated or dispatched.
-        dispatcher = getattr(shim, "_dispatcher", None)
-        if dispatcher is not None and hasattr(dispatcher, "set_inference_provenance"):
-            dispatcher.set_inference_provenance(
+        # capability request is translated or dispatched. Provenance travels
+        # with this dispatch invocation, never as shared dispatcher state, so
+        # concurrent tasks cannot contaminate each other's records (P0).
+        dispatch_kwargs: dict[str, float | None | DispatchProvenance] = {}
+        if "runtime_remaining_s" in inspect.signature(shim.dispatch).parameters:
+            dispatch_kwargs["runtime_remaining_s"] = self._remaining_runtime_seconds(task, state)
+        if "provenance" in inspect.signature(shim.dispatch).parameters:
+            dispatch_kwargs["provenance"] = DispatchProvenance(
                 provider_profile_id=response.metadata.get("provider_profile_id", response.provider),
                 model_id=response.metadata.get("model_id", response.model),
                 repair_mode=response.metadata.get("tool_repair_mode"),
             )
-        dispatch_kwargs = {}
-        if "runtime_remaining_s" in inspect.signature(shim.dispatch).parameters:
-            dispatch_kwargs["runtime_remaining_s"] = self._remaining_runtime_seconds(task, state)
         outcome = await shim.dispatch(task, calls, **dispatch_kwargs)
 
         if outcome.suspended:
             return await self._approval_path(task, state, outcome)
 
+        repaired_retry = await self._retry_repaired_generated_operation(
+            task,
+            state,
+            outcome.results,
+            shim,
+        )
+        if repaired_retry is not None:
+            if repaired_retry.suspended:
+                return await self._approval_path(task, state, repaired_retry)
+            await self._append_results(
+                task,
+                repaired_retry.results,
+                calls=[],
+            )
+            outcome = repaired_retry
+
         await self._append_results(task, outcome.results, calls=calls)
-        # Loop-side observation producer (audit P0.2 completion): a FAILED
-        # capability result is an execution-grounded observation. Offer at
-        # most ONE per dispatch (cost-amplification bound: a turn with N
-        # failed calls must not trigger N unbounded model subturns, and the
-        # budget is re-checked immediately so a task at its cost/token cap
-        # cannot overshoot inside this loop) to the interpreter extension
-        # (when the service wired one in). The extension's subturn and its
-        # proposal's dispatch both meter through this kernel.
-        if self._interpreter is not None:
-            budget = getattr(task, "resource_budget", None)
-            for result in outcome.results:
-                if not isinstance(result, CapabilityResultBlock):
-                    continue
-                # Track consecutive failures per capability AFTER the primary
-                # loop's own tool-correction path has run: enough repetitions
-                # turn one more failed result into a REPEATED_FAILURE
-                # observation (triggering policy decides the threshold).
-                candidates = []
-                if result.ok:
-                    # RuntimeCompleted: successful runs with abnormal status
-                    # or voluminous output are interpreter material too.
-                    candidates.append(_runtime_completed_observation(task, result))
-                else:
-                    failures = state.interpreter_failure_counts
-                    failures[result.capability_id] = failures.get(result.capability_id, 0) + 1
-                    candidates = [
-                        _observation_from_result(task, result),
-                        _repeated_failure_observation(task, result, failures[result.capability_id]),
-                    ]
-                offered = False
-                for observation in candidates:
-                    if observation is None:
-                        continue
-                    # Triggering policy (P1-13): concise failures return
-                    # directly to the primary loop; only observations that
-                    # genuinely compress body state spend a subturn.
-                    if not observation_warrants_subturn(observation):
-                        continue
-                    if budget is not None and _budget_exhausted(state, budget):
-                        break
-                    try:
-                        await self._offer_observation(task, state, observation)
-                        offered = True
-                    except Exception:  # noqa: BLE001 — fusion must not kill the loop
-                        _logger.warning(
-                            "interpreter fusion failed for %s observation",
-                            observation.kind,
-                            exc_info=True,
-                        )
-                    break  # one subturn per dispatch, however many failures
-                if offered:
-                    break
-        exhausted: list[str] = []
-        max_cycles = int(response.metadata.get("max_tool_correction_cycles", 2))
+        exhausted_recovery = False
         for result in outcome.results:
-            if not isinstance(result, CapabilityResultBlock):
-                continue
-            if not (result.error or "").startswith("tool_input_invalid"):
-                continue
-            count = state.tool_correction_counts.get(result.capability_id, 0) + 1
-            state.tool_correction_counts[result.capability_id] = count
-            if count > max_cycles:
-                exhausted.append(result.capability_id)
+            if isinstance(result, CapabilityResultBlock) and result.capability_id == "fusion":
+                recorded = await self._record_speculative_failure(task, state, result)
+                exhausted_recovery = exhausted_recovery or (
+                    recorded
+                    and state.speculative_recovery_attempts >= state.speculative_recovery_limit
+                )
+            if isinstance(result, CapabilityResultBlock) and result.capability_id.startswith(
+                "synth_"
+            ):
+                original_call = next(
+                    (call for call in calls if call.call_id == result.call_id),
+                    None,
+                )
+                recorded = await self._record_generated_failure(task, state, result, original_call)
+                exhausted_recovery = exhausted_recovery or (
+                    recorded and state.generated_recovery_attempts >= state.generated_recovery_limit
+                )
+        if exhausted_recovery:
+            await self._emit(
+                "SpeculativeRecoveryStopped",
+                {
+                    "reason": "bounded recovery produced another failed candidate",
+                    "attempts": max(
+                        state.speculative_recovery_attempts,
+                        state.generated_recovery_attempts,
+                    ),
+                },
+                task,
+            )
+            return await self._finalize(
+                task,
+                state,
+                TaskStatus.FAILED,
+                "bounded recovery produced another failed candidate",
+            )
+        await self._observation_dispatch.offer_one(
+            task=task,
+            state=state,
+            results=outcome.results,
+            offer_enabled=self._interpreter is not None,
+        )
+        max_cycles = int(response.metadata.get("max_tool_correction_cycles", 2))
+        exhausted = self._tool_input_corrections.exhausted_capabilities(
+            state,
+            outcome.results,
+            max_cycles=max_cycles,
+        )
         if exhausted:
             await self._emit(
                 "ToolInputCorrectionExhausted",
-                {
-                    "capabilities": sorted(set(exhausted)),
-                    "max_cycles": max_cycles,
-                },
+                {"capabilities": list(exhausted), "max_cycles": max_cycles},
                 task,
             )
             return await self._finalize(
@@ -1663,17 +1401,13 @@ class AgentKernel:
         suspended=None,
         *,
         record: Any = None,
-        dispatcher: Any = None,
-        workspace: Any = None,
-        profile: Any = None,
+        shim: Any = None,
     ):
         return await ContinuationCoordinator(self)._resume_workflow_parent(
             task,
             suspended,
             record=record,
-            dispatcher=dispatcher,
-            workspace=workspace,
-            profile=profile,
+            shim=shim,
         )
 
     async def _reconcile_workflow_suspended(
@@ -1735,23 +1469,9 @@ class AgentKernel:
 
     @staticmethod
     def _remaining_runtime_seconds(task: TaskSpec, state: RunState) -> float | None:
-        limits: list[float] = []
-        deadline = getattr(task, "deadline", None)
-        if deadline is not None:
-            limits.append((deadline - utcnow()).total_seconds())
-        budget = getattr(task, "resource_budget", None)
-        wall_remaining = getattr(state, "budget_wall_time_remaining_s", None)
-        if wall_remaining is not None:
-            elapsed_since_checkpoint = max(
-                0.0,
-                state.elapsed_ms / 1000 - getattr(state, "budget_wall_time_checkpoint_s", 0.0),
-            )
-            limits.append(wall_remaining - elapsed_since_checkpoint)
-        else:
-            max_wall_time = getattr(budget, "max_wall_time", None)
-            if max_wall_time is not None:
-                limits.append(max_wall_time.total_seconds() - state.elapsed_ms / 1000)
-        return min(limits) if limits else None
+        from athena.kernel.policy_context import remaining_runtime_seconds
+
+        return remaining_runtime_seconds(task, state)
 
     async def _refresh_runtime_budget(self, task: TaskSpec, state: RunState) -> None:
         """Refresh the root-aware active-compute ceiling before each turn."""

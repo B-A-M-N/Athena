@@ -1,6 +1,7 @@
 from athena.context.compiler import ContextCompiler, _message_entry
 from athena.context.digest_builder import ContextDigestBuilder
-from athena.context.digest import ContextDigest, ContextDigestStore
+from athena.context.digest import ContextDigest
+from athena.state.context_digests import ContextDigestStore
 from athena.protocol.messages import (
     CapabilityResultBlock,
     Message,

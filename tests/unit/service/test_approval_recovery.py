@@ -8,6 +8,7 @@ import pytest
 
 from athena.protocol.tasks import TaskStatus
 from athena.service.service import AthenaService
+from athena.service.recovery import RecoveryCoordinator
 
 
 class _Continuations:
@@ -47,6 +48,7 @@ class _Kernel:
 @pytest.mark.asyncio
 async def test_recover_approved_continuation_requeues_same_task_once():
     service = AthenaService.__new__(AthenaService)
+    service._recovery = RecoveryCoordinator(service)
     service._approval_recovery_tasks = set()
     continuations = _Continuations()
     manager = _TaskManager()

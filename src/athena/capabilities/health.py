@@ -6,13 +6,13 @@ reset the resulting circuit through a normal capability.
 """
 
 from __future__ import annotations
+from athena.capabilities.operations import native_descriptor
 
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from athena.protocol.capabilities import (
-    CapabilityDescriptor,
     CapabilityOrigin,
     CapabilityRequest,
     CapabilityResult,
@@ -200,6 +200,7 @@ class CapabilityHealth:
         return record.to_record()
 
     def record_failure(self, capability_id: str, reason: str | None = None) -> dict[str, Any]:
+        """Record a health-relevant infrastructure/implementation failure."""
         record = self._records.setdefault(
             capability_id,
             HealthRecord(capability_id, cooldown_seconds=self.cooldown_seconds),
@@ -216,6 +217,34 @@ class CapabilityHealth:
             record.status = "open"
             record.opened_at = record.last_failure_at
             record.opened_at_wall = record.last_failure_at_wall
+        return record.to_record()
+
+    def record_domain_outcome(
+        self, capability_id: str, reason: str | None = None
+    ) -> dict[str, Any]:
+        """Record a truthful failed domain call without punishing circuit health.
+
+        A missing file, invalid user request, or expected conflict is not a
+        capability outage.  This method keeps total/failure telemetry accurate
+        without incrementing consecutive infrastructure failures.
+        """
+        record = self._records.setdefault(
+            capability_id,
+            HealthRecord(capability_id, cooldown_seconds=self.cooldown_seconds),
+        )
+        self._mark_dirty(capability_id)
+        record.total_calls += 1
+        record.failures += 1
+        record.consecutive_failures = 0
+        record.last_failure = str(reason or "domain failure")[:500]
+        record.last_failure_at = time.monotonic()
+        record.last_failure_at_wall = time.time()
+        if record.status == "half_open":
+            # A domain probe outcome is a real call and closes the probe.
+            record.status = "closed"
+            record._probe_in_flight = False
+        if record.status == "closed":
+            record.opened_at = None
         return record.to_record()
 
     def get(self, capability_id: str) -> dict[str, Any]:
@@ -253,7 +282,7 @@ class CapabilityHealth:
 
 
 class CapabilityHealthCapability:
-    descriptor = CapabilityDescriptor(
+    descriptor = native_descriptor(
         id="capability_health",
         description=(
             "Inspect capability health and circuit-breaker state. Operations: "

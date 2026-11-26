@@ -407,3 +407,322 @@ async def test_budget_exhausted_skips_fusion():
     assert state.model_calls == 0
     await stack.db.close()
     await stack.db.close()
+
+
+async def test_generated_failure_arms_one_canonical_repair_turn():
+    stack = await _make_stack(interpreter=None)
+    task = await _persisted_task(stack)
+    dispatched: list = []
+
+    class _GeneratedShim:
+        def __init__(self):
+            self.calls = 0
+
+        async def dispatch(self, task, calls):
+            from athena.kernel.dispatch import DispatchResult
+
+            self.calls += 1
+            dispatched.extend(calls)
+            if self.calls == 1:
+                return DispatchResult(
+                    results=(
+                        CapabilityResultBlock(
+                            call_id="generated-call",
+                            capability_id="synth_buggy",
+                            ok=False,
+                            error="implementation failed",
+                            metadata={
+                                "generated_failure": {
+                                    "capability_id": "synth_buggy",
+                                    "failure_class": "implementation_failure",
+                                    "repairable": True,
+                                    "recovery_action": "source_repair",
+                                    "evidence": {"stderr": "unexpected value"},
+                                }
+                            },
+                        ),
+                    )
+                )
+            return DispatchResult(
+                results=(
+                    CapabilityResultBlock(
+                        call_id=calls[0].call_id,
+                        capability_id=calls[0].capability_id,
+                        ok=True,
+                        output="repaired",
+                    ),
+                )
+            )
+
+    shim = _GeneratedShim()
+    await _run_one_turn(stack, task, shim)
+    state = stack.kernel._runs[task.id]
+    assert state.generated_recovery_pending is True
+    assert state.generated_recovery_attempts == 0
+    assert len(dispatched) == 1
+
+    repair = _Call(
+        call_id="repair-call",
+        capability_id="synthesis",
+        arguments={
+            "operation": "repair",
+            "capability_id": "synth_buggy",
+            "code": "def run(args):\n    return {'ok': True}\n",
+        },
+    )
+    await _run_one_turn(stack, task, shim, calls=[repair])
+    assert state.generated_recovery_pending is False
+    assert state.generated_recovery_attempts == 1
+    assert dispatched[-1].capability_id == "synthesis"
+    events = await stack.events.list_for_task(task.id)
+    assert any(event.type == "GeneratedFailureObserved" for event in events)
+    await stack.db.close()
+
+
+async def test_successful_repair_retries_original_generated_call_once():
+    stack = await _make_stack(interpreter=None)
+    task = await _persisted_task(stack)
+    state = stack.kernel._runs.get(task.id) or RunState(task=task)
+    stack.kernel._runs[task.id] = state
+    state.generated_recovery_original = {
+        "call_id": "original-call",
+        "capability_id": "synth_buggy",
+        "arguments": {"value": 7},
+    }
+    state.generated_recovery_retried = False
+    dispatched: list = []
+
+    class _Shim:
+        async def dispatch(self, task, calls):
+            dispatched.extend(calls)
+            return __import__("athena.kernel.dispatch", fromlist=["DispatchResult"]).DispatchResult(
+                results=()
+            )
+
+    result = await stack.kernel._retry_repaired_generated_operation(
+        task,
+        state,
+        (
+            CapabilityResultBlock(
+                call_id="repair",
+                capability_id="synthesis",
+                ok=True,
+                output="{}",
+                metadata={"capability_id": "synth_fixed"},
+            ),
+        ),
+        _Shim(),
+    )
+    assert result is not None
+    assert dispatched[0].capability_id == "synth_fixed"
+    assert dispatched[0].arguments == {"value": 7}
+    assert state.generated_recovery_retried is True
+    second = await stack.kernel._retry_repaired_generated_operation(
+        task,
+        state,
+        (
+            CapabilityResultBlock(
+                call_id="repair-2",
+                capability_id="synthesis",
+                ok=True,
+                metadata={"capability_id": "synth_fixed_2"},
+            ),
+        ),
+        _Shim(),
+    )
+    assert second is None
+    await stack.db.close()
+
+
+async def test_generated_dependency_failure_does_not_arm_source_repair():
+    stack = await _make_stack(interpreter=None)
+    task = await _persisted_task(stack)
+    state = stack.kernel._runs.get(task.id) or RunState(task=task)
+    stack.kernel._runs[task.id] = state
+    result = CapabilityResultBlock(
+        call_id="generated-call",
+        capability_id="synth_dependency",
+        ok=False,
+        error="dependency missing",
+        metadata={
+            "generated_failure": {
+                "capability_id": "synth_dependency",
+                "failure_class": "environment_changed",
+                "repairable": False,
+                "recovery_action": "dependency_refresh_and_revalidation",
+            }
+        },
+    )
+    assert await stack.kernel._record_generated_failure(task, state, result) is False
+    assert state.generated_recovery_pending is False
+    await stack.db.close()
+
+
+async def test_composed_generated_repair_revalidates_and_retries_original_call(tmp_path):
+    import json as _json
+
+    from athena.affordances import CapabilityFabric
+    from athena.capabilities.registry import CapabilityRegistry
+    from athena.capabilities.synthesis import SynthesisCapability
+    from athena.kernel.dispatch import DispatchResult
+    from athena.protocol.capabilities import (
+        CapabilityRequest,
+        CapabilityRequestOrigin,
+        InvocationContext,
+    )
+    from athena.protocol.tasks import WorkspaceSpec
+    from athena.synthesis.engine import SynthesisEngine
+
+    stack = await _make_stack(interpreter=None)
+    task = await _persisted_task(stack)
+    fabric = CapabilityFabric(CapabilityRegistry())
+    engine = SynthesisEngine()
+    synthesis = SynthesisCapability(engine, fabric)
+    created = await synthesis.invoke(
+        CapabilityRequest(
+            capability_id="synthesis",
+            task_id=task.id,
+            call_id="generated-create",
+            origin=CapabilityRequestOrigin.MODEL,
+            arguments={
+                "operation": "create",
+                "name": "branch_transform",
+                "description": "Transforms values",
+                "code": "def run(args):\n    return {'value': args['value'].upper()}\n",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                    "additionalProperties": False,
+                },
+                "effects": ["READ_LOCAL"],
+                "validation_cases": [
+                    {"args": {"value": "ready"}, "expect_output": {"value": "READY"}},
+                ],
+            },
+        )
+    )
+    assert created.status.value == "ok", (created.error, created.output)
+    original_id = _json.loads(created.output)["capability_id"]
+    original = engine.synthetic_for(original_id)
+    assert original is not None
+    workspace = WorkspaceSpec(id="repo", root=str(tmp_path))
+    retry_outputs: list[str] = []
+
+    class _ComposedShim:
+        def __init__(self):
+            self.calls = 0
+
+        async def dispatch(self, task, calls):
+            self.calls += 1
+            call = calls[0]
+            if self.calls == 1:
+                return DispatchResult(
+                    results=(
+                        CapabilityResultBlock(
+                            call_id=call.call_id,
+                            capability_id=original_id,
+                            ok=False,
+                            error="unseen input raised ValueError",
+                            metadata={
+                                "generated_failure": {
+                                    "capability_id": original_id,
+                                    "code_hash": "original-hash",
+                                    "failure_class": "implementation_failure",
+                                    "repairable": True,
+                                    "recovery_action": "source_repair",
+                                    "evidence": {"stderr": "unseen input"},
+                                }
+                            },
+                        ),
+                    )
+                )
+            if call.capability_id == "synthesis":
+                repaired = await synthesis.invoke(
+                    CapabilityRequest(
+                        capability_id="synthesis",
+                        task_id=task.id,
+                        call_id=call.call_id,
+                        origin=CapabilityRequestOrigin.MODEL,
+                        arguments={
+                            "operation": "repair",
+                            "capability_id": original_id,
+                            "name": "branch_transform_v2",
+                            "description": "Transforms values and records a suffix",
+                            "code": (
+                                "def run(args):\n"
+                                "    return {'value': args['value'].upper() + ('' if args['value'] == 'ready' else '-fixed')}\n"
+                            ),
+                            "input_schema": dict(original.input_schema),
+                            "effects": ["READ_LOCAL"],
+                            "validation_cases": [
+                                {
+                                    "args": {"value": "unseen"},
+                                    "expect_output": {"value": "UNSEEN-fixed"},
+                                },
+                            ],
+                        },
+                    )
+                )
+                assert repaired.status.value == "ok", (repaired.error, repaired.output)
+                payload = _json.loads(repaired.output) if repaired.output else {}
+                return DispatchResult(
+                    results=(
+                        CapabilityResultBlock(
+                            call_id=call.call_id,
+                            capability_id=call.capability_id,
+                            ok=True,
+                            output=repaired.output,
+                            metadata={**dict(repaired.metadata), **payload},
+                        ),
+                    )
+                )
+            request = CapabilityRequest(
+                capability_id=call.capability_id,
+                arguments=dict(call.arguments or {}),
+                task_id=task.id,
+                call_id=call.call_id,
+            )
+            result = await fabric.executor_for(
+                call.capability_id,
+                task_id=task.id,
+            ).invoke(request, context=InvocationContext(workspace=workspace, task_id=task.id))
+            retry_outputs.append(result.output)
+            return DispatchResult(
+                results=(
+                    CapabilityResultBlock(
+                        call_id=result.call_id,
+                        capability_id=result.capability_id,
+                        ok=result.status.value == "ok",
+                        output=result.output,
+                        error=result.error,
+                        metadata=result.metadata,
+                    ),
+                )
+            )
+
+    shim = _ComposedShim()
+    initial = _Call(
+        call_id="generated-original", capability_id=original_id, arguments={"value": "unseen"}
+    )
+    await _run_one_turn(stack, task, shim, calls=[initial])
+    state = stack.kernel._runs[task.id]
+    assert state.generated_recovery_pending is True
+    assert (await stack.tasks.get(task.id))["metadata"]["generated_recovery"]["failing_input"] == {
+        "value": "unseen"
+    }
+    repair = _Call(
+        call_id="generated-repair",
+        capability_id="synthesis",
+        arguments={
+            "operation": "repair",
+            "capability_id": original_id,
+            "code": "def run(args):\n    return {'value': args['value'].upper() + '-fixed'}\n",
+        },
+    )
+    await _run_one_turn(stack, task, shim, calls=[repair])
+    assert state.generated_recovery_attempts == 1
+    assert state.generated_recovery_retried is True
+    assert state.generated_recovery_retry_status == "consumed"
+    assert _json.loads(retry_outputs[0])["value"] == "UNSEEN-fixed"
+    await stack.db.close()

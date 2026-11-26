@@ -39,13 +39,17 @@ from athena.protocol.messages import (
     TrustClass,
     utcnow,
 )
+from athena.protocol.task_codec import TaskCodecError
 from athena.protocol.tasks import (
     AutonomyLevel,
     CapabilityPolicy,
     DeliverySpec,
+    FINAL_STATUSES,
+    PAUSED_STATUSES,
     MutationMode,
     NetworkPolicy,
     TaskSpec,
+    TaskStatus,
 )
 
 # ---------------------------------------------------------------------------
@@ -94,26 +98,32 @@ EV_TASK_FINISHED = "task.finished"
 EV_TASK_ERROR = "task.error"
 
 _STATUS_TO_ACP_ENV: dict[str, str] = {
-    "COMPLETE": EV_TASK_FINISHED,
-    "PARTIAL": EV_TASK_FINISHED,
-    "FAILED": EV_TASK_ERROR,
-    "CANCELLED": EV_TASK_ERROR,
-    "INTERRUPTED": EV_TASK_ERROR,
-    "BLOCKED": EV_TASK_ERROR,
-    "RECOVERY_REQUIRED": EV_TASK_ERROR,
-    "QUEUED": EV_TASK_STARTED,
-    "RUNNING": EV_TASK_STARTED,
+    status.value: (
+        EV_TASK_FINISHED
+        if status in FINAL_STATUSES
+        else EV_TASK_ERROR
+        if status in {TaskStatus.FAILED, TaskStatus.CANCELLED}
+        else EV_TASK_MESSAGE
+        if status in PAUSED_STATUSES
+        else EV_TASK_STARTED
+    )
+    for status in TaskStatus
 }
-
-# Athena event type strings that mark the end of a task lifecycle.
-_TERMINAL_EVENT_TYPES = frozenset(
+_FINAL_EVENT_TYPES = frozenset(
     {
         "TaskCompleted",
         "TaskPartial",
-        "TaskBlocked",
         "TaskFailed",
         "TaskCancelled",
+    }
+)
+_PAUSED_EVENT_TYPES = frozenset(
+    {
+        "ApprovalRequested",
+        "TaskStateChanged",
+        "TaskBlocked",
         "TaskInterrupted",
+        "TaskRecoveryRequired",
     }
 )
 
@@ -198,7 +208,7 @@ class ACPAdapter:
             delivery=_map_delivery(request.delivery),
             metadata={
                 "origin": "acp",
-                "autonomy": autonomy,
+                **({"autonomy": autonomy} if autonomy is not None else {}),
                 **dict(request.metadata),
             },
         )
@@ -257,8 +267,10 @@ class ACPAdapter:
         type_ = _STATUS_TO_ACP_ENV.get(status_str or "", EV_TASK_STARTED)
         task_id = _task_id_of(task)
         payload: dict[str, Any] = {"task_id": task_id}
-        if type_ is EV_TASK_FINISHED:
+        if type_ == EV_TASK_FINISHED:
             payload["status"] = "completed"
+        elif status_str in {status.value for status in PAUSED_STATUSES}:
+            payload["lifecycle"] = "paused"
         return ACPEvent(
             type=type_,
             task_id=task_id,
@@ -307,8 +319,9 @@ class ACPAdapter:
                 for ev in events:
                     if ev.sequence > last_seq:
                         last_seq = ev.sequence
-                    yield _event_from_athena_event(ev, task_id)
-                    if _event_type_of(ev) in _TERMINAL_EVENT_TYPES:
+                    event = _event_from_athena_event(ev, task_id)
+                    yield event
+                    if event.type in {EV_TASK_FINISHED, EV_TASK_ERROR}:
                         done = True
             if not done:
                 await _sleep(self._stream_interval)
@@ -362,12 +375,18 @@ def _task_id_of(task: Any) -> str:
     return str(getattr(task, "id", "") or getattr(task, "task_id", "") or "")
 
 
-def _map_autonomy(raw: str | None) -> str:
-    value = (raw or AutonomyLevel.SUPERVISED.value).lower()
+def _map_autonomy(raw: str | None) -> str | None:
+    """Map an explicit ACP autonomy boundary without inventing a default."""
+    if raw is None:
+        return None
+    value = raw.lower()
     try:
         return AutonomyLevel(value).value
-    except ValueError:
-        return AutonomyLevel.SUPERVISED.value
+    except ValueError as exc:
+        raise TaskCodecError(
+            f"invalid autonomy: {raw!r}; expected one of "
+            f"{[member.value for member in AutonomyLevel]}"
+        ) from exc
 
 
 def _map_delivery(raw: Mapping[str, Any] | None) -> DeliverySpec | None:
@@ -380,15 +399,15 @@ def _map_delivery(raw: Mapping[str, Any] | None) -> DeliverySpec | None:
 
 
 def _parse_deadline(value: str | None) -> datetime | None:
-    if not value:
+    if value is None or value == "":
         return None
     try:
         dt = datetime.fromisoformat(value)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt
-    except (TypeError, ValueError):
-        return None
+    except (TypeError, ValueError) as exc:
+        raise TaskCodecError(f"invalid deadline: {value!r}; expected ISO-8601 datetime") from exc
 
 
 def _event_type_of(ev: Any) -> str:
@@ -396,18 +415,30 @@ def _event_type_of(ev: Any) -> str:
 
 
 def _event_from_athena_event(ev: Any, task_id: str) -> ACPEvent:
-    """Map an Athena Event onto an ACP lifecycle envelope."""
-    ev_type = str(getattr(ev, "type", "") or "")
-    if ev_type in _TERMINAL_EVENT_TYPES:
-        type_ = EV_TASK_FINISHED if ev_type in ("TaskCompleted", "TaskPartial") else EV_TASK_ERROR
+    """Map an Athena Event onto an ACP lifecycle envelope.
+
+    Only canonical final events close the stream.  Resumable statuses are
+    explicit typed status messages so an ACP consumer can observe the pause
+    without incorrectly treating it as terminal failure.
+    """
+    ev_type = _event_type_of(ev)
+    if ev_type in _FINAL_EVENT_TYPES:
+        type_ = EV_TASK_FINISHED
+    elif ev_type in ("TaskFailed", "TaskCancelled"):
+        type_ = EV_TASK_ERROR
+    elif ev_type in _PAUSED_EVENT_TYPES:
+        type_ = EV_TASK_MESSAGE
     elif ev_type in ("TaskStarted", "TaskQueued"):
         type_ = EV_TASK_STARTED
     else:
         type_ = EV_TASK_MESSAGE
     payload = dict(getattr(ev, "payload", None) or {})
     payload["task_id"] = task_id
-    if type_ is EV_TASK_FINISHED:
+    payload["athena_event"] = ev_type
+    if type_ == EV_TASK_FINISHED:
         payload["status"] = "completed"
+    elif ev_type in _PAUSED_EVENT_TYPES:
+        payload["lifecycle"] = "paused"
     return ACPEvent(
         type=type_,
         task_id=task_id,

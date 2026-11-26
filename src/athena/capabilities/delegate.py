@@ -13,10 +13,10 @@ The model-facing primitive supports structured operations (P0-17):
 """
 
 from __future__ import annotations
+from athena.capabilities.operations import native_descriptor
 
 
 from athena.protocol.capabilities import (
-    CapabilityDescriptor,
     CapabilityOrigin,
     CapabilityRequest,
     CapabilityResult,
@@ -89,7 +89,7 @@ _INPUT_SCHEMA = {
 
 
 class DelegateCapability:
-    descriptor = CapabilityDescriptor(
+    descriptor = native_descriptor(
         id="delegate",
         description=(
             "Delegate a unit of work to a child Task. Supports spawn (create and "

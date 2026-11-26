@@ -8,8 +8,10 @@ from io import StringIO
 import pytest
 
 from athena.cli.animation import AnimationClock, OIAnimator, OIVisualState
-from athena.cli.framebuffer import OIFrameBuffer, pillow_available
+from athena.cli.render.dotmatrix import build_owl_field
+from athena.cli.framebuffer import FrameBuffer, OIFrameBuffer, pillow_available
 from athena.cli.dual_pane import DualPaneSurface
+from athena.cli.glass_presentation import GlassPresentation
 from athena.cli.layout import LayoutMode, compute_layout
 from athena.cli.projection import ProjectionState
 from athena.cli.render.ansi import CellGridDiffRenderer, cell_width, fit_cells
@@ -23,6 +25,49 @@ from athena.cli.render.scene import render_scene_lines
 from athena.cli.scene import build_oi_scene
 from athena.cli.terminal import TerminalSession, sanitize_terminal_text
 from athena.service.config import AthenaConfig, config_from_dict, config_to_dict, load_config
+
+
+class _FakeGlassFramebuffer:
+    def render_base(self, scene, width, height):
+        return FrameBuffer(b"base", width, height, base_key=("stable",))
+
+    def render_motion_overlay(self, scene, visual, width, height):
+        return FrameBuffer(b"motion", width, height, dirty_region=(10, 20, 30, 40))
+
+    def render_overlay(self, scene, visual, width, height):
+        return FrameBuffer(b"overlay", width, height, dirty_region=(20, 40, 50, 60))
+
+
+class _FakeKitty:
+    def __init__(self) -> None:
+        self.presented: list[int] = []
+
+    def present(self, asset, **kwargs):
+        del kwargs
+        self.presented.append(asset.asset_id)
+        return f"<{asset.asset_id}>"
+
+    def delete(self, asset_id: int) -> str:
+        return f"<delete:{asset_id}>"
+
+    def cleanup(self) -> str:
+        return "<cleanup>"
+
+
+def test_glass_presentation_retains_base_and_places_dirty_layers() -> None:
+    output = StringIO()
+    kitty = _FakeKitty()
+    presentation = GlassPresentation(output, _FakeGlassFramebuffer(), kitty)
+    layout = compute_layout(140, 36, "glass")
+
+    presentation.present(layout=layout, scene=object(), visual=OIVisualState())
+    assert kitty.presented == [40, 42, 41]
+    assert f"\x1b[{layout.prompt.y + 2};1H" in output.getvalue()
+
+    kitty.presented.clear()
+    presentation.present(layout=layout, scene=object(), visual=OIVisualState())
+    assert kitty.presented == [42, 41]
+    assert presentation.cleanup() == "<cleanup>"
 
 
 @pytest.mark.parametrize(
@@ -161,24 +206,95 @@ def test_glass_framebuffer_exposes_small_dynamic_overlay() -> None:
 
 
 @pytest.mark.skipif(not pillow_available(), reason="Pillow is optional")
-def test_glass_buddy_uses_fixed_sprite_source_box() -> None:
+def test_glass_buddy_is_fixed_dotmatrix_owl_world() -> None:
+    layout = compute_layout(120, 40)
+    scene = build_oi_scene(ProjectionState(), layout.oi)
+    framebuffer = OIFrameBuffer()
+    overlay = framebuffer.render_overlay(scene, OIVisualState(), 640, 360)
     from io import BytesIO
     from PIL import Image
 
+    assert overlay is not None and overlay.dirty_region is not None
+    _left, _top, width, height = overlay.dirty_region
+    assert width == framebuffer.BUDDY_WORLD_WIDTH
+    assert height == framebuffer.BUDDY_WORLD_HEIGHT
+    assert Image.open(BytesIO(overlay.png)).size == (
+        framebuffer.BUDDY_WORLD_WIDTH,
+        framebuffer.BUDDY_WORLD_HEIGHT,
+    )
+    assert not hasattr(framebuffer, "_BUDDY_SPRITE")
+
+
+@pytest.mark.skipif(not pillow_available(), reason="Pillow is optional")
+def test_dotmatrix_owl_is_deterministic_and_animates_with_ambient_time() -> None:
     layout = compute_layout(120, 40)
-    state = ProjectionState()
-    scene = build_oi_scene(state, layout.oi)
+    scene = build_oi_scene(ProjectionState(status="EXECUTING"), layout.oi)
     animator = OIAnimator()
+    animator.set_state("EXECUTING", "center")
     framebuffer = OIFrameBuffer()
 
-    overlay = framebuffer.render_overlay(scene, animator.visual, 640, 360)
+    first = framebuffer.render_overlay(scene, animator.visual, 640, 360)
+    second = framebuffer.render_overlay(scene, animator.visual, 640, 360)
+    assert first is not None and second is not None
+    assert first.png == second.png
 
-    assert overlay is not None and overlay.dirty_region is not None
-    assert (overlay.dirty_region[2], overlay.dirty_region[3]) == (64, 80)
-    assert Image.open(BytesIO(overlay.png)).size == (64, 80)
-    assert len(framebuffer._BUDDY_SPRITE) == 40
-    assert {len(row) for row in framebuffer._BUDDY_SPRITE} == {32}
-    assert sum(row.count("#") for row in framebuffer._BUDDY_SPRITE) < 32 * 40 // 2
+    animator.tick(0.2)
+    third = framebuffer.render_overlay(scene, animator.visual, 640, 360)
+    assert third is not None
+    assert third.png != first.png
+
+
+@pytest.mark.skipif(not pillow_available(), reason="Pillow is optional")
+def test_reduced_motion_dotmatrix_owl_is_still() -> None:
+    layout = compute_layout(120, 40)
+    scene = build_oi_scene(ProjectionState(), layout.oi)
+    animator = OIAnimator(reduced_motion=True)
+    framebuffer = OIFrameBuffer()
+
+    before = framebuffer.render_overlay(scene, animator.visual, 640, 360)
+    assert animator.tick(1.0) is False
+    after = framebuffer.render_overlay(scene, animator.visual, 640, 360)
+    assert before is not None and after is not None
+    assert before.png == after.png
+
+
+@pytest.mark.skipif(not pillow_available(), reason="Pillow is optional")
+def test_dotmatrix_owl_masks_have_target_density_hierarchy() -> None:
+    from PIL import Image, ImageDraw
+
+    field = build_owl_field(Image, ImageDraw)
+    assert len(field.outline) > len(field.face)
+    assert len(field.wings) > 0
+    assert len(field.body) > 0
+    assert len(field.body) < len(field.wings) + len(field.outline)
+
+
+@pytest.mark.skipif(not pillow_available(), reason="Pillow is optional")
+def test_buddy_collision_uses_complete_dotmatrix_world() -> None:
+    layout = compute_layout(120, 40)
+    scene = build_oi_scene(ProjectionState(), layout.oi)
+    framebuffer = OIFrameBuffer()
+    position = framebuffer._buddy_position(scene, OIVisualState(), 640, 360)
+    assert position is not None
+    left, top = position
+    box = (
+        left,
+        top,
+        left + framebuffer.BUDDY_WORLD_WIDTH,
+        top + framebuffer.BUDDY_WORLD_HEIGHT,
+    )
+    assert box[2] <= 640
+    assert box[3] <= 360
+    assert not framebuffer._buddy_overlaps_content(scene, box[0], box[1], 640, 360)
+
+
+@pytest.mark.skipif(not pillow_available(), reason="Pillow is optional")
+def test_base_has_no_perspective_vector_floor() -> None:
+    import inspect
+
+    source = inspect.getsource(OIFrameBuffer._render_base)
+    assert "draw.line((width // 2, height // 2, x, height)" not in source
+    assert "faint perspective grid" not in source
 
 
 @pytest.mark.skipif(not pillow_available(), reason="Pillow is optional")

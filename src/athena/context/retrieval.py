@@ -15,6 +15,7 @@ import hashlib
 import inspect
 import json
 import logging
+import re
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from athena.context.instructions import (
@@ -23,6 +24,12 @@ from athena.context.instructions import (
     source_for_context,
 )
 from athena.context.provenance import prov
+from athena.context.scoring import (
+    DEFAULT_FALLBACK_BUNDLE as _DEFAULT_FALLBACK_BUNDLE,
+    MEMORY_SCOPE_WEIGHTS as _MEMORY_SCOPE_WEIGHTS,
+    fallback_bundle_ids as _fallback_bundle_ids,
+    strong_matches as _strong_matches,
+)
 from athena.context.selection import estimate_tokens
 from athena.protocol.capabilities import CapabilityDescriptor
 from athena.protocol.errors import CapabilityReadinessError, ContextIntegrityError
@@ -33,54 +40,50 @@ from athena.protocol.tasks import TaskSpec
 from athena.skills.selector import SkillSelector
 from athena.strategy import StrategyAffordance, is_explicit_response_turn
 
+from athena.context.contracts import (
+    ContextEntry as _Entry,
+    ContextStaticContext as _StaticContext,
+    SkillRetrieval,
+    MemoryCacheKey as _MemoryCacheKey,
+    MemoryRetrievalMode,
+)
+
 if TYPE_CHECKING:
     from athena.context.compiler import ContextCompiler
-    from athena.context.compiler import _Entry as _EntryT
-    from athena.context.compiler import MemoryRetrievalMode as MemoryRetrievalModeT
-    from athena.context.compiler import _StaticContext as _StaticContextT
 
 __all__ = ["ContextRetrieval"]
 
 _logger = logging.getLogger("athena.context")
 
 
-def _mod():
-    from athena.context import compiler as m
-
-    return m
-
-
-def _types():
-    # compiler-local types (_Entry/_StaticContext/_MemoryCacheKey/MemoryRetrievalMode)
-    # stay single-sourced on the compiler module; resolved lazily to avoid
-    # the retrieval <-> compiler import cycle.
-    from athena.context import compiler as m
-
-    return m
-
-
-def _strong_matches(objective, records):
-    return _mod()._strong_matches(objective, records)
-
-
-def _fallback_bundle_ids(objective):
-    return _mod()._fallback_bundle_ids(objective)
-
-
 def _agents_entry(path, text):
-    return _mod()._agents_entry(path, text)
+    from athena.context.compiler import _agents_entry as fn
+
+    return fn(path, text)
 
 
 def _message_entry(msg, *, is_last=False):
-    return _mod()._message_entry(msg, is_last=is_last)
+    from athena.context.compiler import _message_entry as fn
+
+    return fn(msg, is_last=is_last)
 
 
 def _memory_entry(rec):
-    return _mod()._memory_entry(rec)
+    from athena.context.compiler import _memory_entry as fn
+
+    return fn(rec)
 
 
 def _skill_entry(skill):
-    return _mod()._skill_entry(skill)
+    from athena.context.compiler import _skill_entry as fn
+
+    return fn(skill)
+
+
+def _workflow_entry(workflow):
+    from athena.context.compiler import _workflow_entry as fn
+
+    return fn(workflow)
 
 
 class ContextRetrieval:
@@ -89,7 +92,7 @@ class ContextRetrieval:
     def __init__(self, compiler: "ContextCompiler") -> None:
         self._c = compiler
 
-    async def _load_research(self, task: TaskSpec) -> list[_EntryT]:
+    async def _load_research(self, task: TaskSpec) -> list[_Entry]:
         """Retrieve bounded durable source snippets relevant to this task.
 
         Research snapshots are external content, never instructions. They are
@@ -112,7 +115,7 @@ class ContextRetrieval:
             _logger.warning("research context lookup failed: %s", exc)
             self._c._record_degradation("research", exc)
             return []
-        entries: list[_EntryT] = []
+        entries: list[_Entry] = []
         for hit in hits or []:
             source = hit.get("source") or {}
             source_id = str(source.get("id") or "unknown")
@@ -126,7 +129,7 @@ class ContextRetrieval:
                 f"Source: {title} ({uri})\n{snippet}"
             )
             entries.append(
-                _types()._Entry(
+                _Entry(
                     name=f"research:{source_id}",
                     text=text,
                     tokens=estimate_tokens(text),
@@ -170,17 +173,52 @@ class ContextRetrieval:
                 ) from exc
         return []
 
+    async def _load_workflows(self, task: TaskSpec) -> list[_Entry]:
+        """Discover promoted workflows relevant to an ordinary task."""
+        store = self._c._workflow_store
+        if store is None or not task.objective.strip():
+            return []
+        try:
+            workflows = await store.list(
+                task_id=task.id,
+                project_id=task.workspace.id if task.workspace else None,
+                user_id=self._c._principal_id,
+            )
+        except Exception as exc:
+            self._c._record_degradation("workflows", exc)
+            return []
+        terms = {
+            token
+            for token in re.findall(r"[a-zA-Z0-9][a-zA-Z0-9_-]{1,}", task.objective.lower())
+            if len(token) > 2
+        }
+        entries: list[_Entry] = []
+        for workflow in workflows or ():
+            if not getattr(workflow, "enabled", True):
+                continue
+            if getattr(workflow, "lifecycle_state", "ACTIVE") not in {"ACTIVE", "PROMOTED"}:
+                continue
+            haystack = " ".join(
+                (getattr(workflow, "name", ""), getattr(workflow, "description", ""))
+            ).lower()
+            if terms and not any(token in haystack for token in terms):
+                continue
+            entries.append(_workflow_entry(workflow))
+            if len(entries) >= 4:
+                break
+        return entries
+
     async def _load_memories(
-        self, task: TaskSpec, *, mode: "MemoryRetrievalModeT" | None = None
+        self, task: TaskSpec, *, mode: "MemoryRetrievalMode" | None = None
     ) -> list[Any]:
         if mode is None:
-            mode = _types().MemoryRetrievalMode.WORK
+            mode = MemoryRetrievalMode.WORK
         if self._c._memory_store is None:
             return []
         store = self._c._memory_store
         generation = getattr(store, "generation", None)
         cache_key = (
-            _types()._MemoryCacheKey(task.id, mode.value, int(generation))
+            _MemoryCacheKey(task.id, mode.value, int(generation))
             if isinstance(generation, int)
             else None
         )
@@ -217,10 +255,10 @@ class ContextRetrieval:
                             scopes,
                             limit=24,
                             mode="relevance",
-                            weights=_mod()._MEMORY_SCOPE_WEIGHTS,
+                            weights=_MEMORY_SCOPE_WEIGHTS,
                         )
                     )
-                    if mode is _types().MemoryRetrievalMode.WORK:
+                    if mode is MemoryRetrievalMode.WORK:
                         result = _strong_matches(task.objective, result)
                 else:
                     result = list(
@@ -230,7 +268,7 @@ class ContextRetrieval:
                             limit=24,
                         )
                     )
-                    if mode is _types().MemoryRetrievalMode.WORK:
+                    if mode is MemoryRetrievalMode.WORK:
                         result = _strong_matches(task.objective, result)
                 if cache_key is not None:
                     self._c._memory_cache[cache_key] = tuple(result)
@@ -292,7 +330,7 @@ class ContextRetrieval:
             out.extend(await store.search(task.objective, scope=MemoryScope.GLOBAL))
         except Exception as exc:
             self._c._record_degradation("memory", exc, scope="global")
-        if mode is _types().MemoryRetrievalMode.WORK:
+        if mode is MemoryRetrievalMode.WORK:
             out = _strong_matches(task.objective, out)
         if cache_key is not None:
             self._c._memory_cache[cache_key] = tuple(out)
@@ -301,24 +339,38 @@ class ContextRetrieval:
                 self._c._memory_cache.popitem(last=False)
         return out
 
-    async def _load_skills(self, task: TaskSpec) -> list[Any]:
+    async def _load_skills(self, task: TaskSpec) -> SkillRetrieval:
         if self._c._skill_loader is None:
-            return []
+            return SkillRetrieval()
         try:
             available = list(await self._c._skill_loader.load_active())
         except Exception as exc:
             self._c._record_degradation("skills", exc)
-            return []
+            return SkillRetrieval()
         if not available:
-            return []
-        selected = await SkillSelector(min_score=0.01).select(
+            return SkillRetrieval()
+        records, selected = await SkillSelector(min_score=0.01).select_with_evidence(
             task_objective=task.objective,
             available=available,
             limit=self._c.skill_limit,
+            task_context={
+                "objective": task.objective,
+                "project_id": task.workspace.id if task.workspace else None,
+                "principal_id": self._c._principal_id,
+                # Capability availability is deliberately optional here; the
+                # selector must not fabricate an authority inventory. A
+                # caller that has a canonical inventory can provide it in
+                # task metadata.
+                "available_capabilities": (task.metadata or {}).get("available_capabilities", ()),
+                "environment": getattr(task.workspace, "execution_backend", None)
+                if task.workspace
+                else None,
+                "dependencies": (task.metadata or {}).get("dependencies", ()),
+            },
         )
-        return selected
+        return SkillRetrieval(skills=tuple(selected), records=tuple(records))
 
-    async def _load_context_blocks(self, task: TaskSpec) -> list[_EntryT]:
+    async def _load_context_blocks(self, task: TaskSpec) -> list[_Entry]:
         store = self._c._context_block_store
         if store is None:
             return []
@@ -334,7 +386,7 @@ class ContextRetrieval:
             _logger.warning("attached context lookup failed: %s", exc)
             self._c._record_degradation("context_blocks", exc)
             return []
-        entries: list[_EntryT] = []
+        entries: list[_Entry] = []
         for block in blocks or ():
             content = block.bounded_content()
             text = (
@@ -345,7 +397,7 @@ class ContextRetrieval:
             source = source_for_context(block.scope, trust)
             rendered_text = render_instruction(text, source)
             entries.append(
-                _types()._Entry(
+                _Entry(
                     name=f"context_block:{block.id}:v{block.version}",
                     text=rendered_text,
                     tokens=estimate_tokens(rendered_text),
@@ -365,6 +417,8 @@ class ContextRetrieval:
     async def _load_capabilities(
         self, *, task: TaskSpec | None = None, require_tools: bool = False
     ) -> tuple[tuple[CapabilityDescriptor, ...], tuple[StrategyAffordance, ...], str]:
+        from athena.context.compiler import _strategy_affordance  # noqa: PLC0415
+
         reg = self._c._capability_registry
         if reg is None:
             return (), (), "degraded"
@@ -399,7 +453,7 @@ class ContextRetrieval:
                 return (
                     tuple(descriptors),
                     tuple(
-                        _mod()._strategy_affordance(descriptor, records.get(descriptor.id))
+                        _strategy_affordance(descriptor, records.get(descriptor.id))
                         for descriptor in descriptors
                     ),
                     discovery_state,
@@ -542,7 +596,7 @@ class ContextRetrieval:
         # shipping reflection alone — a bare affordance is not a way to look.
         primitives = [item for item in bundle if item.id != "capabilities"]
         if not primitives:
-            for capability_id in _mod()._DEFAULT_FALLBACK_BUNDLE:
+            for capability_id in _DEFAULT_FALLBACK_BUNDLE:
                 if capability_id in available:
                     descriptor = next(
                         (item for item in descriptors if item.id == capability_id),
@@ -560,9 +614,9 @@ class ContextRetrieval:
         self,
         task: TaskSpec,
         recent: Sequence[Any] | None,
-        static: "_StaticContextT",
-    ) -> list[_EntryT]:
-        out: list[_EntryT] = []
+        static: "_StaticContext",
+    ) -> list[_Entry]:
+        out: list[_Entry] = []
         out.extend(await self._load_context_digests(task))
         transcript = list(recent) if recent else await self._c._load_transcript(task)
         # ``!!`` direct escapes are durable audit records, but explicitly opt
@@ -584,10 +638,12 @@ class ContextRetrieval:
             out.append(_memory_entry(rec))
         for s in static.skills:
             out.append(_skill_entry(s))
+        for workflow in static.workflows:
+            out.append(_workflow_entry(workflow))
         out.extend(static.research)
         return out
 
-    async def _load_context_digests(self, task: TaskSpec) -> list[_EntryT]:
+    async def _load_context_digests(self, task: TaskSpec) -> list[_Entry]:
         store = self._c._context_digest_store
         if store is None or not task.session_id:
             return []
@@ -596,7 +652,7 @@ class ContextRetrieval:
         except Exception as exc:
             self._c._record_degradation("context_digest", exc, scope=task.session_id)
             return []
-        entries: list[_EntryT] = []
+        entries: list[_Entry] = []
         if digest is None:
             return entries
         fields = digest.normalized_fields()
@@ -613,7 +669,7 @@ class ContextRetrieval:
             f"{rendered}\nRecovery queries: " + ", ".join(digest.recovery_queries[:8])
         )[:8_000]
         entries.append(
-            _types()._Entry(
+            _Entry(
                 name=f"digest:{digest.id}",
                 text=text,
                 tokens=estimate_tokens(text),
@@ -632,7 +688,7 @@ class ContextRetrieval:
         )
         return entries
 
-    def _project_entries(self, workspace: str | None) -> list[_EntryT]:
+    def _project_entries(self, workspace: str | None) -> list[_Entry]:
         reader = self._c._workspace_reader
         if reader is None or not hasattr(reader, "list_agents_md"):
             return []

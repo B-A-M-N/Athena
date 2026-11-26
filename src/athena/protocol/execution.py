@@ -38,6 +38,9 @@ class ExecutionRequest:
     persistence: RuntimePersistence = RuntimePersistence.EPHEMERAL
     cwd: str | None = None
     env: Mapping[str, str] = field(default_factory=dict)
+    # Retained for wire compatibility only. ExecutionManager rejects this
+    # field because built-in persistent runtimes expose task-owned interactive
+    # stdin through a separate governed operation, not initial request input.
     stdin: bytes | None = None
     timeout: timedelta | None = None
     network_policy: NetworkPolicy | None = None
@@ -107,6 +110,7 @@ class Runtime(Protocol):
         env: Mapping[str, str] | None = None,
         workspace_root: str | None = None,
         network_policy: NetworkPolicy | str | None = None,
+        resource_limits: ExecutionLimits | None = None,
     ) -> str: ...
 
     def execute(
@@ -135,6 +139,7 @@ class ExecutionBackend(Protocol):
         env: Mapping[str, str] | None,
         workspace_root: str | None = None,
         network_policy: NetworkPolicy | str | None = None,
+        resource_limits: ExecutionLimits | None = None,
     ) -> str: ...
 
     def execute(self, request: ExecutionRequest) -> AsyncIterator[ExecutionEvent]: ...

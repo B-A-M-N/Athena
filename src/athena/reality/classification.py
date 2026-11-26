@@ -9,15 +9,9 @@ prevents operation names from becoming an authority mechanism.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
 from typing import Any
 
-
-class ExecutionDisposition(str, Enum):
-    DIRECT = "direct"
-    ISOLATED = "isolated"
-    TRANSACTIONAL = "transactional"
-    SPECULATIVE = "speculative"
+from athena.protocol.reality import ExecutionDisposition
 
 
 @dataclass(frozen=True)

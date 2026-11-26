@@ -47,7 +47,7 @@ while True:
         length = int(length_line.strip())
         payload = sys.stdin.read(length)
         msg = json.loads(payload)
-    except Exception:
+    except Exception:  # rationale: optional worker bootstrap probe fails closed
         sys.stdout.write(json.dumps({"type":"fatal","data":"bad stdin"})+"\n")
         sys.stdout.flush()
         break
@@ -97,6 +97,7 @@ class PythonRuntime(BaseRuntime):
         read_only_paths=(),
         toolchain_paths=(),
         writable_toolchain_paths=(),
+        resource_limits=None,
     ) -> "_PythonSession":
         sess = _PythonSession(
             env=env,
@@ -107,6 +108,7 @@ class PythonRuntime(BaseRuntime):
             read_only_paths=read_only_paths,
             toolchain_paths=toolchain_paths,
             writable_toolchain_paths=writable_toolchain_paths,
+            resource_limits=resource_limits,
         )
         sess.start()
         return sess
@@ -132,6 +134,7 @@ class _PythonSession:
         read_only_paths=(),
         toolchain_paths=(),
         writable_toolchain_paths=(),
+        resource_limits=None,
     ) -> None:
         self.env = env or {}
         self.cwd = cwd
@@ -141,6 +144,7 @@ class _PythonSession:
         self.read_only_paths = read_only_paths
         self.toolchain_paths = toolchain_paths
         self.writable_toolchain_paths = writable_toolchain_paths
+        self.resource_limits = resource_limits
         self.process: subprocess.Popen | None = None
         self.frames: queue.Queue = queue.Queue()
         self.lock = threading.Lock()
@@ -156,6 +160,7 @@ class _PythonSession:
             read_only_paths=self.read_only_paths,
             toolchain_paths=self.toolchain_paths,
             writable_toolchain_paths=self.writable_toolchain_paths,
+            resource_limits=self.resource_limits,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -189,7 +194,7 @@ class _PythonSession:
                         self.process.stdout.close()
                     if self.process.stderr:
                         self.process.stderr.close()
-                except Exception:
+                except Exception:  # rationale: closing a dead process stream is best effort
                     pass
                 self.process = None
 
@@ -230,7 +235,7 @@ class _PythonSession:
             process.stdin.write(f"{len(message)}\n")
             process.stdin.write(message)
             process.stdin.flush()
-        except Exception:
+        except Exception:  # rationale: worker I/O loss becomes an ExecutionEvent
             yield ExecutionEvent(
                 type=ExecutionEventType.STDERR,
                 execution_id=execution_id,

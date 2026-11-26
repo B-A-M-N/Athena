@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Mapping
 
-from athena.execution.async_call import run_blocking
+from athena.concurrency import ReferenceCountedKeyedLocks, run_blocking
 from athena.protocol.artifacts import ArtifactRef, parse_artifact_uri
 from athena.protocol.ids import new_id
 from athena.protocol.messages import Provenance, utcnow
@@ -45,9 +45,8 @@ class ArtifactStore:
         self._meta = self._root / META_DIR
         self._blobs.mkdir(parents=True, exist_ok=True)
         self._meta.mkdir(parents=True, exist_ok=True)
-        # Per-digest lock for sidecar metadata updates (race-prone without lock).
-        self._meta_locks: dict[str, asyncio.Lock] = {}
-        self._meta_locks_lock = asyncio.Lock()
+        # Per-digest locks exist only while a sidecar update is active.
+        self._meta_locks = ReferenceCountedKeyedLocks()
         self._io_slots = asyncio.Semaphore(8)
         self._budget_tracker = budget_tracker
 
@@ -59,12 +58,9 @@ class ArtifactStore:
         async with self._io_slots:
             return await run_blocking(function, *args, **kwargs)
 
-    async def _meta_lock(self, digest: str) -> asyncio.Lock:
-        """Get or create a per-digest lock for sidecar updates."""
-        async with self._meta_locks_lock:
-            if digest not in self._meta_locks:
-                self._meta_locks[digest] = asyncio.Lock()
-            return self._meta_locks[digest]
+    def _meta_lock(self, digest: str):
+        """Own a per-digest lock only for this sidecar update."""
+        return self._meta_locks.lock(digest)
 
     # -- writes -----------------------------------------------------------
 
@@ -184,8 +180,7 @@ class ArtifactStore:
         occurrence = _ref_to_meta(ref, include_provenance=True)
 
         # Lock on digest to serialize concurrent sidecar updates
-        lock = await self._meta_lock(ref.hash)
-        async with lock:
+        async with self._meta_lock(ref.hash):
             # Re-read inside lock to get latest state
             sidecar_exists = await self._io(sidecar.exists)
             previous = await self._io(_read_meta_sync, sidecar) if sidecar_exists else None
@@ -327,8 +322,7 @@ class ArtifactStore:
         removed = False
         sidecar = self._sidecar(ref)
         if sidecar is not None and await self._io(sidecar.exists):
-            lock = await self._meta_lock(digest)
-            async with lock:
+            async with self._meta_lock(digest):
                 removed = await self._io(_remove_occurrence_sync, sidecar, ref)
         return removed
 

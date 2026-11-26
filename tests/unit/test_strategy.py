@@ -97,7 +97,63 @@ def test_strategy_accepts_typed_affordance_records():
     assert guidance.affordances[0].proof == {"all_passed": True}
 
 
-def test_structured_tags_and_effects_can_select_a_route_without_keywords():
+def test_coding_mutation_defaults_to_fusion_when_speculative_surface_is_visible():
+    guidance = select_strategy(
+        "fix the parser bug in this repository",
+        ("fs", "execute", "fusion"),
+    )
+
+    assert guidance.route == "fusion"
+    assert guidance.route_kind == "fusion_shadow"
+    assert guidance.candidates[0] == "fusion"
+    assert guidance.decision == "act"
+    assert guidance.completion_mode == "observable_work_required"
+
+
+def test_simple_readme_edit_stays_direct_when_advanced_capabilities_are_visible():
+    guidance = select_strategy(
+        "fix a typo in README.md",
+        ("fs", "execute", "fusion", "synthesis"),
+    )
+
+    assert guidance.route == "direct"
+    assert guidance.work_requirement == "persistent_mutation"
+    assert "fusion" not in guidance.candidates[:1]
+
+
+def test_unrelated_research_inventory_does_not_change_a_direct_edit():
+    guidance = select_strategy(
+        "fix a typo in README.md",
+        ("fs", "execute", "research", "fusion", "synthesis", "workflow"),
+    )
+
+    assert guidance.route == "direct"
+
+
+def test_coding_mutation_does_not_invent_a_missing_fusion_capability():
+    guidance = select_strategy(
+        "fix the parser bug in this repository",
+        ("fs", "execute"),
+    )
+
+    assert guidance.route == "direct"
+    assert guidance.decision == "act"
+    assert "fusion" not in guidance.candidates
+
+
+def test_observation_work_does_not_get_the_mutation_fusion_override():
+    guidance = select_strategy(
+        "review the parser bug in this repository",
+        ("fs", "execute", "fusion"),
+    )
+
+    # Fusion may win from evidence, but it must not be the deterministic
+    # mutation-specific override when the turn intent is not a mutation.
+    assert guidance.turn_intent != "mutation"
+    assert guidance.completion_mode == "observable_work_required"
+
+
+def test_structured_tags_and_effects_do_not_override_task_requirements():
     guidance = select_strategy(
         "perform the bounded operation",
         (
@@ -111,8 +167,8 @@ def test_structured_tags_and_effects_can_select_a_route_without_keywords():
         ),
     )
 
-    assert guidance.route == "fusion"
-    assert guidance.route_kind == "fusion_shadow"
+    assert guidance.route == "direct"
+    assert guidance.work_requirement == "direct_execution"
 
 
 # ---------------------------------------------------------------------- #
@@ -163,3 +219,25 @@ def test_continuations_inherit_evidence_obligation():
     ):
         guidance = select_strategy(prompt, ("fs", "git", "execute"))
         assert guidance.completion_mode == "observable_work_required", prompt
+
+
+def test_strategy_selection_record_is_tied_to_baseline_and_acceptance():
+    from athena.protocol.tasks import Criterion, TaskSpec, WorkspaceSpec
+    from athena.strategy import build_strategy_selection_record
+
+    guidance = select_strategy("run a shadow experiment", ("fusion", "execute"))
+    task = TaskSpec(
+        id="task-strategy-record",
+        objective="run a shadow experiment",
+        workspace=WorkspaceSpec(id="repo", root="/tmp/repo", revision="rev-1"),
+        acceptance_criteria=(Criterion(id="proof", description="candidate passes"),),
+    )
+    record = build_strategy_selection_record(guidance, task=task)
+    payload = record.to_record()
+    assert payload["selected_route"] == guidance.route
+    assert payload["selected_by"] == "deterministic_advisory_strategy"
+    assert payload["viable_alternatives"]
+    assert payload["workspace_baseline"]["workspace_id"] == "repo"
+    assert payload["workspace_baseline"]["workspace_revision"] == "rev-1"
+    assert payload["acceptance_criteria"] == ["proof:True"]
+    assert "work_requirement:" in " ".join(payload["evidence"])

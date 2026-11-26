@@ -4,8 +4,16 @@ name: CI
 on:  # yamllint disable-line rule:truthy
   pull_request:
   push:
-    branches: [main]
+    # Candidate release qualification branches are listed here so pushing to
+    # them triggers the certification chain (see core-release-certification
+    # below); every privileged job keeps its push-to-main/tag-only guard.
+    branches: [main, candidate/next-release, fix/pr6-safe-main-integration]
     tags: ["v*", "[0-9]+.[0-9]+.[0-9]+"]
+  # Candidate release qualification: the certification chain can be exercised
+  # against any branch before merging to main. Dispatched runs are
+  # nonpublishing by construction - every privileged job below keeps its
+  # push-to-main/tag gate, so signing and publication stay unreachable.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -73,16 +81,158 @@ jobs:
         run: |
           make check
 
+      - name: Run Python formatting and critical static gates
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          make format-check static-critical
+
+  full-python-3-12:
+    # The complete suite must run on the same GLIBC baseline as the release
+    # artifacts; sandboxed-execution and native seam tests are part of it.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@bc540ba06a4ccee415bb241490e0b25ee8e7d315 # 1.85.0
+      - name: Install uv
+        run: python -m pip install uv==0.11.21
+      - name: Install workspace sandbox and native-link dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap libx11-dev libxft-dev libgl1-mesa-dev
+      - name: Prepare Bubblewrap sandbox
+        run: |
+          set -euo pipefail
+
+          # Bubblewrap needs unprivileged user namespaces.
+          current_userns="$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)"
+          if [ -n "$current_userns" ] && [ "$current_userns" != "1" ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+
+          # Ubuntu 24.04+ AppArmor otherwise blocks Bubblewrap's network setup.
+          current_apparmor="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)"
+          if [ -n "$current_apparmor" ] && [ "$current_apparmor" != "0" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+          command -v bwrap
+          bwrap --version
+          bwrap \
+            --die-with-parent \
+            --new-session \
+            --unshare-pid \
+            --unshare-net \
+            --proc /proc \
+            --dev /dev \
+            --ro-bind /usr /usr \
+            --ro-bind /bin /bin \
+            --ro-bind /lib /lib \
+            --ro-bind /lib64 /lib64 \
+            /usr/bin/true
+      - name: Bootstrap locked Rust dependencies
+        run: cargo fetch --manifest-path native/Cargo.toml --locked
+      - name: Provision pinned cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.6.4
+      - name: Bootstrap pinned release toolchain
+        # The release-script tests execute the same provisioned-toolchain
+        # contract release-check satisfies on a developer checkout.
+        run: |
+          set -euo pipefail
+          mkdir -p .release-toolchain/bin
+          cp "$(command -v cosign)" .release-toolchain/bin/cosign
+          .release-toolchain/bin/cosign version
+          scripts/bootstrap-cargo-deny
+      - name: Build native binary for projection tests
+        run: cargo build --manifest-path native/Cargo.toml --locked --offline
+      - name: Run the complete Python suite on Python 3.12
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          uv run --frozen --extra dev --extra anthropic --extra mcp python -m pytest -q
+
+  critical-contracts:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install uv
+        run: python -m pip install uv==0.11.21
+      - name: Install workspace sandbox dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+      - name: Run critical correctness contracts
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          make critical-contracts
+
+  native:
+    # Build the native companion on the same GLIBC-compatible baseline as the
+    # release artifact policy.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@bc540ba06a4ccee415bb241490e0b25ee8e7d315 # 1.85.0
+        with:
+          components: rustfmt, clippy
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap libfontconfig1-dev libgl1-mesa-dev libx11-dev libxft-dev libxrender-dev
+      - name: Install uv
+        run: python3 -m pip install uv==0.11.21
+      - name: Bootstrap locked Rust dependencies
+        run: cargo fetch --manifest-path native/Cargo.toml --locked
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path native/Cargo.toml -- --check
+      - name: Run Rust Clippy
+        run: cargo clippy --manifest-path native/Cargo.toml --all-targets --locked --offline -- -D warnings
+      - name: Build native production binary
+        run: cargo build --manifest-path native/Cargo.toml --locked --offline
+      - name: Test native crate
+        run: cargo test --manifest-path native/Cargo.toml --locked --offline
+      - name: Test Python to Rust projection seam
+        env:
+          ATHENA_NATIVE_BINARY: native/target/debug/athena-terminal
+        run: uv run --extra dev pytest -q tests/e2e/test_native_projection_bridge.py
+
   # This lane is intentionally protected: it needs a real X11/WM environment
   # for the desktop acceptance suite. Hermes is an optional integration and
-  # is certified by a separate job below. Python 3.12 is the beta certification
-  # interpreter; Python 3.13 remains compatibility-tested by ordinary CI until
-  # a protected release lane is added for it.
+  # is certified by a separate job below. Python 3.12 also runs the complete
+  # suite on every PR; 3.13 remains the default ordinary CI interpreter.
   core-release-certification:
+    # workflow_dispatch runs the identical certification chain against a
+    # candidate branch (defer-signing, no publishing); push runs remain the
+    # authoritative post-merge qualification.  Pushes to the candidate
+    # integration branch also certify pre-merge when dispatch rights are not
+    # available to the automation identity.  This is a nonpublishing
+    # qualification path: every privileged job below keeps its push-to-main/
+    # tag gate, so signing and publication stay unreachable from a candidate.
     if: >-
-      github.event_name == 'push' &&
+      (github.event_name == 'workflow_dispatch') ||
+      (github.event_name == 'push' &&
       (github.ref == 'refs/heads/main' ||
-      startsWith(github.ref, 'refs/tags/'))
+      startsWith(github.ref, 'refs/tags/') ||
+      github.ref == 'refs/heads/candidate/next-release' ||
+      github.ref == 'refs/heads/fix/pr6-safe-main-integration'))
     # Keep release builds on the GLIBC-compatible baseline used by the native
     # artifact policy; Ubuntu 24.04 emits newer imported symbols.
     runs-on: ubuntu-22.04
@@ -155,6 +305,11 @@ jobs:
       - name: Run protected release checks
         env:
           PYTHONUNBUFFERED: "1"
+          # The certification desktop session is Xvfb + Openbox, i.e. a real
+          # X11 session; xvfb-run does not set XDG_SESSION_TYPE itself, and
+          # the native support-matrix cell (linux-x86_64-x11-openbox) is
+          # derived from this value in the desktop-acceptance receipt.
+          XDG_SESSION_TYPE: "x11"
           ATHENA_COSIGN: cosign
           COSIGN_CERTIFICATE_IDENTITY: https://github.com/${{ github.workflow_ref }}
           COSIGN_CERTIFICATE_OIDC_ISSUER: https://token.actions.githubusercontent.com
@@ -170,6 +325,43 @@ jobs:
                 --defer-signing \
                 --evidence-dir "$RUNNER_TEMP/athena-release-evidence"
             '
+      - name: Capture visual-golden candidates and per-fixture RMSE (owner evidence, nonpublishing)
+        if: always()
+        # Evidence-only companion to verify mode.  Captures the 45 mandatory
+        # fixtures plus the physical cabinet from THIS candidate commit into
+        # RUNNER_TEMP (never the checked-in golden assets), then compares each
+        # capture against the committed approved goldens and prints the full
+        # per-fixture RMSE table.  Nothing is approved or regenerated in the
+        # repository; golden review status stays an owner decision.
+        continue-on-error: true
+        env:
+          NATIVE_VISUAL_UPDATE_GOLDENS: "1"
+          NATIVE_VISUAL_GOLDEN_DIR: "${{ runner.temp }}/athena-visual-candidates"
+          NATIVE_CABINET_UPDATE_GOLDEN: "1"
+          NATIVE_CABINET_GOLDEN: "${{ runner.temp }}/athena-visual-candidates/cabinet-golden.png"
+        run: |
+          set -euo pipefail
+          candidate_dir="${RUNNER_TEMP}/athena-visual-candidates"
+          rm -rf "$candidate_dir"
+          mkdir -p "$candidate_dir"
+          cp native/assets/oi/visual-goldens/manifest.json "$candidate_dir/manifest.json"
+          xvfb-run -a -s '-screen 0 1920x1080x24 -ac' \
+            bash -ceu '
+              openbox --replace >/tmp/athena-openbox-capture.log 2>&1 &
+              wm_pid=$!
+              trap "kill $wm_pid 2>/dev/null || true" EXIT
+              sleep 1
+              scripts/native-visual-smoke || true
+            '
+          GOLDEN_DIR="${RUNNER_TEMP}/athena-visual-candidates" \
+            python3 scripts/compare-visual-goldens.py
+
+      - name: Upload candidate visual-capture evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: athena-visual-candidates-${{ github.sha }}
+          path: ${{ runner.temp }}/athena-visual-candidates
       - name: Upload certified release artifacts and evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

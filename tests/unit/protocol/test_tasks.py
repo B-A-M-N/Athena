@@ -154,6 +154,14 @@ def test_capability_policy_coverage_handles_unrestricted_and_deny_rules():
     )
 
 
+def test_cancelled_positive_rules_are_empty_authority_for_coverage():
+    cancelled = CapabilityPolicy(ask=("files.read",), deny=("files.read",))
+    denied_universe = CapabilityPolicy(deny=("files.read",))
+
+    assert capability_policy_covers(cancelled, cancelled)
+    assert not capability_policy_covers(cancelled, denied_universe)
+
+
 def test_resource_budget_ceiling_keeps_unbounded_dimensions_explicit():
     ceiling = intersect_resource_budgets({}, {"max_children": 2})
     assert isinstance(ceiling, ResourceBudgetCeiling)

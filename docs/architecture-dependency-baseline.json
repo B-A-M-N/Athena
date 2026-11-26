@@ -1,0 +1,5 @@
+{
+  "schema": 1,
+  "policy": "absolute ratchet: any package dependency cycle is a regression; the committed cycle baseline must remain empty",
+  "cycles": []
+}

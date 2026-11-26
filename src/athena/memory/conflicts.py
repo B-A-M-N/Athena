@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import enum
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from athena.protocol.memory import MemoryKind, MemoryRecord, MemoryScope
 from athena.protocol.messages import TrustClass
@@ -85,13 +86,19 @@ class MemoryConflictResolver:
     until explicitly promoted.
     """
 
-    def __init__(self, store: "MemoryStore") -> None:
-        self._store = store
+    def __init__(
+        self,
+        store: "MemoryStore | Callable[[MemoryKind], Awaitable[list[MemoryRecord]]]",
+    ) -> None:
+        self._list_by_kind = cast(
+            Callable[[MemoryKind], Awaitable[list[MemoryRecord]]],
+            getattr(store, "list_by_kind", store),
+        )
 
     async def detect_conflict(self, record: MemoryRecord) -> ConflictReport:
         if record.kind is not MemoryKind.SEMANTIC:
             return ConflictReport(record=record)
-        existing = await self._store.list_by_kind(MemoryKind.SEMANTIC)
+        existing = await self._list_by_kind(MemoryKind.SEMANTIC)
         scope_id = _scope_id(record)
         new_key = _signature(record)
         conflicts: list[MemoryRecord] = []
@@ -128,11 +135,3 @@ class MemoryConflictResolver:
         if equal:
             return ConflictResult(ConflictResolution.FLAG, report, superseded=tuple(equal))
         return ConflictResult(ConflictResolution.SUPERSEDE, report, superseded=tuple(lower))
-
-
-__all__ = [
-    "MemoryConflictResolver",
-    "ConflictReport",
-    "ConflictResult",
-    "ConflictResolution",
-]

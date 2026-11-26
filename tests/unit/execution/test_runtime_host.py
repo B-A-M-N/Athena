@@ -80,3 +80,52 @@ async def test_local_runtime_host_executes_and_reattaches(tmp_path):
     )
     await second.shutdown()
     await first.supervisor.stop()
+
+
+async def test_local_runtime_host_rejects_cross_task_execution_and_reattach(tmp_path):
+    tmp_path.chmod(0o755)
+    backend = SupervisedLocalBackend(LocalRuntimeSupervisor(str(tmp_path / "host")))
+    try:
+        session_id = await backend.create_session(
+            task_id="owner",
+            runtime="python",
+            workspace_root=str(tmp_path),
+        )
+    except (OSError, RuntimeError) as exc:
+        if getattr(exc, "errno", None) == errno.EPERM or "Operation not permitted" in str(exc):
+            await backend.supervisor.stop()
+            pytest.skip("managed sandbox disallows detached Unix-socket hosts")
+        raise
+
+    with pytest.raises(RuntimeError, match="belongs to task owner"):
+        await _run(
+            backend,
+            ExecutionRequest(
+                runtime="python",
+                source="print('must not run')",
+                task_id="different-task",
+                workspace_id="root",
+                runtime_session_id=session_id,
+                workspace_root=str(tmp_path),
+                metadata={"__execution_id": "cross-task"},
+            ),
+        )
+
+    identity = dict(await backend.describe_session(session_id))
+    with pytest.raises(RuntimeError, match="runtime task ownership proof failed"):
+        await backend.reattach_session(
+            {
+                "id": session_id,
+                "task_id": "different-task",
+                "runtime": "python",
+                "start_identity": identity["start_identity"],
+                "process_identity": identity["process_identity"],
+                "workspace_identity": identity["workspace_identity"],
+                "metadata": {
+                    "host_socket": identity["host_socket"],
+                    "host_token_fingerprint": identity["host_token_fingerprint"],
+                },
+            }
+        )
+    await backend.shutdown()
+    await backend.supervisor.stop()

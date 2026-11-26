@@ -59,14 +59,48 @@ class KnowledgePipeline:
 
     async def __call__(self, task: Any, result: Any) -> None:
         status = getattr(result.status, "value", result.status)
-        if str(status) not in ("COMPLETE", "PARTIAL"):
-            # Failed/cancelled work is not knowledge-worthy.
+        status = str(status)
+        if status not in ("COMPLETE", "PARTIAL", "FAILED", "CANCELLED"):
             return
         objective = str(getattr(task, "objective", "") or "").strip()
         if objective and _is_ephemeral_objective(objective):
             return
         transcript = _task_transcript(task, await self._transcript(task))
         successful_calls = _successful_ordinary_calls(transcript)
+        selected_skills, selection_records = await self._selected_skill_versions(task)
+        if selection_records and self._skills is not None:
+            recorder = getattr(self._skills, "record_selection_evidence", None)
+            if callable(recorder):
+                try:
+                    await recorder(selection_records, task_id=getattr(task, "id", ""))
+                except Exception as exc:
+                    _logger.warning("skill selection evidence recording failed: %s", exc)
+        used_skills = await self._used_skill_versions(task, selected_skills)
+        if selected_skills and not used_skills:
+            selected_skills = ()
+        if selected_skills:
+            await self._record_skill_outcomes(
+                task,
+                result,
+                selected_skills,
+                passed=status == "COMPLETE",
+                selection_records=selection_records,
+            )
+        if (
+            status == "FAILED"
+            and selected_skills
+            and _skill_learning_eligible(task, transcript, successful_calls)
+        ):
+            # A failed reuse is refinement evidence, not a reason to replace
+            # the active skill. The candidate lifecycle validates/preserves
+            # the exact source revision until explicit promotion.
+            await self._propose_skill(
+                task,
+                result,
+                transcript=transcript,
+                target_skill_versions=selected_skills,
+            )
+            return
         # A completed turn is not automatically a learning event. Greetings,
         # thanks, and ordinary conversational questions remain ephemeral; the
         # specialized candidate gates still decide whether evidence is strong
@@ -119,7 +153,7 @@ class KnowledgePipeline:
                 for step in steps
             ):
                 return
-            from athena.affordances.models import AffordanceScope
+            from athena.protocol.affordances import AffordanceScope
             from athena.workflows.models import Workflow
 
             signature = _trace_signature(steps)
@@ -230,6 +264,128 @@ class KnowledgePipeline:
         except Exception as exc:
             _logger.warning("knowledge pipeline transcript load failed: %s", exc)
             return []
+
+    async def _selected_skill_versions(
+        self, task: Any
+    ) -> tuple[tuple[tuple[str, int], ...], list[dict[str, Any]]]:
+        """Recover exact skill revisions and deterministic selection records."""
+        if self._events is None or not getattr(task, "id", None):
+            return (), []
+        try:
+            events = await self._events.list_for_task(task.id)
+        except Exception as exc:
+            _logger.warning("skill selection evidence lookup failed: %s", exc)
+            return (), []
+        selected: list[tuple[str, int]] = []
+        records: list[dict[str, Any]] = []
+        seen: set[tuple[str, int]] = set()
+        seen_records: set[tuple[Any, ...]] = set()
+        for event in events:
+            if getattr(event, "type", None) != "SkillContextSelected":
+                continue
+            payload = getattr(event, "payload", {}) or {}
+            for item in payload.get("selection_records", ()):
+                if not isinstance(item, Mapping) or not item.get("skill_id"):
+                    continue
+                record = dict(item)
+                identity = (
+                    record.get("skill_id"),
+                    record.get("version"),
+                    record.get("task_class"),
+                    record.get("environment_fingerprint"),
+                    record.get("selected"),
+                    record.get("reason"),
+                )
+                if identity not in seen_records:
+                    seen_records.add(identity)
+                    records.append(record)
+            for item in payload.get("skills", ()):
+                if not isinstance(item, Mapping) or not item.get("skill_id"):
+                    continue
+                try:
+                    ref = (str(item["skill_id"]), int(item.get("version") or 1))
+                except (TypeError, ValueError):
+                    continue
+                if ref not in seen:
+                    seen.add(ref)
+                    selected.append(ref)
+        return tuple(selected), records
+
+    async def _used_skill_versions(
+        self, task: Any, selected: tuple[tuple[str, int], ...]
+    ) -> tuple[tuple[str, int], ...]:
+        if not selected or self._events is None:
+            return ()
+        selected_ids = {skill_id for skill_id, _ in selected}
+        try:
+            events = await self._events.list_for_task(getattr(task, "id", ""))
+        except Exception as exc:
+            _logger.warning("skill usage evidence lookup failed: %s", exc)
+            return ()
+        used: set[tuple[str, int]] = set()
+        for event in events:
+            if getattr(event, "type", None) != "SkillApplied":
+                continue
+            payload = getattr(event, "payload", {}) or {}
+            skill_id = str(payload.get("skill_id") or "")
+            if skill_id not in selected_ids:
+                continue
+            try:
+                version = int(payload.get("version") or 0)
+            except (TypeError, ValueError):
+                continue
+            if (skill_id, version) in selected:
+                used.add((skill_id, version))
+        return tuple(item for item in selected if item in used)
+
+    async def _record_skill_outcomes(
+        self,
+        task: Any,
+        result: Any,
+        selected: tuple[tuple[str, int], ...],
+        *,
+        passed: bool,
+        selection_records: list[dict[str, Any]] | None = None,
+    ) -> None:
+        if self._skills is None:
+            return
+        status = str(
+            getattr(getattr(result, "status", None), "value", getattr(result, "status", ""))
+        )
+        failure: dict[str, Any] = {
+            "status": status,
+            "summary": str(getattr(result, "summary", "") or "")[:1000],
+            "unresolved": [str(item) for item in (getattr(result, "unresolved", ()) or ())[:8]],
+        }
+        if status == "COMPLETE" or hasattr(result, "verification_receipts"):
+            failure["verified"] = status == "COMPLETE"
+        for skill_id, version in selected:
+            try:
+                record = next(
+                    (
+                        item
+                        for item in (selection_records or [])
+                        if str(item.get("skill_id")) == skill_id
+                        and int(item.get("version") or 1) == version
+                    ),
+                    None,
+                )
+                outcome_kwargs: dict[str, Any] = {}
+                if record is not None:
+                    outcome_kwargs["task_class"] = str(record.get("task_class") or "general")
+                    outcome_kwargs["environment_fingerprint"] = str(
+                        record.get("environment_fingerprint") or ""
+                    )
+                await self._skills.record_outcome(
+                    skill_id,
+                    version=version,
+                    passed=passed,
+                    task_id=getattr(task, "id", None),
+                    failure=({**failure} if not passed else {"status": status, "verified": True}),
+                    **outcome_kwargs,
+                )
+            except Exception as exc:
+                _logger.warning("skill outcome recording failed for %s: %s", skill_id, exc)
 
     async def _ingest_memory(
         self, task: Any, result: Any, *, transcript: list[Any] | None = None
@@ -387,16 +543,33 @@ class KnowledgePipeline:
             _logger.warning("scheduled job memory ingestion failed: %s", exc)
 
     async def _propose_skill(
-        self, task: Any, result: Any, *, transcript: list[Any] | None = None
+        self,
+        task: Any,
+        result: Any,
+        *,
+        transcript: list[Any] | None = None,
+        target_skill_versions: tuple[tuple[str, int], ...] = (),
     ) -> None:
         if self._skills is None:
             return
         try:
             from athena.skills.candidates import candidates_from_task
 
-            drafts = await candidates_from_task(
-                task, transcript if transcript is not None else await self._transcript(task), result
-            )
+            transcript = transcript if transcript is not None else await self._transcript(task)
+            targets = []
+            if target_skill_versions:
+                for skill_id, version in target_skill_versions:
+                    skill = await self._skills.get(skill_id)
+                    if skill is not None and skill.version == version:
+                        targets.append(skill)
+            if targets:
+                drafts = []
+                for target in targets:
+                    drafts.extend(
+                        await candidates_from_task(task, transcript, result, target_skill=target)
+                    )
+            else:
+                drafts = await candidates_from_task(task, transcript, result)
         except Exception as exc:
             _logger.warning("skill proposal failed: %s", exc)
             return
@@ -432,7 +605,7 @@ class KnowledgePipeline:
         if self._workflows is None or not getattr(task, "id", None):
             return
         try:
-            from athena.affordances.models import AffordanceScope
+            from athena.protocol.affordances import AffordanceScope
             from athena.protocol.messages import CapabilityCallBlock, CapabilityResultBlock
             from athena.workflows.models import Workflow, WorkflowStep
 

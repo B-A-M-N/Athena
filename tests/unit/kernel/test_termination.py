@@ -116,6 +116,65 @@ async def test_required_research_evidence_needs_a_ready_bundle_receipt():
     assert ready.status is TaskStatus.COMPLETE
 
 
+@pytest.mark.parametrize(
+    ("results", "expected"),
+    [
+        ([], ("first", "second")),
+        ([True], ("first", "second")),
+        ([True, True, True], ("first", "second")),
+        ([True, "true"], ("second",)),
+    ],
+)
+async def test_verifier_results_must_match_required_criteria_exactly(results, expected):
+    class Verifier:
+        async def verify(self, task, criteria):
+            return results
+
+    task = TaskSpec(
+        id="criteria-cardinality",
+        objective="verify the result",
+        acceptance_criteria=(
+            Criterion(id="first", description="first criterion"),
+            Criterion(id="second", description="second criterion"),
+        ),
+    )
+    evaluator = TerminationEvaluator(acceptance_verifier=Verifier())
+
+    decision = await evaluator.evaluate(
+        task,
+        _response([TextBlock(type="text", text="done")]),
+        iterations=1,
+    )
+
+    assert decision.status is TaskStatus.PARTIAL
+    assert decision.unresolved == expected
+
+
+async def test_verifier_exception_leaves_every_required_criterion_unresolved():
+    class Verifier:
+        async def verify(self, task, criteria):
+            raise RuntimeError("verifier unavailable")
+
+    task = TaskSpec(
+        id="criteria-exception",
+        objective="verify the result",
+        acceptance_criteria=(
+            Criterion(id="first", description="first criterion"),
+            Criterion(id="second", description="second criterion"),
+        ),
+    )
+    evaluator = TerminationEvaluator(acceptance_verifier=Verifier())
+
+    decision = await evaluator.evaluate(
+        task,
+        _response([TextBlock(type="text", text="done")]),
+        iterations=1,
+    )
+
+    assert decision.status is TaskStatus.PARTIAL
+    assert decision.unresolved == ("first", "second")
+
+
 async def test_reality_coordinator_owns_speculative_candidate_proof():
     class _CountingVerifier:
         calls = 0

@@ -6,6 +6,8 @@ import pytest
 
 from athena.protocol.tasks import TaskStatus
 from athena.service.service import AthenaService
+from athena.service.interaction import OperatorInteractionService
+from athena.service.recovery import RecoveryCoordinator
 
 
 _METADATA = {
@@ -108,6 +110,8 @@ def _service(
     kernel_error: BaseException | None = None,
 ) -> AthenaService:
     service = AthenaService.__new__(AthenaService)
+    service._interaction = OperatorInteractionService(service)
+    service._recovery = RecoveryCoordinator(service)
     service._store_approvals = approvals
     service._store_continuations = continuations
     service._store_tasks = _Tasks()

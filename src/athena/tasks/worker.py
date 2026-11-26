@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from athena.protocol.errors import PersistenceError, RequestCancelled, TaskOwnershipLost
+from athena.protocol.failure import FailureInfo, failure_from_exception
 from athena.protocol.tasks import TERMINAL_STATUSES, TaskResult, TaskStatus
 
 __all__ = [
@@ -257,12 +258,21 @@ class TaskWorker:
         except RequestCancelled as exc:
             if self._ownership_lost.get(task_id):
                 return _ownership_lost_result(task_id, exc)
-            return await self._mark_failed(task_id, TaskStatus.CANCELLED, f"task cancelled: {exc}")
+            return await self._mark_failed(
+                task_id,
+                TaskStatus.CANCELLED,
+                f"task cancelled: {exc}",
+                failure=failure_from_exception(exc),
+            )
         except Exception as exc:  # noqa: BLE001 - classify every kernel failure truthfully
             if self._ownership_lost.get(task_id):
                 return _ownership_lost_result(task_id, exc)
+            failure = failure_from_exception(exc)
             return await self._mark_failed(
-                task_id, TaskStatus.FAILED, f"worker kernel failure: {exc}"
+                task_id,
+                TaskStatus.FAILED,
+                failure.message,
+                failure=failure,
             )
         finally:
             self._ownership_lost.pop(task_id, None)
@@ -336,13 +346,21 @@ class TaskWorker:
                 driver.cancel()
             return
 
-    async def _mark_failed(self, task_id: str, status: TaskStatus, reason: str) -> TaskResult:
+    async def _mark_failed(
+        self,
+        task_id: str,
+        status: TaskStatus,
+        reason: str,
+        *,
+        failure: FailureInfo | None = None,
+    ) -> TaskResult:
         try:
             return await self._tasks.finalize(
                 task_id,
                 status=status,
                 reason=reason,
                 summary=reason,
+                failure=failure,
             )
         except Exception as exc:
             self._record_store_error("finalization", exc)

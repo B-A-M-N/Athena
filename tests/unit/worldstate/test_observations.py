@@ -7,6 +7,7 @@ import pytest
 from athena.protocol.events import make_event
 from athena.protocol.tasks import WorkspaceSpec
 from athena.service.service import AthenaService
+from athena.service.watch_ports import WatchPorts
 from athena.worldstate import ClaimRegistry
 from athena.worldstate import TaskWorldState
 
@@ -67,11 +68,16 @@ async def test_watch_change_invalidates_overlapping_claims():
         task_id="maintenance-task",
         depends_on_paths=("config/",),
     )
-    service = SimpleNamespace(
-        _default_workspace=WorkspaceSpec(id="repo", root="/workspace"),
-        _world_states={"maintenance-task": SimpleNamespace(claims=claims)},
-        _world_state_store=None,
-    )
+
+    class _WatchAPIHost:
+        pass
+
+    service = _WatchAPIHost()
+    service._default_workspace = WorkspaceSpec(id="repo", root="/workspace")
+    service._watch_ports = WatchPorts(service)
+    service._world_states = {"maintenance-task": SimpleNamespace(claims=claims)}
+    service._world_state_store = None
+    service._project_index_coordinator = None
 
     await AthenaService._invalidate_watch_claims(
         service,

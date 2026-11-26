@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from athena.protocol.tasks import Criterion, TaskSpec, VerificationSpec, VerificationType
@@ -37,6 +37,8 @@ class VerificationPlan:
     impacted_resources: tuple[str, ...] = ()
     impacted_tests: tuple[str, ...] = ()
     invariants: tuple[str, ...] = ()
+    evidence_categories: tuple[str, ...] = ()
+    criterion_categories: Mapping[str, str] = field(default_factory=dict)
     required_strength: str = "standard"
     rationale: tuple[str, ...] = ()
     index_revision: str | None = None
@@ -168,6 +170,7 @@ class VerificationPlanner:
         )
         plan_payload = {
             "commands": [command for _category, command in selected],
+            "categories": sorted({category for category, _command in selected}),
             "resources": resources,
             "invariants": invariant_values,
             "strength": required_strength,
@@ -181,12 +184,17 @@ class VerificationPlanner:
         )
         return VerificationPlan(
             criteria=criteria,
+            criterion_categories={
+                f"project_default:{index}": category
+                for index, (category, _command) in enumerate(selected, start=1)
+            },
             source="project_profile_command_catalog",
             skipped_commands=tuple(skipped),
             plan_id=plan_id,
             impacted_resources=resources,
             impacted_tests=impacted_tests,
             invariants=invariant_values,
+            evidence_categories=tuple(sorted({category for category, _command in selected})),
             required_strength=required_strength,
             rationale=tuple(rationale),
             index_revision=index_revision,

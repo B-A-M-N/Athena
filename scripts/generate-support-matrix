@@ -122,7 +122,11 @@ def main(argv: list[str] | None = None) -> int:
     }
     actual_platform = _platform_cell()
     native_platform = _native_platform_cell(actual_platform)
-    python_lane_output = str(lanes.get("python-version", {}).get("output") or "")
+    # release-check records lanes via _evidence_record, which strips the raw
+    # "output" key and keeps only the final "output_tail"; honor the actual
+    # receipt shape (the python-version lane output is tiny and always fits).
+    python_lane = lanes.get("python-version", {})
+    python_lane_output = str(python_lane.get("output") or python_lane.get("output_tail") or "")
     python_match = re.search(r"Python\s+(\d+\.\d+)(?:\.\d+)?", python_lane_output)
     exercised_python_versions = [python_match.group(1)] if python_match else []
     surfaces: dict[str, dict[str, object]] = {}

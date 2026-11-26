@@ -23,23 +23,22 @@ import tempfile
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
+from athena.execution.process_tree import (
+    kill_tree,
+    kill_tree_async,
+    sandbox_argv,
+    spawn_owned,
+)
 from athena.protocol.resources import TaskResourceCloseResult
 from athena.synthesis.runtime import GeneratedToolHost, PersistentGeneratedSession
 
 if TYPE_CHECKING:
-    from athena.synthesis.engine import SyntheticCapability as SyntheticCapabilityT
+    from athena.synthesis.models import SyntheticCapability as SyntheticCapabilityT
     from athena.synthesis.engine import SynthesisEngine
 
 _logger = logging.getLogger(__name__)
 
 __all__ = ["ChildRuntime", "_namespace_python_paths"]
-
-
-def _mod():
-    # Patch seams: tests patch ``athena.synthesis.engine.<name>``.
-    from athena.synthesis import engine
-
-    return engine
 
 
 class ChildRuntime:
@@ -87,7 +86,7 @@ class ChildRuntime:
         network = "allow" if {"NETWORK_READ", "NETWORK_WRITE"} & values else "deny"
         proc = None
         try:
-            proc = _mod().spawn_owned(
+            proc = spawn_owned(
                 [sys.executable, "-c", child],
                 env=self._e._child_env(python_paths),
                 sandbox_root=root,
@@ -101,7 +100,7 @@ class ChildRuntime:
             try:
                 stdout, stderr = proc.communicate(input=payload, timeout=timeout)
             except subprocess.TimeoutExpired:
-                _mod().kill_tree(proc)
+                kill_tree(proc)
                 stdout, stderr = proc.communicate()
                 return stdout, stderr or "synthetic execution timed out", 124
             return stdout, stderr, proc.returncode
@@ -135,15 +134,15 @@ class ChildRuntime:
         network = "allow" if {"NETWORK_READ", "NETWORK_WRITE"} & values else "deny"
         proc = None
         try:
-            argv = _mod().sandbox_argv(
+            argv = sandbox_argv(
                 [sys.executable, "-c", child],
                 root=root,
                 network_policy=network,
                 writable=writable,
             )
-            proc = await asyncio.create_subprocess_exec(  # architecture-lint: allow subprocess-outside-approved-backends reason=generated validation worker
+            proc = await asyncio.create_subprocess_exec(  # architecture-lint: allow subprocess-outside-approved-backends reason=generated validation worker; architecture-exception: synthesis-validation-worker
                 *argv,
-                env=self._e._child_env(_mod()._namespace_python_paths(python_paths, root)),
+                env=self._e._child_env(_namespace_python_paths(python_paths, root)),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -162,9 +161,21 @@ class ChildRuntime:
                             "error": "generated host is unavailable in this context",
                         }
                     )
+                    # write/readline/read_all avoids a rare pipe/register
+                    # race in ``communicate()`` observed on constrained
+                    # hosts where an exited child can leave the write-end
+                    # registered and block EOF delivery until timeout.
+                    assert proc.stdin is not None
+                    assert proc.stdout is not None
+                    assert proc.stderr is not None
+                    proc.stdin.write((payload + "\n" + unavailable + "\n").encode())
+                    await proc.stdin.drain()
+                    proc.stdin.close()
+                    stdout_task = asyncio.create_task(proc.stdout.read())
+                    stderr_task = asyncio.create_task(proc.stderr.read())
                     stdout, stderr = await asyncio.wait_for(
-                        proc.communicate((payload + "\n" + unavailable + "\n").encode()),
-                        timeout=timeout,
+                        asyncio.gather(stdout_task, stderr_task),
+                        timeout,
                     )
                 else:
                     stdout, stderr = await asyncio.wait_for(
@@ -172,21 +183,26 @@ class ChildRuntime:
                         timeout=timeout,
                     )
             except TimeoutError:
-                await _mod().kill_tree_async(proc)
+                await kill_tree_async(proc)
                 stdout, stderr = await proc.communicate()
                 return (
                     stdout.decode("utf-8", errors="replace"),
                     stderr.decode("utf-8", errors="replace") or "synthetic execution timed out",
                     124,
                 )
+            decoded = stdout.decode("utf-8", errors="replace")
+            if decoded.startswith("__RESULT__"):
+                returncode = 0
+            else:
+                returncode = proc.returncode if proc.returncode is not None else 1
             return (
-                stdout.decode("utf-8", errors="replace"),
+                decoded,
                 stderr.decode("utf-8", errors="replace"),
-                proc.returncode if proc.returncode is not None else 1,
+                returncode,
             )
         except asyncio.CancelledError:
             if proc is not None and proc.returncode is None:
-                await asyncio.shield(_mod().kill_tree_async(proc))
+                await asyncio.shield(kill_tree_async(proc))
                 await asyncio.shield(proc.communicate())
             raise
         finally:
@@ -219,13 +235,13 @@ class ChildRuntime:
             network = "allow" if {"NETWORK_READ", "NETWORK_WRITE"} & values else "deny"
             try:
                 session = PersistentGeneratedSession(
-                    _mod().sandbox_argv(
+                    sandbox_argv(
                         [sys.executable, "-c", child],
                         root=root,
                         network_policy=network,
                         writable=writable,
                     ),
-                    env=self._e._child_env(_mod()._namespace_python_paths(python_paths, root)),
+                    env=self._e._child_env(_namespace_python_paths(python_paths, root)),
                 )
                 await session.start()
             except BaseException:
@@ -341,17 +357,21 @@ class ChildRuntime:
                 python_paths=python_paths,
                 host=host,
             )
-            # A read-only generated child may lose its entire timeout budget
-            # to sandbox/process startup when the host is heavily contended.
-            # A second isolated attempt is safe for this class of capability;
-            # write/delete/network-write children deliberately do not retry so
-            # an unknown timed-out effect is never duplicated.
+            # A child may lose its entire timeout budget to sandbox/process
+            # startup when the host is heavily contended.  Read-only children
+            # are idempotent and safe to retry once; write/delete/network-write
+            # children deliberately do not retry so an unknown timed-out effect
+            # is never duplicated.
             retryable_effects = {"WRITE_LOCAL", "DELETE", "NETWORK_WRITE"}
             if (
                 result[2] == 124
                 and result[1].strip() == "synthetic execution timed out"
                 and not (set(effects or ()) & retryable_effects)
             ):
+                # Startup contention can consume the first invocation budget.
+                # A fresh retry doubles the wall-clock allowance for this
+                # idempotent read/execute path without reducing its isolation.
+                timeout *= 2
                 result = await self._e._run_child_async(
                     child,
                     payload,
@@ -403,7 +423,9 @@ class ChildRuntime:
                 break
         if not proc.stdin.is_closing():
             proc.stdin.close()
-        await proc.wait()
+        # The result marker is authoritative: child output proves completion.
+        # Avoid waiting on the host process transition because bwrap teardown
+        # can transiently retain pipe registration on constrained hosts.
         return b"".join(output), await stderr_task
 
 

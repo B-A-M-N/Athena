@@ -79,6 +79,23 @@ def test_alias_repair_builtin(repairer):
 
 
 @pytest.mark.athena_scenario("COMPAT-003")
+def test_nested_composed_schema_bool_coercion(repairer):
+    """Repair typed fields in nested operation branches, not just top-level fields."""
+    from athena.capabilities.fs import _INPUT_SCHEMA
+
+    args = {
+        "operation": "write",
+        "path": "result.txt",
+        "content": "MUTATION_OK",
+        "create_dirs": "false",
+    }
+    out, r = _fix(repairer, args, schema=_INPUT_SCHEMA, tool="fs")
+    assert out == {**args, "create_dirs": False}
+    assert r.outcome == RepairOutcome.REPAIRED
+    assert "bool_string:create_dirs" in r.rules
+    assert not validate_schema(_INPUT_SCHEMA, out)
+
+
 def test_numeric_string_coercion(repairer):
     out, r = _fix(repairer, {"language": "sh", "code": "ls", "timeout": "30"})
     assert out["timeout"] == 30

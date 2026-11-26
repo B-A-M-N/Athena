@@ -1,13 +1,15 @@
 """ProviderRegistry — registration of ModelProvider adapters and model lookups.
 
-The router consumes this registry purely through ``list_models`` and
-``provider_for`` (see router.ModelSource). All provider instantiation lives
-with the caller; the registry holds adapter instances and their declared models.
+The router consumes this registry through the normalized
+``list_effective_models`` inventory and ``provider_for`` (see
+router.ModelSource). All provider instantiation lives with the caller; the
+registry holds adapter instances and their declared models.
 """
 
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
+from dataclasses import replace
 import time
 
 from athena.protocol.errors import ModelUnavailable, ProviderUnavailable
@@ -17,8 +19,9 @@ from athena.protocol.models import (
     ModelProvider,
     ModelRequest,
     ModelResponse,
-    ModelResponseAccumulator,
 )
+from athena.models.inventory import EffectiveModelDescriptor, normalize_model
+from athena.models.response_collection import collect_response
 
 
 class ProviderRegistry:
@@ -31,7 +34,7 @@ class ProviderRegistry:
         # describe selected-model quirks. Both belong to this one registry so
         # the kernel, adapters, and repair boundary share an authority.
         self._model_profiles: dict[tuple[str, str], object] = {}
-        self._models_cache: tuple[float, tuple[ModelInfo, ...]] | None = None
+        self._models_cache: tuple[float, tuple[EffectiveModelDescriptor, ...]] | None = None
         self._models_cache_ttl = 2.0
         self._generation = 0
 
@@ -62,6 +65,7 @@ class ProviderRegistry:
         if provider_name not in self._providers:
             raise ProviderUnavailable(f"provider {provider_name!r} is not registered")
         self._profiles[provider_name] = profile
+        self._invalidate_models()
 
     def profile_for(self, provider_name: str) -> object | None:
         return self._profiles.get(provider_name)
@@ -77,6 +81,7 @@ class ProviderRegistry:
         if not model_name:
             raise ValueError("model profile requires a model name")
         self._model_profiles[(provider_name, model_name)] = profile
+        self._invalidate_models()
 
     def model_profile_for(self, provider_name: str, model_name: str) -> object | None:
         return self._model_profiles.get((provider_name, model_name))
@@ -119,15 +124,27 @@ class ProviderRegistry:
             raise ProviderUnavailable(f"provider {provider_name!r} is not registered")
 
     async def list_models(self) -> Sequence[ModelInfo]:
+        """Return the normalized inventory in its legacy model-only shape."""
+        return tuple(item.info for item in await self.list_effective_models())
+
+    async def list_effective_models(self) -> Sequence[EffectiveModelDescriptor]:
+        """Return one canonical descriptor per discovered provider model."""
         now = time.monotonic()
         if self._models_cache is not None and now - self._models_cache[0] < self._models_cache_ttl:
             return self._models_cache[1]
-        out: list[ModelInfo] = []
+        out: list[EffectiveModelDescriptor] = []
         for name, provider in self._providers.items():
             for info in await provider.list_models():
-                if info.provider == "":
-                    info = _with_provider(info, name)
-                out.append(info)
+                # The registration key is the canonical identity: an adapter
+                # must not shadow routing with a different nonempty name.
+                info = _with_provider(info, name)
+                out.append(
+                    normalize_model(
+                        info,
+                        provider_profile=self.profile_for(info.provider),
+                        model_profile=self.model_profile_for(info.provider, info.id),
+                    )
+                )
         result = tuple(out)
         self._models_cache = (now, result)
         return result
@@ -156,39 +173,14 @@ class ProviderRegistry:
     async def invoke(self, provider_name: str, request: ModelRequest) -> ModelResponse:
         """Accumulate a provider stream into a single ModelResponse."""
         provider = self.provider_for(provider_name)
-        return await _collect_response(provider, request)
+        return await collect_response(provider, request)
 
 
 def _with_provider(info: ModelInfo, provider_name: str) -> ModelInfo:
-    fields = {
-        k: getattr(info, k)
-        for k in (
-            "id",
-            "context_limit",
-            "max_output_tokens",
-            "tool_calling",
-            "vision",
-            "audio_input",
-            "audio_output",
-            "reasoning",
-            "structured_output",
-            "streaming",
-            "cost",
-            "latency_class",
-            "privacy_class",
-        )
-    }
-    return ModelInfo(provider=provider_name, **fields)
+    return replace(info, provider=provider_name)
 
 
-async def _collect_response(provider: ModelProvider, request: ModelRequest) -> ModelResponse:
-    accumulator = ModelResponseAccumulator(request)
-    async for event in provider.complete(request):
-        accumulator.ingest(event)
-    if not accumulator.has_response:
-        raise ModelUnavailable(f"provider produced no response for {request.request_id}")
-    response = accumulator.finish()
-    return response
+_collect_response = collect_response
 
 
 __all__ = ["ProviderRegistry"]

@@ -321,6 +321,9 @@ async def _resolve_with_timeout(resolver, host: str, port: int, *, timeout: floa
     return value
 
 
+resolve_with_timeout = _resolve_with_timeout
+
+
 __all__ = [
     "BraveSearchProvider",
     "HttpDiscoveryProvider",

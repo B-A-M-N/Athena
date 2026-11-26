@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 from urllib.parse import unquote
 
-from athena.affordances.models import DependencyRequirement
+from athena.protocol.affordances import DependencyRequirement
 from athena.execution.dependency_lock import (
     calculate_environment_fingerprint,
     parse_dependency_lock,
@@ -282,6 +282,9 @@ def _python_runtime_identity() -> str:
     from athena.execution.environment import ProjectEnvironmentFingerprint
 
     return ProjectEnvironmentFingerprint._executable_identity("python", sys.executable)
+
+
+python_runtime_identity = _python_runtime_identity
 
 
 def _find_record(packages: Mapping[str, Any], name: str) -> Mapping[str, Any] | None:

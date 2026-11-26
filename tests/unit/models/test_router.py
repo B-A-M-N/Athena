@@ -48,7 +48,7 @@ async def test_selects_fake_provider_when_tools_required():
     reg = _registry({"tools": tools, "plain": plain})
 
     router = ModelRouter(reg)
-    reqs = ModelRequirements(required_capabilities=frozenset({CAP_TOOLS}), needs_tools=True)
+    reqs = ModelRequirements(required_capabilities=frozenset({CAP_TOOLS}))
     sel = await router.select(requirements=reqs)
 
     assert sel.info.tool_calling is True
@@ -315,7 +315,7 @@ async def test_provider_registry_resolve_uses_cached_model_inventory():
 # ---------------------------------------------------------------------- #
 
 
-async def test_minimum_context_tokens_requirement_selects_the_large_model():
+async def test_minimum_context_window_tokens_requirement_selects_the_large_model():
     """model A context=8k, model B context=128k, requirement=20k -> B."""
     small = FakeModelProvider(
         model="ctx-8k",
@@ -331,12 +331,12 @@ async def test_minimum_context_tokens_requirement_selects_the_large_model():
 
     selection = await router.select(
         policy=ModelPolicy(role="primary", require_tools=False),
-        requirements=ModelRequirements(minimum_context_tokens=20 * 1024),
+        requirements=ModelRequirements(minimum_context_window_tokens=20 * 1024),
     )
     assert (selection.provider, selection.model) == ("largeprov", "ctx-128k")
 
 
-async def test_minimum_context_tokens_rejects_undersized_only_model():
+async def test_minimum_context_window_tokens_rejects_undersized_only_model():
     """When the only registered model cannot hold the request, selection
     must fail loudly rather than silently route to an undersized context
     (the old ``min_context_window`` getattr always got None and let it
@@ -353,7 +353,7 @@ async def test_minimum_context_tokens_rejects_undersized_only_model():
     # Below the limit: selectable.
     ok = await router.select(
         policy=ModelPolicy(role="primary", require_tools=False),
-        requirements=ModelRequirements(minimum_context_tokens=2 * 1024),
+        requirements=ModelRequirements(minimum_context_window_tokens=2 * 1024),
     )
     assert (ok.provider, ok.model) == ("onlyprov", "only-model")
 
@@ -361,19 +361,18 @@ async def test_minimum_context_tokens_rejects_undersized_only_model():
     with pytest.raises(ModelUnavailable):
         await router.select(
             policy=ModelPolicy(role="primary", require_tools=False),
-            requirements=ModelRequirements(minimum_context_tokens=64 * 1024),
+            requirements=ModelRequirements(minimum_context_window_tokens=64 * 1024),
         )
 
 
 async def test_kernel_selects_model_by_compiled_minimum_context():
     """End-to-end P0-5 regression: AgentKernel._select_model must forward
-    the compiler's ``minimum_context_tokens`` (not the nonexistent
-    ``min_context_window``) so a 128k model is chosen when the compiled
+    the compiler's explicit context-window requirement so a 128k model is chosen when the compiled
     request needs 20k and an 8k model is also registered."""
     from athena.kernel.kernel import AgentKernel
 
-    field = ModelRequirements.__dataclass_fields__.get("minimum_context_tokens")
-    assert field is not None, "ModelRequirements.minimum_context_tokens must exist"
+    field = ModelRequirements.__dataclass_fields__.get("minimum_context_window_tokens")
+    assert field is not None, "ModelRequirements.minimum_context_window_tokens must exist"
 
     class Holder:
         """Minimal stand-in for the kernel's compiled-context handle."""
@@ -392,7 +391,12 @@ async def test_kernel_selects_model_by_compiled_minimum_context():
         model="ctx-128k", provider="largeprov", context_limit=128 * 1024, tool_calling=True
     )
     kernel._router = ModelRouter(_registry({"smallprov": small, "largeprov": large}))
-    compiled = Holder(ModelRequirements(minimum_context_tokens=20 * 1024, needs_tools=True))
+    compiled = Holder(
+        ModelRequirements(
+            required_capabilities=frozenset({CAP_TOOLS}),
+            minimum_context_window_tokens=20 * 1024,
+        )
+    )
 
     selection = await kernel._select_model(task=TaskStub(), compiled=compiled)
     assert (selection.provider, selection.model) == ("largeprov", "ctx-128k")

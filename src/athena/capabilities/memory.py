@@ -6,13 +6,15 @@ memory subsystem lands. Effects: READ_LOCAL for recall, none for store.
 """
 
 from __future__ import annotations
+from athena.capabilities.operations import native_descriptor
 
 import json
 from datetime import datetime
 from typing import Any, Mapping
 
 from athena.protocol.capabilities import (
-    CapabilityDescriptor,
+    CapabilityFailure,
+    CapabilityFailureCode,
     CapabilityOrigin,
     CapabilityRequest,
     CapabilityRequestOrigin,
@@ -81,7 +83,7 @@ _GLOBAL_AUTHORITY = frozenset(
 
 
 class MemoryCapability:
-    descriptor = CapabilityDescriptor(
+    descriptor = native_descriptor(
         id="memory",
         description=(
             "Long-term memory: recall relevant memories using bounded lexical, "
@@ -97,6 +99,14 @@ class MemoryCapability:
 
     def __init__(self, memory_store=None) -> None:
         self.memory_store = memory_store
+
+    def _conformance_failure_probe(self) -> dict:
+        failure = CapabilityFailure(
+            code=CapabilityFailureCode.UNSUPPORTED_OPERATION,
+            detail="conformance probe",
+            stage="invoke",
+        )
+        return failure.to_metadata()
 
     async def invoke(
         self, request: CapabilityRequest, *, context=None, **kwargs
@@ -194,17 +204,24 @@ class MemoryCapability:
                 ref_uri=(f"memory:{outcome.memory_id}" if outcome.memory_id else None),
                 metadata={"operation": "save", **outcome_data},
             )
-        return CapabilityResult(
-            call_id,
-            request.capability_id,
-            CapabilityResultStatus.FAILED,
-            error=f"unknown operation: {op}",
+        return _typed_failed(
+            request,
+            f"unknown operation: {op}",
+            CapabilityFailureCode.UNSUPPORTED_OPERATION,
         )
 
 
 def _failed(call_id: str, request: CapabilityRequest, error: str) -> CapabilityResult:
     return CapabilityResult(
         call_id, request.capability_id, CapabilityResultStatus.FAILED, error=error
+    )
+
+
+def _typed_failed(
+    request: CapabilityRequest, msg: str, code: CapabilityFailureCode
+) -> CapabilityResult:
+    return CapabilityResult.failure(
+        request, CapabilityFailure(code=code, detail=msg, stage="invoke")
     )
 
 

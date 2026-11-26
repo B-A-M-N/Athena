@@ -27,9 +27,23 @@ _logger = logging.getLogger(__name__)
 class TaskForker:
     """Create causal forks of existing tasks and inspect their timelines."""
 
-    def __init__(self, service: Any = None, checkpoint_manager: Any = None) -> None:
+    def __init__(
+        self,
+        service: Any = None,
+        checkpoint_manager: Any = None,
+        *,
+        ports: Any = None,
+    ) -> None:
         self._service = service
+        self._ports = ports
         self._checkpoint_manager = checkpoint_manager
+
+    def _dependency(self, name: str):
+        if self._ports is not None:
+            return getattr(self._ports, name, None)
+        if self._service is None:
+            return None
+        return getattr(self._service, name, None)
 
     async def fork(
         self,
@@ -40,12 +54,16 @@ class TaskForker:
         workspace_checkpoint_id: str | None = None,
     ) -> dict:
         """Fork ``task_id``, resuming conceptually after event sequence N."""
-        if self._service is None:
-            raise RuntimeError("TaskForker requires an AthenaService instance")
-        store_tasks = self._service._store_tasks
-        tm = self._service._task_manager
+        store_tasks = self._dependency("task_store") or (
+            self._service._store_tasks if self._service is not None else None
+        )
+        tm = self._dependency("task_manager") or (
+            self._service._task_manager if self._service is not None else None
+        )
+        if self._service is None and self._ports is None:
+            raise RuntimeError("TaskForker requires ports or an AthenaService instance")
         if store_tasks is None or tm is None:
-            raise RuntimeError("AthenaService not started")
+            raise RuntimeError("TaskForker task store and manager are not started")
 
         row = await store_tasks.get(task_id)
         if row is None:
@@ -53,7 +71,9 @@ class TaskForker:
 
         if after_event_sequence < 0:
             raise ValueError("after_event_sequence must be non-negative")
-        events = self._service._store_events
+        events = self._dependency("event_store") or (
+            self._service._store_events if self._service is not None else None
+        )
         if events is None:
             raise RuntimeError("AthenaService event store is not started")
         timeline = await events.list_for_task(task_id)
@@ -66,9 +86,9 @@ class TaskForker:
         prefix = [event for event in timeline if event.sequence <= after_event_sequence]
         boundary = prefix[-1] if prefix else None
 
-        from athena.kernel.lifecycle import deserialize_task
+        from athena.protocol.task_codec import decode_task_spec
 
-        spec = deserialize_task(dict(row))
+        spec = decode_task_spec(dict(row), status=row.get("status"))
         metadata = dict(spec.metadata or {})
         # Drop runtime bookkeeping inherited from the parent.
         metadata.pop("status", None)
@@ -123,7 +143,11 @@ class TaskForker:
                 boundary_timestamp=boundary.timestamp if boundary else None,
                 parent_task_id=task_id,
                 after_event_sequence=after_event_sequence,
-                principal_id=getattr(self._service.config, "cache_namespace", None),
+                principal_id=(
+                    getattr(self._ports, "principal_id", None)
+                    if self._ports is not None
+                    else getattr(self._service.config, "cache_namespace", None)
+                ),
                 project_id=getattr(spec.workspace, "id", None),
             )
         except Exception:
@@ -154,7 +178,9 @@ class TaskForker:
             except Exception:
                 _logger.exception("could not determine ownership of failed fork %s", fork_id)
             if not task_exists:
-                sessions = getattr(self._service, "_sessions", None)
+                sessions = self._dependency("session_store") or (
+                    self._service._sessions if self._service is not None else None
+                )
                 if session_id is not None and sessions is not None:
                     try:
                         await sessions.delete_if_orphaned(session_id)
@@ -193,8 +219,12 @@ class TaskForker:
         a message created after the chosen event is never copied. The copied
         message IDs and session metadata make the reconstruction auditable.
         """
-        sessions = getattr(self._service, "_sessions", None)
-        messages = getattr(self._service, "_store_messages", None)
+        sessions = self._dependency("session_store") or (
+            self._service._sessions if self._service is not None else None
+        )
+        messages = self._dependency("message_store") or (
+            self._service._store_messages if self._service is not None else None
+        )
         if session_id is None or sessions is None or messages is None:
             return None
 
@@ -249,11 +279,11 @@ class TaskForker:
 
     async def timeline(self, task_id: str) -> list[dict]:
         """Summarize a task's events so an operator can pick a fork point."""
-        if self._service is None:
-            raise RuntimeError("TaskForker requires an AthenaService instance")
-        events = self._service._store_events
+        events = self._dependency("event_store") or (
+            self._service._store_events if self._service is not None else None
+        )
         if events is None:
-            raise RuntimeError("AthenaService not started")
+            raise RuntimeError("TaskForker event store is not started")
         out: list[dict] = []
         for ev in await events.list_for_task(task_id):
             payload = dict(ev.payload or {})

@@ -7,6 +7,8 @@ from typing import Any
 
 from athena.context.provenance import prov
 from athena.protocol.capabilities import (
+    CapabilityFailure,
+    CapabilityFailureCode,
     CapabilityDescriptor,
     CapabilityOrigin,
     CapabilityRequest,
@@ -214,12 +216,22 @@ def _json(value: Any) -> str:
 
 
 def _result(request, *, ok: bool = True, output: str = "", error: str | None = None):
-    return CapabilityResult(
-        request.call_id,
-        request.capability_id,
-        CapabilityResultStatus.OK if ok else CapabilityResultStatus.FAILED,
+    if ok:
+        return CapabilityResult(
+            request.call_id,
+            request.capability_id,
+            CapabilityResultStatus.OK,
+            output=output,
+            error=error,
+        )
+    return CapabilityResult.failure(
+        request,
+        CapabilityFailure(
+            code=CapabilityFailureCode.DOMAIN_REJECTED,
+            detail=error or "operation failed",
+            stage="invoke",
+        ),
         output=output,
-        error=error,
     )
 
 

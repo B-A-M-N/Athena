@@ -15,7 +15,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
-from athena.execution.async_call import run_blocking
+from athena.concurrency import run_blocking
 
 DEFAULT_FASTEMBED_MODEL = "BAAI/bge-small-en-v1.5"
 

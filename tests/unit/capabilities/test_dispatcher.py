@@ -1,5 +1,7 @@
 import asyncio
 
+import pytest
+
 from athena.capabilities.dispatcher import CapabilityDispatcher
 from athena.capabilities.registry import CapabilityRegistry
 from athena.policy.engine import PolicyEngine
@@ -160,3 +162,136 @@ def test_dispatcher_emits_capability_progress_and_diagnostics():
     assert "CapabilityProgress" in event_types
     assert "DiagnosticsProduced" in event_types
     assert event_types[-1] == "CapabilityCompleted"
+
+
+@pytest.mark.asyncio
+async def test_stale_prepared_call_cannot_cross_reused_call_id(tmp_path):
+    """Removing ambient by-call-id prepared state prevents snapshot replay.
+
+    Two calls with the same call_id must resolve their own executor and
+    workspace independently. There is no hidden map for a prior dispatch to
+    leave behind a stale prepared snapshot for the second dispatch.
+    """
+    from athena.capabilities.dispatcher import CapabilityDispatcher
+    from athena.capabilities.registry import CapabilityRegistry
+    from athena.policy.engine import PolicyEngine
+    from athena.protocol.capabilities import (
+        CapabilityRequest,
+        CapabilityResult,
+        CapabilityResultStatus,
+        EffectClass,
+    )
+    from athena.protocol.tasks import AutonomyLevel, WorkspaceSpec
+
+    class W:
+        descriptor = CapabilityDescriptor(
+            id="fs.write",
+            description="write",
+            input_schema={
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+            effects=frozenset({EffectClass.WRITE_LOCAL}),
+        )
+
+        async def invoke(self, request, *, output_accumulator=None, context=None):
+            return CapabilityResult(
+                request.call_id, request.capability_id, CapabilityResultStatus.OK
+            )
+
+    ws = WorkspaceSpec(id="repo", root="/tmp")
+    reg = CapabilityRegistry()
+    reg.register(W())
+    d = CapabilityDispatcher(reg, PolicyEngine(AutonomyLevel.AUTONOMOUS))
+    r = CapabilityRequest("fs.write", {"path": "x.txt"}, task_id="t", call_id="reused-id")
+
+    r1 = await d.dispatch(r, workspace=ws)
+    assert r1.status is CapabilityResultStatus.OK
+    # Ambient by-call-id prepared state must not exist after the call.
+    assert not hasattr(d, "_prepared_by_call") or getattr(d, "_prepared_by_call", None) is None
+    r2 = await d.dispatch(r, workspace=ws)
+    assert r2.status is CapabilityResultStatus.OK
+
+
+async def test_release_task_sync_cleans_synchronization_registries():
+    """Terminal tasks must not leave lanes, semaphores, or escalation state."""
+    from athena.capabilities.dispatcher import CapabilityDispatcher
+    from athena.capabilities.registry import CapabilityRegistry
+    from athena.policy.engine import PolicyEngine
+    from athena.protocol.capabilities import (
+        CapabilityRequest,
+        CapabilityResult,
+        CapabilityResultStatus,
+    )
+    from athena.protocol.capabilities import EffectClass
+    from athena.protocol.tasks import AutonomyLevel, WorkspaceSpec
+
+    class W:
+        descriptor = CapabilityDescriptor(
+            id="fs.write",
+            description="write",
+            input_schema={
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+            effects=frozenset({EffectClass.WRITE_LOCAL}),
+        )
+
+        async def invoke(self, request, *, output_accumulator=None, context=None):
+            return CapabilityResult(
+                request.call_id, request.capability_id, CapabilityResultStatus.OK
+            )
+
+    ws = WorkspaceSpec(id="repo", root="/tmp")
+    reg = CapabilityRegistry()
+    reg.register(W())
+    d = CapabilityDispatcher(reg, PolicyEngine(AutonomyLevel.AUTONOMOUS))
+    r = CapabilityRequest("fs.write", {"path": "same.txt"}, task_id="task-cleanup")
+    result = await d.dispatch(r, workspace=ws)
+    assert result.status is CapabilityResultStatus.OK
+
+    # Simulate state that accumulates for the task.
+    d._execution_semaphores["task-cleanup"] = asyncio.Semaphore(2)
+    d._runtime_speculative_tasks.add("task-cleanup")
+    assert len(d._execution_semaphores) > 0
+
+    d.release_task_sync("task-cleanup")
+    assert "task-cleanup" not in d._execution_semaphores
+    assert "task-cleanup" not in d._runtime_speculative_tasks
+
+
+async def test_multi_lock_cancellation_does_not_strand_locks():
+    """Cancellation while waiting for lock B must release already-held A."""
+    from athena.capabilities.dispatch_helpers import ReferenceCountedKeyedLocks
+
+    keyed = ReferenceCountedKeyedLocks()
+    keys = ["a", "b"]
+
+    # Pre-acquire lock "b" to block our waiter.
+    blocker = keyed.acquire_reference("b")
+    await blocker.acquire()
+
+    async def waiter():
+        locks = await keyed.acquire_many(keys)
+        return locks
+
+    task = asyncio.create_task(waiter())
+    await asyncio.sleep(0.01)  # let it acquire "a" and start waiting on "b"
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # Lock "a" must be released and its reference dropped.
+    entry_a = keyed._entries.get("a")
+    assert entry_a is None or not entry_a[0].locked(), (
+        "lock 'a' was stranded after cancellation during multi-key acquisition"
+    )
+
+    # Another caller must be able to acquire both without deadlock.
+    fresh = ReferenceCountedKeyedLocks()
+    locks = await asyncio.wait_for(fresh.acquire_many(keys), timeout=2.0)
+    assert len(locks) == 2
+    fresh.release_many(locks)
+    assert len(fresh) == 0

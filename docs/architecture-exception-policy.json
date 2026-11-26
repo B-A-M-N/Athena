@@ -1,25 +1,25 @@
 {
-  "schema": 1,
+  "schema": 2,
   "default_action": "fail_on_new_or_moved_exception_site",
   "categories": {
     "trusted_control_plane": "Operator-owned or service-owned orchestration with bounded arguments and an explicit lifecycle owner.",
     "model_reachable_data_plane": "A model-reachable observation or generated-runtime path; it must remain read-only or mediated and must not widen authority."
   },
   "subprocess": [
-    {"path": "src/athena/causal/checkpoint.py", "line": 728, "category": "trusted_control_plane", "model_reachable": false, "rationale": "owned checkpoint worker"},
-    {"path": "src/athena/cli/native.py", "line": 230, "category": "trusted_control_plane", "model_reachable": false, "rationale": "owned native frontend"},
-    {"path": "src/athena/delegates/sessions.py", "line": 373, "category": "trusted_control_plane", "model_reachable": false, "rationale": "host-configured specialist command; model messages return through the canonical dispatcher"},
-    {"path": "src/athena/hermes/manager.py", "line": 154, "category": "trusted_control_plane", "model_reachable": false, "rationale": "owned Hermes referee service"},
-    {"path": "src/athena/policy/credentials.py", "line": 131, "category": "trusted_control_plane", "model_reachable": false, "rationale": "owner-authenticated secret-store CLI"},
-    {"path": "src/athena/project/index/builder.py", "line": 664, "category": "trusted_control_plane", "model_reachable": false, "rationale": "service-owned read-only git project inventory rooted at the task workspace"},
-    {"path": "src/athena/self_host/gates.py", "line": 461, "category": "trusted_control_plane", "model_reachable": false, "rationale": "read-only self-host base identity"},
-    {"path": "src/athena/synthesis/child_runtime.py", "line": 144, "category": "model_reachable_data_plane", "model_reachable": true, "authority_boundary": "generated-source admission plus Bubblewrap sandbox", "rationale": "generated validation worker remains sandboxed and bounded"},
-    {"path": "src/athena/synthesis/runtime.py", "line": 62, "category": "model_reachable_data_plane", "model_reachable": true, "authority_boundary": "generated-source admission plus Bubblewrap sandbox", "rationale": "generated runtime worker remains mediated by the parent host"},
-    {"path": "src/athena/workspace_manifest.py", "line": 114, "category": "trusted_control_plane", "model_reachable": false, "rationale": "service-owned read-only tracked-manifest query rooted at the task workspace"},
-    {"path": "src/athena/worldstate/core.py", "line": 513, "category": "trusted_control_plane", "model_reachable": false, "rationale": "service-owned read-only git observation rooted at the task workspace"}
+    {"id": "checkpoint-worker", "path": "src/athena/causal/checkpoint.py", "line": 728, "category": "trusted_control_plane", "model_reachable": false, "rationale": "owned checkpoint worker"},
+    {"id": "cli-native-launch", "path": "src/athena/cli/native.py", "line": 178, "category": "trusted_control_plane", "model_reachable": false, "rationale": "owned native frontend"},
+    {"id": "delegate-specialist-transport", "path": "src/athena/delegates/sessions.py", "line": 373, "category": "trusted_control_plane", "model_reachable": false, "rationale": "host-configured specialist command; model messages return through the canonical dispatcher"},
+    {"id": "hermes-referee", "path": "src/athena/hermes/manager.py", "line": 154, "category": "trusted_control_plane", "model_reachable": false, "rationale": "owned Hermes referee service"},
+    {"id": "secret-store-cli", "path": "src/athena/policy/credentials.py", "line": 131, "category": "trusted_control_plane", "model_reachable": false, "rationale": "owner-authenticated secret-store CLI"},
+    {"id": "project-git-inventory", "path": "src/athena/project/index/builder.py", "line": 664, "category": "trusted_control_plane", "model_reachable": false, "rationale": "service-owned read-only git project inventory rooted at the task workspace"},
+    {"id": "self-host-base-identity", "path": "src/athena/self_host/gates.py", "line": 461, "category": "trusted_control_plane", "model_reachable": false, "rationale": "read-only self-host base identity"},
+    {"id": "synthesis-validation-worker", "path": "src/athena/synthesis/child_runtime.py", "line": 144, "category": "model_reachable_data_plane", "model_reachable": true, "authority_boundary": "generated-source admission plus Bubblewrap sandbox", "rationale": "generated validation worker remains sandboxed and bounded"},
+    {"id": "synthesis-runtime-worker", "path": "src/athena/synthesis/runtime.py", "line": 62, "category": "model_reachable_data_plane", "model_reachable": true, "authority_boundary": "generated-source admission plus Bubblewrap sandbox", "rationale": "generated runtime worker remains mediated by the parent host"},
+    {"id": "tracked-manifest-query", "path": "src/athena/workspace_manifest.py", "line": 114, "category": "trusted_control_plane", "model_reachable": false, "rationale": "service-owned read-only tracked-manifest query rooted at the task workspace"},
+    {"id": "worldstate-git-observation", "path": "src/athena/worldstate/core.py", "line": 513, "category": "trusted_control_plane", "model_reachable": false, "rationale": "service-owned read-only git observation rooted at the task workspace"}
   ],
   "raw_database": [
-    {"path": "src/athena/capabilities/environment_database.py", "line": 172, "category": "model_reachable_data_plane", "model_reachable": true, "rationale": "read-only task database view"},
-    {"path": "src/athena/capabilities/environment_database.py", "line": 176, "category": "model_reachable_data_plane", "model_reachable": true, "rationale": "read-only task database view"}
+    {"id": "environment-db-readonly", "path": "src/athena/capabilities/environment_database.py", "line": 172, "category": "model_reachable_data_plane", "model_reachable": true, "rationale": "read-only task database view"},
+    {"id": "environment-db-workspace", "path": "src/athena/capabilities/environment_database.py", "line": 176, "category": "model_reachable_data_plane", "model_reachable": true, "rationale": "workspace database view uses the same deny-by-default authorizer"}
   ]
 }

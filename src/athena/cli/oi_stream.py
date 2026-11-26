@@ -23,13 +23,13 @@ from athena.cli.dual_pane import (
     _MASCOT_OFF,
     resolve_mascot_name,
 )
-from athena.cli.layout import Rect
 from athena.cli.input import PromptController
-from athena.cli.projection import ProjectionState
-from athena.cli.render.ansi import CellGridDiffRenderer
-from athena.cli.render.scene import render_scene_lines
-from athena.cli.scene import build_oi_scene
 from athena.cli.terminal import TerminalSession
+from athena.presentation.ansi import CellGridDiffRenderer
+from athena.presentation.ansi_scene import render_scene_lines
+from athena.presentation.layout import Rect
+from athena.presentation.projection import ProjectionState
+from athena.presentation.scene import build_oi_scene
 
 _DIM = "\x1b[2m"
 _BOLD = "\x1b[1m"

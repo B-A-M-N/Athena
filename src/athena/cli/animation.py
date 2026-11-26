@@ -35,6 +35,7 @@ class OIVisualState:
     code_line_count: int = 0
     buddy_anchor: str = "center"
     previous_anchor: str = "center"
+    ambient_time: float = 0.0
     phase: float = 0.0
     transition: float = 1.0
     scene_transition: float = 1.0
@@ -86,17 +87,24 @@ class OIAnimator:
         ):
             self.visual.dirty = False
             return False
-        self.visual.phase = (self.visual.phase + max(float(dt), 0.0) * 2.0) % 1.0
-        self.visual.transition = min(1.0, self.visual.transition + max(float(dt), 0.0) * 3.0)
         delta = max(float(dt), 0.0)
+
+        # Glass ambience is allowed to remain alive even when Athena has no
+        # active semantic operation. It never implies task progress.
+        self.visual.ambient_time += delta
+        active = self.visual.semantic_state.upper() in _ACTIVE_STATES
+
+        if active:
+            self.visual.transition = min(1.0, self.visual.transition + delta * 3.0)
+            self.visual.cursor_phase = (self.visual.cursor_phase + delta * 5.0) % 1.0
+            self.visual.scan_phase = (self.visual.scan_phase + delta * 0.9) % 1.0
+            self.visual.pulse_phase = (self.visual.pulse_phase + delta * 2.2) % 1.0
+            self.visual.activity_phase = (self.visual.activity_phase + delta * 1.6) % 1.0
+            if self.visual.action_kind.casefold() == "code":
+                self.visual.code_reveal = min(1.0, self.visual.code_reveal + delta * 3.5)
+
+        self.visual.grid_phase = (self.visual.grid_phase + delta * 0.05) % 1.0
         self.visual.scene_transition = min(1.0, self.visual.scene_transition + delta * 2.5)
-        self.visual.cursor_phase = (self.visual.cursor_phase + delta * 5.0) % 1.0
-        self.visual.scan_phase = (self.visual.scan_phase + delta * 0.9) % 1.0
-        self.visual.pulse_phase = (self.visual.pulse_phase + delta * 2.2) % 1.0
-        self.visual.grid_phase = (self.visual.grid_phase + delta * 0.35) % 1.0
-        self.visual.activity_phase = (self.visual.activity_phase + delta * 1.6) % 1.0
-        if self.visual.action_kind.casefold() == "code":
-            self.visual.code_reveal = min(1.0, self.visual.code_reveal + delta * 3.5)
         self.visual.dirty = True
         return True
 

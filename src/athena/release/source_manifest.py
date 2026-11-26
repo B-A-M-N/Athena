@@ -15,8 +15,10 @@ EXCLUDED_DIRECTORIES = frozenset(
     {
         ".git",
         ".venv",
+        ".release-toolchain",
         ".artifacts",
         ".pytest_cache",
+        ".hypothesis",
         ".mypy_cache",
         ".ruff_cache",
         "__pycache__",

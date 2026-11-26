@@ -24,9 +24,11 @@ from typing import Any, Mapping
 
 from athena.protocol.ids import new_id
 from athena.protocol.messages import utcnow
+from athena.protocol.task_codec import decode_budget, decode_model_policy
 
 from athena.protocol.tasks import (
     CapabilityPolicy,
+    TaskExecutionPlan,
     Criterion,
     DeliverySpec,
     MutationMode,
@@ -39,7 +41,7 @@ from athena.protocol.tasks import (
     WorkspaceSpec,
 )
 from athena.scheduler.claims import Claim, _to_claim, claim_next
-from athena.scheduler.triggers import TriggerType, TriggerSpec, next_fire
+from athena.protocol.scheduling import TriggerType, TriggerSpec, next_fire
 from athena.state.schedules import ScheduleStore
 
 _logger = logging.getLogger("athena.scheduler")
@@ -145,6 +147,15 @@ class TaskTemplate:
         )
         if self.authority_snapshot:
             metadata["_authority_snapshot"] = dict(self.authority_snapshot)
+        # Scheduled occurrences consume the schedule's service-derived
+        # execution plan, not current classification rules. Re-derive only
+        # when a legacy job snapshot predates this field.
+        execution_plan_record = self.authority_snapshot.get("execution_plan")
+        execution_plan: TaskExecutionPlan | None = None
+        if isinstance(execution_plan_record, Mapping):
+            execution_plan = TaskExecutionPlan.from_record(execution_plan_record)
+            metadata["_athena_work_class"] = execution_plan.work_class.value
+            metadata["_athena_speculation_depth"] = execution_plan.speculation_depth.value
         # Fresh/previous-result/job-memory occurrences always mint a new
         # execution session. Only the explicit ``session`` continuity mode may
         # use the schedule-owned stable session. The fallback to session_id is
@@ -173,6 +184,7 @@ class TaskTemplate:
             deadline=self.deadline,
             delivery=scheduled_delivery,
             metadata=metadata,
+            execution_plan=execution_plan,
         )
 
 
@@ -312,16 +324,12 @@ def _capability_policy_from_record(raw: Any) -> CapabilityPolicy | None:
 def _model_policy_from_record(raw: Any) -> ModelPolicy | None:
     if not isinstance(raw, Mapping):
         return None
-    from athena.api.decoders import decode_model_policy
-
     return decode_model_policy(raw)
 
 
 def _budget_from_record(raw: Any) -> ResourceBudget | None:
     if not isinstance(raw, Mapping):
         return None
-    from athena.api.decoders import decode_budget
-
     return decode_budget(raw)
 
 
@@ -383,6 +391,7 @@ class Scheduler:
         self._loop_interval = loop_interval_seconds
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
+        self._nudge_event = asyncio.Event()
         # Every claim-producing entry point shares one boundary.  The
         # background tick loop, an operator-triggered run, and an event
         # callback can otherwise race on the same SQLite-backed schedule and
@@ -419,6 +428,10 @@ class Scheduler:
                 fires += 1
             return fires
 
+    def nudge(self) -> None:
+        """Wake the run loop immediately (control-plane change notice)."""
+        self._nudge_event.set()
+
     async def run_now(self, job_id: str) -> str | None:
         """Run one enabled job occurrence through the normal claim path.
 
@@ -437,7 +450,7 @@ class Scheduler:
                 return None
             try:
                 await self._fire_claim(job, _to_claim(claim))
-            except Exception:
+            except Exception:  # rationale: scheduler occurrence isolation
                 # _fire_claim releases an unmaterialized claim; preserve the
                 # exception for the operator instead of reporting a false run.
                 raise
@@ -458,7 +471,7 @@ class Scheduler:
         try:
             async with self._claim_boundary():
                 return await self._notify_event(event)
-        except Exception as exc:
+        except Exception as exc:  # rationale: event errors surface after health record
             self._record_error(exc)
             raise
 
@@ -483,7 +496,7 @@ class Scheduler:
                     await self._notify_event(event)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # rationale: deferred event drain must not die
             self._record_error(exc)
             _logger.warning("deferred scheduler event failed: %s", exc)
         finally:
@@ -577,7 +590,7 @@ class Scheduler:
                     )
             if created is None:
                 raise RuntimeError("TaskManager.create returned no Task for scheduled occurrence")
-        except Exception:
+        except Exception:  # rationale: scheduler occurrence isolation
             # A successful create followed by enqueue failure leaves a real
             # CREATED task that reconciliation can enqueue. Releasing that
             # claim would permit a duplicate Task for the same occurrence.
@@ -635,7 +648,7 @@ class Scheduler:
         self._health["health"] = "recovering"
         try:
             await self.reconcile()
-        except Exception as exc:
+        except Exception as exc:  # rationale: startup reconcile failure is fatal
             self._record_error(exc, reconciliation=True)
             self._health["health"] = "failed"
             raise
@@ -689,7 +702,7 @@ class Scheduler:
                 await asyncio.wait_for(asyncio.shield(drain), timeout=5)
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 drain.cancel()
-            except Exception as exc:
+            except Exception as exc:  # rationale: stop drain errors are nonfatal
                 self._record_error(exc)
         self._event_drain_task = None
         self._health["health"] = "stopped"
@@ -735,35 +748,50 @@ class Scheduler:
         self._health["consecutive_failures"] = 0
         self._health["health"] = "recovering" if previous == "failed" else "healthy"
 
+    async def _wait_stop_or_nudge(self) -> None:
+        stop_wait = asyncio.create_task(self._stop.wait())
+        nudge_wait = asyncio.create_task(self._nudge_event.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {stop_wait, nudge_wait},
+                timeout=self._loop_interval,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            stop_wait.cancel()
+            nudge_wait.cancel()
+        if self._nudge_event.is_set() and not self._stop.is_set():
+            self._nudge_event.clear()
+
     async def _run(self) -> None:
         # Give callers one scheduling turn after startup to finish durable
         # setup or perform an explicit tick.  Immediate first-pass polling
         # makes a due occurrence race with recovery/bootstrap code.
         try:
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=self._loop_interval)
+                await self._wait_stop_or_nudge()
             except asyncio.TimeoutError:
                 pass
             while not self._stop.is_set():
                 self._health["last_tick_at"] = utcnow().isoformat()
                 try:
                     await self.tick()
-                except Exception as exc:
+                except Exception as exc:  # rationale: tick failures isolated in loop
                     self._record_error(exc)
                     _logger.warning("scheduler tick failed: %s", exc)
                     # If a claim was left open, attempt immediate reconciliation
                     try:
                         await self.reconcile()
-                    except Exception as reconcile_error:
+                    except Exception as reconcile_error:  # rationale: bounded recovery attempt
                         self._record_error(reconcile_error, reconciliation=True)
                         _logger.warning("scheduler reconciliation failed: %s", reconcile_error)
                 else:
                     self._record_success()
                 try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=self._loop_interval)
+                    await self._wait_stop_or_nudge()
                 except asyncio.TimeoutError:
                     continue
-        except Exception as exc:
+        except Exception as exc:  # rationale: run loop failure marks scheduler failed
             self._record_error(exc)
             self._health["health"] = "failed"
             raise

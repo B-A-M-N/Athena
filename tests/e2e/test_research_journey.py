@@ -51,6 +51,7 @@ class _ResearchFixtureHandler(BaseHTTPRequestHandler):
         return
 
 
+@pytest.mark.athena_capability("TCP_LOOPBACK")
 @pytest.mark.dsh_release
 @pytest.mark.athena_evidence("e2e", "security")
 @pytest.mark.asyncio

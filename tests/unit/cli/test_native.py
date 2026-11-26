@@ -6,7 +6,6 @@ import pytest
 from athena.cli.app import Options, _arg_parse
 from athena.cli.native import (
     NativePreflight,
-    _load_credential_env,
     native_binary,
     native_preflight,
     worker_command,
@@ -87,32 +86,6 @@ def test_native_worker_command_forwards_scope_without_credentials():
     assert command[-5:] == ["--verbose", "--mascot", "owl", "--no-animations", "--reduced-motion"]
 
 
-def test_native_loads_only_supported_credential_settings_without_executing_file(
-    tmp_path, monkeypatch
-):
-    env_file = tmp_path / "opencodex.env"
-    env_file.write_text(
-        "FREEINFERENCE_API_KEY=test-key\n"
-        "FREEINFERENCE_API_ENDPOINT=https://fi.example/v1\n"
-        "FREEINFERENCE_MODEL=glm-5.3-flash\n"
-        "ATHENA_NATIVE_INJECTED=should-not-load\n"
-        "$(touch %s)=not-shell\n" % (tmp_path / "should-not-exist"),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("ATHENA_CREDENTIAL_ENV_FILE", str(env_file))
-
-    env = {"ATHENA_CREDENTIAL_ENV_FILE": str(env_file)}
-    _load_credential_env(env)
-
-    assert env == {
-        "ATHENA_CREDENTIAL_ENV_FILE": str(env_file),
-        "FREEINFERENCE_API_KEY": "test-key",
-        "FREEINFERENCE_API_ENDPOINT": "https://fi.example/v1",
-        "FREEINFERENCE_MODEL": "glm-5.3-flash",
-    }
-    assert not (tmp_path / "should-not-exist").exists()
-
-
 def test_native_session_parser_matches_worker_contract():
     options = parse_args(
         [
@@ -176,6 +149,69 @@ async def test_native_transcript_does_not_expose_internal_task_id(capsys):
     assert "internal-task-secret" not in output
     assert "YOU\ninspect workspace" in output
     assert "ATHENA\ncompleted" in output
+
+
+@pytest.mark.asyncio
+async def test_native_session_projection_send_accepts_conversation():
+    session = NativeSession(parse_args([]))
+
+    class Writer:
+        def __init__(self):
+            self.data = b""
+
+        def write(self, data):
+            self.data += data
+
+        async def drain(self):
+            return None
+
+    session._writer = Writer()
+    session._conversation.append({"id": 1, "role": "user", "text": "hello"})
+    await session._send_projection()
+
+    import json
+
+    payload = json.loads(session._writer.data.decode("utf-8"))
+    assert payload["conversation"][0] == {"id": 1, "role": "user", "text": "hello"}
+
+
+@pytest.mark.asyncio
+async def test_native_submit_publishes_semantic_transcript(capsys):
+    session = NativeSession(parse_args([]))
+    session._writer = None  # compatibility PTY test; projection writes are disabled
+
+    class Service:
+        async def submit(self, request, wait=False):
+            return SimpleNamespace(id="task-1", session_id="session-1")
+
+        async def stream_events(self, task_id, after_sequence=0):
+            del task_id, after_sequence
+            if False:
+                yield None
+
+        async def get_result(self, task_id):
+            return SimpleNamespace(summary="semantic response")
+
+    session.service = Service()
+    sent = []
+
+    async def flush():
+        sent.append(list(session._conversation))
+        session._projection_dirty = False
+
+    session._flush_projection = flush  # type: ignore[method-assign]
+    await session._submit("inspect workspace")
+
+    assert sent == [
+        [{"id": 1, "role": "user", "text": "inspect workspace"}],
+        [
+            {"id": 1, "role": "user", "text": "inspect workspace"},
+            {"id": 2, "role": "assistant", "text": "semantic response"},
+        ],
+    ]
+    output = capsys.readouterr().out
+    assert "YOU\ninspect workspace" in output
+    assert "ATHENA\nsemantic response" in output
 
 
 @pytest.mark.asyncio

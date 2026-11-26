@@ -149,6 +149,38 @@ def _missing_evidence(case: EvaluationCase, outcome: EvaluationOutcome) -> tuple
     return tuple(item for item in case.required_evidence if item not in present)
 
 
+def compare_delegation_outcomes(
+    case: EvaluationCase,
+    *,
+    single_agent: EvaluationOutcome,
+    delegated: EvaluationOutcome,
+) -> dict[str, Any]:
+    """Compare delegation against a single-agent run on one fixed case."""
+    report = compare_outcomes(case, {"single_agent": single_agent, "delegated": delegated})
+    single_complete = bool(report["systems"]["single_agent"]["eligible_as_complete"])
+    delegated_complete = bool(report["systems"]["delegated"]["eligible_as_complete"])
+    child_evidence = tuple(str(item) for item in (delegated.metadata.get("child_evidence") or ()))
+    return {
+        **report,
+        "comparison": {
+            "single_agent_completed": single_complete,
+            "delegated_completed": delegated_complete,
+            "completion_delta": int(delegated_complete) - int(single_complete),
+            "delegation_count": delegated.delegation_count,
+            "child_evidence": list(child_evidence),
+            "child_evidence_verified": bool(
+                delegated_complete and set(case.required_evidence).issubset(set(child_evidence))
+            ),
+            "materially_contributed": None,
+            "conclusion": (
+                "delegation_qualified_on_fixed_case"
+                if delegated_complete and single_complete and child_evidence
+                else "inconclusive"
+            ),
+        },
+    }
+
+
 def compare_outcomes(
     case: EvaluationCase,
     outcomes: Mapping[str, EvaluationOutcome],
@@ -303,6 +335,7 @@ __all__ = [
     "EvaluationOutcome",
     "NeutralEvaluationHarness",
     "compare_outcomes",
+    "compare_delegation_outcomes",
     "dumps_report",
     "outcome_from_record",
 ]

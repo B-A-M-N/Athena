@@ -29,6 +29,7 @@ from athena.protocol.tasks import (
     WorkspaceSpec,
 )
 from athena.reality import RealityGate
+from athena.reality.request_risk import is_opaque_execution
 from athena.shadow.engine import ShadowEngine
 
 
@@ -286,8 +287,6 @@ async def test_pty_session_inherits_candidate_workspace(tmp_path):
 
 def test_is_opaque_execution_classifies_correctly():
     """Unit-level classification of opaque execution."""
-    from athena.reality.gate import RealityGate
-
     desc = CapabilityDescriptor(
         id="x",
         description="d",
@@ -295,17 +294,17 @@ def test_is_opaque_execution_classifies_correctly():
         effects=frozenset(),
         origin=CapabilityOrigin.NATIVE,
     )
-    assert RealityGate._is_opaque_execution(
+    assert is_opaque_execution(
         CapabilityRequest(capability_id="execute", arguments={}, task_id="t", call_id="c"),
         frozenset({EffectClass.EXECUTE}),
         desc,
     )
-    assert RealityGate._is_opaque_execution(
+    assert is_opaque_execution(
         CapabilityRequest(capability_id="shell", arguments={}, task_id="t", call_id="c"),
         frozenset({EffectClass.SPAWN_PROCESS}),
         desc,
     )
-    assert RealityGate._is_opaque_execution(
+    assert is_opaque_execution(
         CapabilityRequest(capability_id="gen.run", arguments={}, task_id="t", call_id="c"),
         frozenset({EffectClass.READ_LOCAL}),
         CapabilityDescriptor(
@@ -317,7 +316,7 @@ def test_is_opaque_execution_classifies_correctly():
         ),
     )
     # Transparent fs.write is not opaque.
-    assert not RealityGate._is_opaque_execution(
+    assert not is_opaque_execution(
         CapabilityRequest(capability_id="fs", arguments={}, task_id="t", call_id="c"),
         frozenset({EffectClass.WRITE_LOCAL}),
         desc,

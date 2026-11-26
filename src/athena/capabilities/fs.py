@@ -13,6 +13,8 @@ single MutationRef through the MutationStore without double-counting
 """
 
 from __future__ import annotations
+from athena.capabilities.operations import native_descriptor
+from athena.capabilities.dispatch_helpers import ReferenceCountedKeyedLocks
 
 import asyncio
 import base64
@@ -22,10 +24,10 @@ import hashlib
 import json
 import os
 import secrets
-import threading
 
 from athena.protocol.capabilities import (
-    CapabilityDescriptor,
+    CapabilityFailure,
+    CapabilityFailureCode,
     CapabilityOrigin,
     CapabilityRequest,
     CapabilityResult,
@@ -36,7 +38,7 @@ from athena.protocol.capabilities import (
 )
 from athena.protocol.errors import FilesystemConflict, PolicyDenied
 from athena.protocol.tasks import PathRule, WorkspaceSpec
-from athena.execution.async_call import run_blocking
+from athena.concurrency import run_blocking
 
 _OPERATIONS = (
     "read",
@@ -52,15 +54,32 @@ _OPERATIONS = (
 
 _MUTATING_OPERATIONS = frozenset(("write", "patch", "mkdir", "copy", "move", "delete"))
 
-_LOCK = threading.RLock()
-_PATH_LOCKS: dict[str, asyncio.Lock] = {}
+_PATH_LOCKS = ReferenceCountedKeyedLocks()
 
 
 def _path_lock(path: str) -> asyncio.Lock:
-    """Per-realpath lock to serialize writes/patches to the same target."""
+    """Per-realpath ref-counted lock for the CAS window of one mutation."""
     real = os.path.realpath(os.path.abspath(path))
-    with _LOCK:
-        return _PATH_LOCKS.setdefault(real, asyncio.Lock())
+    return _PATH_LOCKS.acquire_reference(real)
+
+
+def _fs_resource_keys(arguments, workspace: WorkspaceSpec) -> tuple[str, ...]:
+    """Declare exact filesystem resource identity for dispatcher controls.
+
+    ``path`` and ``destination`` are resolved against the workspace and
+    normalized to realpaths. This keeps same-target mutation ordering with
+    the executor's own compare-and-swap lock rather than relying on generic
+    dispatcher argument-name guesses.
+    """
+    keys: list[str] = []
+    root = os.path.realpath(os.path.abspath(workspace.root))
+    for name in ("path", "destination"):
+        value = arguments.get(name)
+        if not isinstance(value, str) or not value:
+            continue
+        candidate = value if os.path.isabs(value) else os.path.join(root, value)
+        keys.append(os.path.realpath(os.path.abspath(candidate)))
+    return tuple(sorted(set(keys)))
 
 
 def _fs_cache_key(arguments, workspace: WorkspaceSpec) -> str | None:
@@ -114,15 +133,39 @@ def _fs_cache_key(arguments, workspace: WorkspaceSpec) -> str | None:
 
 @asynccontextmanager
 async def _resource_locks(*paths: str):
-    """Serialize a mutation's compare-and-swap window for every resource."""
+    """Cancellation-safe compare-and-swap window for every resource.
+
+    Acquires in sorted order. If cancelled while waiting for a later lock,
+    all already-held locks and references are released, so future callers
+    cannot be stranded behind an abandoned CAS window.
+    """
     locks = [_path_lock(path) for path in sorted(set(paths))]
-    for lock in locks:
-        await lock.acquire()
+    acquired: list[asyncio.Lock] = []
     try:
+        for lock in locks:
+            await lock.acquire()
+            acquired.append(lock)
         yield
     finally:
-        for lock in reversed(locks):
+        # ``locked()`` is not ownership. Release only locks this caller
+        # acquired, and drop exactly one reference for every reservation.
+        for lock in reversed(acquired):
             lock.release()
+        for lock in locks:
+            _PATH_LOCKS.release_reference(lock)
+
+
+_OPERATION_FAILURE_CODES = {
+    "read": CapabilityFailureCode.NOT_FOUND,
+    "write": CapabilityFailureCode.INVALID_INPUT,
+    "patch": CapabilityFailureCode.INVALID_INPUT,
+    "list": CapabilityFailureCode.NOT_FOUND,
+    "stat": CapabilityFailureCode.NOT_FOUND,
+    "mkdir": CapabilityFailureCode.ALREADY_EXISTS,
+    "copy": CapabilityFailureCode.NOT_FOUND,
+    "move": CapabilityFailureCode.NOT_FOUND,
+    "delete": CapabilityFailureCode.NOT_FOUND,
+}
 
 
 _PATH = {"type": "string", "minLength": 1}
@@ -201,7 +244,7 @@ _INPUT_SCHEMA = {
 class FilesystemCapability:
     """Structured fs operations enforcing workspace writable/readable scopes."""
 
-    descriptor = CapabilityDescriptor(
+    descriptor = native_descriptor(
         id="fs",
         description=(
             "Structured fs for inspecting and reading project files: read_file, "
@@ -232,6 +275,7 @@ class FilesystemCapability:
             "list": CachePolicy.CONTENT_ADDRESS,
         },
         cache_key_resolver=_fs_cache_key,
+        resource_key_resolver=_fs_resource_keys,
         origin=CapabilityOrigin.NATIVE,
     )
 
@@ -247,6 +291,21 @@ class FilesystemCapability:
         self.artifact_store = artifact_store
         self.mutation_store = mutation_store
 
+    def _conformance_failure_probe(self) -> dict:
+        """Return typed failure metadata for the generic conformance suite."""
+        request = CapabilityRequest(
+            capability_id=self.descriptor.id,
+            arguments={"operation": "read", "path": "conformance"},
+            task_id="conformance",
+            call_id="conformance-probe",
+        )
+        failure = CapabilityFailure(
+            code=CapabilityFailureCode.NOT_FOUND,
+            detail="conformance probe",
+            stage="invoke",
+        )
+        return dict(CapabilityResult.failure(request, failure).metadata or {})
+
     async def invoke(
         self,
         request: CapabilityRequest,
@@ -259,15 +318,21 @@ class FilesystemCapability:
         path = args.get("path")
         ws = context.workspace if context else self.workspace
         if ws is None:
-            return _fail(request, "no workspace bound")
+            return _fail(
+                request, "no workspace bound", code=CapabilityFailureCode.PRECONDITION_FAILED
+            )
         if op not in _OPERATIONS:
-            return _fail(request, f"unknown operation {op!r}")
+            return _fail(
+                request,
+                f"unknown operation {op!r}",
+                code=CapabilityFailureCode.UNSUPPORTED_OPERATION,
+            )
         if not path:
-            return _fail(request, "path required")
+            return _fail(request, "path required", code=CapabilityFailureCode.INVALID_INPUT)
         try:
             abs_path = self._resolve(path, ws)
         except PolicyDenied as e:
-            return _fail(request, str(e))
+            return _fail(request, str(e), code=_operation_failure_code(request))
 
         if op == "copy":
             self._check_readable(abs_path, ws)
@@ -291,9 +356,9 @@ class FilesystemCapability:
         try:
             return await handler(request, args, abs_path, ws, context)
         except FilesystemConflict as e:
-            return _fail(request, str(e))
+            return _fail(request, str(e), code=CapabilityFailureCode.CONFLICT)
         except (PolicyDenied, OSError) as e:
-            return _fail(request, str(e))
+            return _fail(request, str(e), code=_operation_failure_code(request))
 
     # ------------------------------------------------------------------ #
     # Operations
@@ -303,13 +368,17 @@ class FilesystemCapability:
             with self._safe_open_read(path, ws) as f:
                 data = f.read()
         except PolicyDenied as e:
-            return _fail(request, str(e))
+            return _fail(request, str(e), code=_operation_failure_code(request))
         except FileNotFoundError:
-            return _fail(request, f"no such file: {path}")
+            return _fail(request, f"no such file: {path}", code=CapabilityFailureCode.NOT_FOUND)
         except IsADirectoryError:
-            return _fail(request, f"is a directory: {path}")
+            return _fail(
+                request, f"is a directory: {path}", code=CapabilityFailureCode.PRECONDITION_FAILED
+            )
         except PermissionError:
-            return _fail(request, f"permission denied: {path}")
+            return _fail(
+                request, f"permission denied: {path}", code=CapabilityFailureCode.DOMAIN_REJECTED
+            )
         encoding = args.get("encoding", "text")
         if encoding == "base64":
             return _ok(
@@ -320,16 +389,24 @@ class FilesystemCapability:
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError:
-            return _fail(request, "file is not valid UTF-8; read it with encoding=base64")
+            return _fail(
+                request,
+                "file is not valid UTF-8; read it with encoding=base64",
+                code=CapabilityFailureCode.DOMAIN_REJECTED,
+            )
         return _ok(request, text, metadata={"encoding": "utf-8", "bytes": len(data)})
 
     async def _write(self, request, args, path, ws, context=None):
         try:
             content = _decode_content(args, "content", "content_base64")
         except ValueError as e:
-            return _fail(request, str(e))
+            return _fail(request, str(e), code=_operation_failure_code(request))
         if content is None:
-            return _fail(request, "write requires content or content_base64")
+            return _fail(
+                request,
+                "write requires content or content_base64",
+                code=CapabilityFailureCode.INVALID_INPUT,
+            )
         create_dirs = args.get("create_dirs", False)
         async with _resource_locks(path):
             before_ref, before = await self._capture_before(request.task_id, path, ws)
@@ -352,7 +429,7 @@ class FilesystemCapability:
                 self._apply_expected_mode(path, context, ws)
             except OSError as e:
                 await self._abort(intent_id, str(e))
-                return _fail(request, str(e))
+                return _fail(request, str(e), code=_operation_failure_code(request))
             reversible = before is None or before_ref is not None
             await self._complete(intent_id, after, reversible, _inverse("write", path, before_ref))
         return _ok(
@@ -366,9 +443,11 @@ class FilesystemCapability:
         try:
             new_content = _decode_content(args, "new_content", "new_content_base64")
         except ValueError as e:
-            return _fail(request, str(e))
+            return _fail(request, str(e), code=_operation_failure_code(request))
         if new_content is None:
-            return _fail(request, "patch requires new_content")
+            return _fail(
+                request, "patch requires new_content", code=CapabilityFailureCode.INVALID_INPUT
+            )
         async with _resource_locks(path):
             before_ref, before = await self._capture_before(request.task_id, path, ws)
             self._check_expected_preimage(path, before, context)
@@ -388,7 +467,7 @@ class FilesystemCapability:
                 self._apply_expected_mode(path, context, ws)
             except OSError as e:
                 await self._abort(intent_id, str(e))
-                return _fail(request, str(e))
+                return _fail(request, str(e), code=_operation_failure_code(request))
             reversible = before is None or before_ref is not None
             await self._complete(intent_id, after, reversible, _inverse("patch", path, before_ref))
         return _ok(
@@ -405,9 +484,11 @@ class FilesystemCapability:
             finally:
                 os.close(fd)
         except FileNotFoundError:
-            return _fail(request, f"no such dir: {path}")
+            return _fail(request, f"no such dir: {path}", code=CapabilityFailureCode.NOT_FOUND)
         except NotADirectoryError:
-            return _fail(request, f"not a directory: {path}")
+            return _fail(
+                request, f"not a directory: {path}", code=CapabilityFailureCode.PRECONDITION_FAILED
+            )
         return _ok(request, "\n".join(entries))
 
     async def _stat(self, request, args, path, ws, context=None):
@@ -418,7 +499,7 @@ class FilesystemCapability:
             finally:
                 os.close(fd)
         except OSError as e:
-            return _fail(request, str(e))
+            return _fail(request, str(e), code=_operation_failure_code(request))
         import stat as statmod
 
         info = {
@@ -454,7 +535,7 @@ class FilesystemCapability:
             os.close(directory_fd)
         except OSError as e:
             await self._abort(intent_id, str(e))
-            return _fail(request, str(e))
+            return _fail(request, str(e), code=_operation_failure_code(request))
         await self._complete(
             intent_id,
             None,
@@ -491,7 +572,7 @@ class FilesystemCapability:
                 self._apply_expected_mode(dest, context, ws)
             except OSError as e:
                 await self._abort(intent_id, str(e))
-                return _fail(request, str(e))
+                return _fail(request, str(e), code=_operation_failure_code(request))
             await self._complete(intent_id, after, True, _inverse("copy", dest, dest_before_ref))
             return _ok(
                 request,
@@ -531,7 +612,7 @@ class FilesystemCapability:
                 )
             except (OSError, PolicyDenied) as e:
                 await self._abort(intent_id, str(e))
-                return _fail(request, str(e))
+                return _fail(request, str(e), code=_operation_failure_code(request))
             finally:
                 if source_directory is not None:
                     os.close(source_directory)
@@ -559,7 +640,11 @@ class FilesystemCapability:
     async def _delete(self, request, args, path, ws, context=None):
         async with _resource_locks(path):
             if os.path.isdir(path) and not os.path.islink(path):
-                return _fail(request, "refusing recursive directory delete")
+                return _fail(
+                    request,
+                    "refusing recursive directory delete",
+                    code=CapabilityFailureCode.DOMAIN_REJECTED,
+                )
             before_ref, before = await self._capture_before(request.task_id, path, ws)
             self._check_expected_preimage(path, before, context)
             intent_id = await self._intent(
@@ -577,7 +662,7 @@ class FilesystemCapability:
                 os.unlink(os.path.basename(path), dir_fd=directory)
             except (OSError, PolicyDenied) as e:
                 await self._abort(intent_id, str(e))
-                return _fail(request, str(e))
+                return _fail(request, str(e), code=_operation_failure_code(request))
             finally:
                 if directory is not None:
                     os.close(directory)
@@ -1006,12 +1091,24 @@ def _ok(
     )
 
 
-def _fail(request: CapabilityRequest, msg: str) -> CapabilityResult:
-    return CapabilityResult(
-        request.call_id,
-        request.capability_id,
-        CapabilityResultStatus.FAILED,
-        error=msg,
+def _operation_failure_code(request: CapabilityRequest) -> CapabilityFailureCode:
+    """Map remaining operation failures to a stable default by operation."""
+    operation = str((request.arguments or {}).get("operation") or "")
+    return _OPERATION_FAILURE_CODES.get(operation, CapabilityFailureCode.PERMANENT_RUNTIME)
+
+
+def _fail(request: CapabilityRequest, msg: str, *, code: CapabilityFailureCode) -> CapabilityResult:
+    """Return a canonical failed result carrying a typed capability failure."""
+    operation = str((request.arguments or {}).get("operation") or "")
+    return CapabilityResult.failure(
+        request,
+        CapabilityFailure(
+            code=code,
+            detail=msg,
+            stage="invoke",
+            operation=operation,
+            resource=str((request.arguments or {}).get("path") or ""),
+        ),
     )
 
 

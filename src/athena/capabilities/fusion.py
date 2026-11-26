@@ -1,13 +1,13 @@
 """Model-visible bounded access to Athena's fusion machinery."""
 
 from __future__ import annotations
+from athena.capabilities.operations import native_descriptor
 
 import dataclasses
 import json
 from typing import Any
 
 from athena.protocol.capabilities import (
-    CapabilityDescriptor,
     CapabilityOrigin,
     CapabilityRequest,
     CapabilityResult,
@@ -21,15 +21,16 @@ class FusionCapability:
 
     Fusion remains one-agent orchestration: this capability delegates to the
     service-owned :class:`FusionOrchestrator`, which uses the normal dispatcher
-    for shadow execution, verification, and real-workspace commit.
+    for shadow execution and verification. It never promotes a candidate into
+    reality; the kernel's RealityCoordinator owns candidate→reality promotion.
     """
 
-    descriptor = CapabilityDescriptor(
+    descriptor = native_descriptor(
         id="fusion",
         description=(
             "Run bounded speculative experiments in a shadow workspace, inspect "
-            "or discard branches, commit verified changes, create causal forks, "
-            "and capture workspace checkpoints."
+            "or discard candidates, create causal forks, and capture workspace "
+            "checkpoints. Verified candidates remain awaiting reality promotion."
         ),
         input_schema={
             "type": "object",
@@ -41,12 +42,12 @@ class FusionCapability:
                         "run",
                         "compare",
                         "status",
-                        "commit",
                         "discard",
                         "fork",
                         "checkpoint",
                         "inspect_checkpoint",
                         "release_checkpoint",
+                        "synthesize",
                     ],
                 },
                 "branch_id": {"type": "string", "minLength": 1, "maxLength": 128},
@@ -87,11 +88,6 @@ class FusionCapability:
                         },
                     },
                 },
-                "criteria_probes": {
-                    "type": "array",
-                    "maxItems": 100,
-                    "items": {"type": "object", "additionalProperties": True},
-                },
                 "invariants": {
                     "type": "array",
                     "maxItems": 100,
@@ -104,12 +100,15 @@ class FusionCapability:
                 "checkpoint_id": {"type": "string"},
                 "label": {"type": "string"},
                 "reason": {"type": "string"},
+                "changes_from_previous": {"type": "string", "minLength": 1, "maxLength": 2000},
+                "parallel": {"type": "boolean"},
+                "max_parallel": {"type": "integer", "minimum": 1, "maximum": 4},
             },
             "oneOf": [
                 {"properties": {"operation": {"const": "run"}}, "required": ["proposal"]},
                 {"properties": {"operation": {"const": "compare"}}, "required": ["proposals"]},
                 {
-                    "properties": {"operation": {"enum": ["status", "commit", "discard"]}},
+                    "properties": {"operation": {"enum": ["status", "discard"]}},
                     "required": ["branch_id"],
                 },
                 {
@@ -123,6 +122,10 @@ class FusionCapability:
                 {
                     "properties": {"operation": {"const": "release_checkpoint"}},
                     "required": ["checkpoint_id"],
+                },
+                {
+                    "properties": {"operation": {"const": "synthesize"}},
+                    "required": ["branch_id"],
                 },
                 {"properties": {"operation": {"const": "checkpoint"}}},
             ],
@@ -158,12 +161,22 @@ class FusionCapability:
                 outcome = await orchestrator.run_experiment(
                     task_id=task_id,
                     proposal=proposal,
-                    criteria_probes=[dict(item) for item in args.get("criteria_probes") or ()],
                     invariants=[dict(item) for item in args.get("invariants") or ()],
                     profile=args.get("profile"),
                     auto_fork_on_failure=bool(args.get("auto_fork_on_failure", True)),
                 )
-                return _result(request, output=json.dumps(dataclasses.asdict(outcome)))
+                return _result(
+                    request,
+                    output=json.dumps(dataclasses.asdict(outcome)),
+                    metadata={
+                        "operation": operation,
+                        "branch_id": outcome.branch_id,
+                        "speculative_status": outcome.status,
+                        "diagnostic": dict(outcome.failure_record.get("diagnostic") or {}),
+                        "failure_record": dict(outcome.failure_record),
+                        "changes_from_previous": str(args.get("changes_from_previous") or ""),
+                    },
+                )
             if operation == "compare":
                 proposals = [
                     [dict(step) for step in proposal] for proposal in args.get("proposals") or ()
@@ -177,11 +190,51 @@ class FusionCapability:
                 outcome = await orchestrator.compare(
                     task_id=task_id,
                     proposals=proposals,
-                    criteria_probes=[dict(item) for item in args.get("criteria_probes") or ()],
                     invariants=[dict(item) for item in args.get("invariants") or ()],
                     profile=args.get("profile"),
+                    parallel=bool(args.get("parallel", False)),
+                    max_parallel=int(args.get("max_parallel") or 2),
                 )
-                return _result(request, output=json.dumps(outcome))
+                return _result(
+                    request,
+                    output=json.dumps(outcome),
+                    metadata={
+                        "operation": operation,
+                        "comparison_id": outcome.get("comparison_id"),
+                        "verified_count": outcome.get("verified_count", 0),
+                        "comparative_evidence": {
+                            str(item.get("branch_id")): dict(item.get("comparative_evidence") or {})
+                            for item in outcome.get("candidates", ())
+                            if item.get("branch_id")
+                        },
+                    },
+                )
+
+            if operation == "synthesize":
+                branch = _owned_branch(orchestrator, str(args.get("branch_id") or ""), task_id)
+                if branch is None:
+                    return _result(request, ok=False, error="branch not found")
+                outcome = await orchestrator.synthesize_from_branch(
+                    self._service._registry,
+                    name=str(args.get("name") or ""),
+                    description=str(args.get("description") or ""),
+                    code=str(args.get("code") or ""),
+                    input_schema=dict(args.get("input_schema") or {}),
+                    effects=set(args.get("effects") or set()),
+                    task_id=task_id,
+                    validation_cases=[dict(item) for item in args.get("validation_cases") or ()],
+                    branch_id=branch.id,
+                    workspace=branch.shadow_workspace,
+                )
+                return _result(
+                    request,
+                    output=json.dumps(outcome),
+                    metadata={
+                        "operation": operation,
+                        "branch_id": branch.id,
+                        "admitted": bool(outcome.get("admitted")),
+                    },
+                )
 
             branch_id = str(args.get("branch_id") or "")
             if operation == "status":
@@ -196,12 +249,6 @@ class FusionCapability:
                 outcome = await orchestrator.shadow.discard(
                     branch, reason=str(args.get("reason") or "discarded by operator")
                 )
-                return _result(request, output=json.dumps(outcome))
-            if operation == "commit":
-                branch = _owned_branch(orchestrator, branch_id, task_id)
-                if branch is None:
-                    return _result(request, ok=False, error="branch not found")
-                outcome = await orchestrator.shadow.commit(branch)
                 return _result(request, output=json.dumps(outcome))
             if operation == "fork":
                 if "after_event_sequence" not in args:
@@ -305,13 +352,21 @@ def _checkpoint_owned_by_task(checkpoint: Any, task_id: str) -> bool:
     return owner is None or str(owner) == task_id
 
 
-def _result(request, *, ok: bool = True, output: str = "", error: str | None = None):
+def _result(
+    request,
+    *,
+    ok: bool = True,
+    output: str = "",
+    error: str | None = None,
+    metadata: dict[str, Any] | None = None,
+):
     return CapabilityResult(
         request.call_id,
         request.capability_id,
         CapabilityResultStatus.OK if ok else CapabilityResultStatus.FAILED,
         output=output,
         error=error,
+        metadata=metadata or {},
     )
 
 

@@ -7,7 +7,6 @@ exists separately.
 
 from __future__ import annotations
 
-import asyncio
 from typing import AsyncIterator, Mapping
 
 from athena.execution.backend import BackendCapabilities, ExecutionBackend
@@ -31,11 +30,14 @@ class LocalBackend(ExecutionBackend):
             persistent_runtime_state=True,
             reattach=False,
             filesystem_persistence=True,
-            network_modes=("allow", "deny", "restricted"),
+            network_modes=("allow", "deny"),
+            network_policy_effects={"allow": "allow", "deny": "deny", "restricted": "deny"},
+            resource_limits=True,
             secret_materialization=True,
             interactive_stdin=True,
             process_signals=True,
             dependency_installation=("python", "node"),
+            runtime_lifetime="athena_process",
             runtime_capabilities={
                 runtime: {
                     "filesystem_containment": True,
@@ -60,6 +62,7 @@ class LocalBackend(ExecutionBackend):
         env: Mapping[str, str] | None = None,
         workspace_root: str | None = None,
         network_policy: str | None = None,
+        resource_limits=None,
     ) -> str:
         return await self.manager.create_session(
             task_id=task_id,
@@ -68,6 +71,7 @@ class LocalBackend(ExecutionBackend):
             env=dict(env) if env else None,
             workspace_root=workspace_root,
             network_policy=network_policy,
+            resource_limits=resource_limits,
         )
 
     async def execute(self, request: ExecutionRequest) -> AsyncIterator[ExecutionEvent]:
@@ -80,21 +84,7 @@ class LocalBackend(ExecutionBackend):
         await self.manager.interrupt(execution_id)
 
     async def destroy_session(self, runtime_session_id: str) -> None:
-        for task_id in list(self.manager._task_sessions):  # noqa: SLF001
-            await self._destroy_in_task(task_id, runtime_session_id)
-
-    async def _destroy_in_task(self, task_id: str, runtime_session_id: str) -> None:
-        sessions = self.manager._task_sessions.get(task_id, [])  # noqa: SLF001
-        for rt, sid in list(sessions):
-            if sid == runtime_session_id:
-                self.manager._runtime_by_session.pop(sid, None)  # noqa: SLF001
-                sessions.remove((rt, sid))
-                close = getattr(rt, "close", None)
-                if close is not None:
-                    if asyncio.iscoroutinefunction(close):
-                        await close(sid)
-                    else:
-                        close(sid)
+        await self.manager.destroy_session(runtime_session_id)
 
     async def shutdown(self) -> None:
         await self.manager.close_all()

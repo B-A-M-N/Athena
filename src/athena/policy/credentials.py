@@ -128,7 +128,7 @@ class _CommandSecretSource(SecretSource):
         if shutil.which(argv[0]) is None:
             return None
         try:
-            completed = subprocess.run(  # architecture-lint: allow subprocess-outside-approved-backends reason=owner-authenticated secret-store CLI
+            completed = subprocess.run(  # architecture-lint: allow subprocess-outside-approved-backends reason=owner-authenticated secret-store CLI; architecture-exception: secret-store-cli
                 argv,
                 check=True,
                 capture_output=True,

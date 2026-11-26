@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from athena.concurrency import ReferenceCountedKeyedLocks
 from athena.kernel.continuations_coordinator import ContinuationCoordinator
 from athena.kernel.kernel import AgentKernel
 
@@ -59,7 +60,7 @@ def _kernel(task_id: str, *, input_store=None, continuation_store=None):
         _resume={task_id: asyncio.Event()},
         _resume_decision={},
         _resume_armed=set(),
-        _resume_locks={},
+        _resume_locks=ReferenceCountedKeyedLocks(),
         _input_request_store=input_store,
         _continuation_store=continuation_store,
         _parked_slot_wait_s=0.0,

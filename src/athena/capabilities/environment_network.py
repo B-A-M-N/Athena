@@ -3,7 +3,7 @@
 http, tcp_connect, dns, listeners, connections, ping. Read-only effects."""
 
 from athena.capabilities import environment as _facade
-from athena.protocol.capabilities import CapabilityDescriptor
+from athena.capabilities.operations import native_descriptor
 from athena.protocol.capabilities import CapabilityOrigin
 from athena.protocol.capabilities import CapabilityRequest
 from athena.protocol.capabilities import CapabilityResult
@@ -29,14 +29,14 @@ from athena.capabilities.environment_common import _external_receipt_result
 from athena.capabilities.environment_common import _external_request_digest
 from athena.capabilities.environment_common import _safe_external_response
 from athena.capabilities.environment_common import _network_effects
-from athena.execution.async_call import run_blocking
+from athena.concurrency import run_blocking
 from athena.network.target_policy import validate_target
 
 
 class NetworkCapability:
     """Machine networking diagnostics as first-class primitives."""
 
-    descriptor = CapabilityDescriptor(
+    descriptor = native_descriptor(
         id="network",
         description=(
             "Network diagnostics: HTTP requests (method/headers/body), raw "
@@ -203,8 +203,10 @@ class NetworkCapability:
                 policy_name=policy_name,
             )
 
-        def _restricted_addresses(host: str) -> tuple[str | None, tuple[str, ...]]:
-            validated, error = validate_target(
+        async def _restricted_addresses(host: str) -> tuple[str | None, tuple[str, ...]]:
+            """Validate and pin DNS while resolving off the event loop."""
+            validated, error = await run_blocking(
+                validate_target,
                 host,
                 policy_name,
                 resolver=_facade.resolve_addresses,
@@ -222,7 +224,7 @@ class NetworkCapability:
                     request, ok=False, error="url must use http or https and include a host"
                 )
             hostname = parsed.hostname
-            restricted_error, pinned_addresses = _restricted_addresses(hostname)
+            restricted_error, pinned_addresses = await _restricted_addresses(hostname)
             if restricted_error:
                 return _result(request, ok=False, error=restricted_error)
             follow_redirects = bool(args.get("follow_redirects", False))
@@ -280,7 +282,7 @@ class NetworkCapability:
             port = int(args.get("port") or 0)
             if not (0 < port < 65536):
                 return _result(request, ok=False, error="valid port required")
-            restricted_error, pinned_addresses = _restricted_addresses(host)
+            restricted_error, pinned_addresses = await _restricted_addresses(host)
             if restricted_error:
                 return _result(request, ok=False, error=restricted_error)
 
@@ -304,19 +306,13 @@ class NetworkCapability:
 
         if op == "dns":
             name = str(args.get("name") or "localhost")
-            restricted_error, _ = _restricted_addresses(name)
+            restricted_error, resolved_addresses = await _restricted_addresses(name)
             if restricted_error:
                 return _result(request, ok=False, error=restricted_error)
 
-            def _dns():
-                infos = socket.getaddrinfo(name, None)
-                uniq = sorted({str(i[4][0]) for i in infos})
-                return f"{name} -> {', '.join(uniq)}"
+            uniq = sorted(dict.fromkeys(resolved_addresses))
+            text = f"{name} -> {', '.join(uniq)}" if uniq else f"{name} -> no addresses"
 
-            try:
-                text = await run_blocking(_dns)
-            except socket.gaierror as exc:
-                return _result(request, ok=False, error=str(exc))
             return _result(request, output=text)
 
         if op == "listeners":
@@ -339,7 +335,7 @@ class NetworkCapability:
             host = str(args.get("host") or "")
             if not host:
                 return _result(request, ok=False, error="host required")
-            restricted_error, pinned_addresses = _restricted_addresses(host)
+            restricted_error, pinned_addresses = await _restricted_addresses(host)
             if restricted_error:
                 return _result(request, ok=False, error=restricted_error)
 

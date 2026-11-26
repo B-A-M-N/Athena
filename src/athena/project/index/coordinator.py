@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 from collections.abc import Iterable
 from typing import Any
 
-from athena.execution.async_call import run_blocking
+from athena.concurrency import ReferenceCountedKeyedLocks, run_blocking
 from athena.project.index.builder import ProjectIndexBuilder
+from athena.project.index.cache import ProjectIndexCache
 from athena.project.index.models import ProjectIndex
 from athena.project.index.store import ProjectIndexStore
 
@@ -20,12 +20,13 @@ class ProjectIndexCoordinator:
         self,
         store: ProjectIndexStore | None,
         builder: ProjectIndexBuilder | None = None,
+        cache_limit: int = 16,
     ) -> None:
         self._store = store
         self._builder = builder or ProjectIndexBuilder()
-        self._cache: dict[str, ProjectIndex] = {}
+        self._cache = ProjectIndexCache(cache_limit)
         self._stale: set[str] = set()
-        self._locks: dict[str, asyncio.Lock] = {}
+        self._locks = ReferenceCountedKeyedLocks()
 
     async def current(
         self,
@@ -59,8 +60,7 @@ class ProjectIndexCoordinator:
             )
         ):
             return cached
-        lock = self._locks.setdefault(canonical, asyncio.Lock())
-        async with lock:
+        async with self._locks.lock(canonical):
             cached = self._cache.get(canonical)
             if (
                 cached is not None
@@ -85,7 +85,7 @@ class ProjectIndexCoordinator:
                         persisted.source_revision,
                     )
                 ):
-                    self._cache[canonical] = persisted
+                    self._discard_evicted(self._cache.store(canonical, persisted))
                     return persisted
             previous = cached
             if previous is None and self._store is not None:
@@ -100,7 +100,7 @@ class ProjectIndexCoordinator:
                             persisted.source_revision,
                         )
                     ):
-                        self._cache[canonical] = persisted
+                        self._discard_evicted(self._cache.store(canonical, persisted))
                         return persisted
             incremental = getattr(self._builder, "incremental", None)
             if refresh and changed and previous is not None and callable(incremental):
@@ -109,7 +109,7 @@ class ProjectIndexCoordinator:
                 index = await run_blocking(self._builder.build, canonical)
             if self._store is not None:
                 await self._store.save(index)
-            self._cache[canonical] = index
+            self._discard_evicted(self._cache.store(canonical, index))
             self._stale.discard(canonical)
             return index
 
@@ -127,6 +127,10 @@ class ProjectIndexCoordinator:
             return False
         return str(current) == expected
 
+    def _discard_evicted(self, root: str | None) -> None:
+        if root is not None:
+            self._stale.discard(root)
+
     async def refresh(
         self,
         root: str,
@@ -134,6 +138,12 @@ class ProjectIndexCoordinator:
         changed_paths: Iterable[str] = (),
     ) -> ProjectIndex:
         return await self.current(root, refresh=True, changed_paths=changed_paths)
+
+    def release(self, root: str) -> None:
+        """Drop a workspace cache entry without touching durable index state."""
+        canonical = _canonical_root(root)
+        self._cache.release(canonical)
+        self._stale.discard(canonical)
 
     def mark_stale(self, root: str) -> None:
         self._stale.add(_canonical_root(root))

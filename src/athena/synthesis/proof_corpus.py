@@ -24,6 +24,7 @@ class DerivedProofCase:
             "kind": self.kind,
             "input": self.input,
             "expected": self.expected,
+            "verification_claim": f"{self.kind}:{self.expected}",
             "source": self.source,
             "analyzer_status": self.analyzer_status,
         }

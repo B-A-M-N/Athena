@@ -220,8 +220,7 @@ class GeneratedCapabilityStore:
         # visible in the same commit that removes each predecessor from the
         # active revision set. Superseded definitions stay enabled for audit
         # history and explicit rollback inspection.
-        await self._db.execute_raw("BEGIN IMMEDIATE")
-        try:
+        async with self._db.transaction(mode="IMMEDIATE") as db:
             # Re-read the predecessor and active family while holding the
             # write lock. The earlier read is only a fast validation; it must
             # not decide a successor after another writer has committed.
@@ -229,7 +228,7 @@ class GeneratedCapabilityStore:
             for predecessor_id in capability.supersedes:
                 if predecessor_id == capability.id:
                     continue
-                predecessor_row = await self._db.fetch_one_raw(
+                predecessor_row = await db.fetch_one_raw(
                     "SELECT scope, owner, definition FROM generated_capabilities WHERE id = ?",
                     (predecessor_id,),
                 )
@@ -270,7 +269,7 @@ class GeneratedCapabilityStore:
                 fresh_predecessors.append((predecessor_id, predecessor))
             predecessors = fresh_predecessors
 
-            active_row = await self._db.fetch_one_raw(
+            active_row = await db.fetch_one_raw(
                 "SELECT capability_id, revision FROM generated_active_families "
                 "WHERE scope = ? AND owner = ? AND family_id = ?",
                 (capability.scope.value, owner, capability.family_id),
@@ -301,11 +300,11 @@ class GeneratedCapabilityStore:
                         "lifecycle_history": history[-100:],
                     }
                 )
-                await self._db.execute_raw(
+                await db.execute_raw(
                     "UPDATE generated_capabilities SET definition = ?, updated_at = ? WHERE id = ?",
                     (json.dumps(predecessor, sort_keys=True), now, predecessor_id),
                 )
-            await self._db.execute_raw(
+            await db.execute_raw(
                 "DELETE FROM generated_active_families WHERE scope = ? AND owner = ? "
                 "AND family_id = ? AND capability_id IN ("
                 + ",".join("?" for _ in predecessors)
@@ -316,7 +315,7 @@ class GeneratedCapabilityStore:
                 if predecessors
                 else (),
             )
-            await self._db.execute_raw(
+            await db.execute_raw(
                 "INSERT INTO generated_capabilities("
                 "id, scope, owner, project_scope, user_scope, definition, "
                 "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
@@ -340,7 +339,7 @@ class GeneratedCapabilityStore:
                 ),
             )
             if capability.lifecycle_state not in {"SUPERSEDED", "DEPRECATED"}:
-                await self._db.execute_raw(
+                await db.execute_raw(
                     "INSERT INTO generated_active_families "
                     "(scope, owner, family_id, capability_id, revision) VALUES (?, ?, ?, ?, ?) "
                     "ON CONFLICT(scope, owner, family_id) DO UPDATE SET "
@@ -353,10 +352,6 @@ class GeneratedCapabilityStore:
                         capability.revision,
                     ),
                 )
-            await self._db.execute_raw("COMMIT")
-        except BaseException:
-            await self._db.execute_raw("ROLLBACK")
-            raise
 
     async def update_proof(
         self,

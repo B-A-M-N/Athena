@@ -6,7 +6,7 @@ from datetime import timedelta
 
 from hypothesis import given, strategies as st
 
-from athena.capabilities.schedule import _intersect_workspace_records, _workspace_covers
+from athena.scheduler.control import _intersect_workspace_records, _workspace_covers
 from athena.policy.path_scope import intersect_path_rules, path_rules_cover
 from athena.protocol.tasks import (
     CapabilityPolicy,

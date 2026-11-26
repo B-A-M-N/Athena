@@ -248,6 +248,7 @@ async def test_pack_hook_reconciles_task_committed_before_dispatch_receipt(
         "SELECT id FROM messages WHERE id = ?", (f"msg_user_{first_task_id}",)
     )
     assert len(messages) == 1
+    await service.wait_for(first_task_id, timeout=10.0)
     workflow_runs = await service._db.fetch_all(
         "SELECT id FROM workflow_runs WHERE task_id = ?", (first_task_id,)
     )

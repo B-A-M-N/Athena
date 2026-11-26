@@ -4,14 +4,25 @@ from __future__ import annotations
 
 from typing import Any
 
+from athena.execution.conformance import proof_status
+from athena.service.operational_matrix_ports import OperationalMatrixPorts
+
 
 def behavioral_proof(passport: Any, runtime: Any) -> dict[str, Any]:
     if not isinstance(passport, dict) or not isinstance(passport.get("cells"), list):
         return {"status": "not_run"}
     for cell in passport["cells"]:
         if isinstance(cell, dict) and cell.get("runtime") == runtime:
+            cell_status = proof_status(
+                checks=cell.get("checks") or (),
+                failures=cell.get("failures") or (),
+                unverified_claims=cell.get("unverified_claims") or (),
+            )
+            certified = passport.get("status") == "PASS" and cell_status == "passed"
             return {
-                "status": "passed" if cell.get("passed") else "failed",
+                "status": "passed" if certified else cell_status,
+                "certified": certified,
+                "passport_status": passport.get("status"),
                 "release_sha": passport.get("release_sha"),
                 "unverified_claims": list(cell.get("unverified_claims") or ()),
             }
@@ -19,9 +30,10 @@ def behavioral_proof(passport: Any, runtime: Any) -> dict[str, Any]:
 
 
 def build_operational_matrix(service: Any) -> dict[str, Any]:
-    from athena.execution.sandbox_doctor import sandbox_status
+    from athena.affordances.sandbox_doctor import sandbox_status
 
-    execution = getattr(service, "_execution", None)
+    ports = OperationalMatrixPorts(service)
+    execution = ports.execution
     backend_rows = execution.backend_status() if execution is not None else []
     cells: list[dict[str, Any]] = []
     for backend in backend_rows:
@@ -52,6 +64,10 @@ def build_operational_matrix(service: Any) -> dict[str, Any]:
                         capabilities.get("dependency_installation") or ()
                     ),
                     "network_modes": list(capabilities.get("network_modes") or ()),
+                    "network_policy_effects": dict(
+                        capabilities.get("network_policy_effects") or {}
+                    ),
+                    "runtime_lifetime": capabilities.get("runtime_lifetime", "athena_process"),
                     "filesystem_containment": bool(
                         cell.get(
                             "filesystem_containment", capabilities.get("filesystem_containment")
@@ -65,10 +81,7 @@ def build_operational_matrix(service: Any) -> dict[str, Any]:
             )
     return {
         "execution": cells,
-        "sandbox": sandbox_status(getattr(service, "config", None)),
-        "mcp": service.mcp_status(),
-        "memory": service.runtime_health().get("memory_embeddings", {}),
+        "sandbox": sandbox_status(ports.config),
+        "mcp": ports.mcp_status(),
+        "memory": ports.runtime_health().get("memory_embeddings", {}),
     }
-
-
-__all__ = ["behavioral_proof", "build_operational_matrix"]

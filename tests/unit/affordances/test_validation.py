@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 from athena.affordances import validation as validation_module
-from athena.affordances.validation import GeneratedSourceValidator, ValidationTier
+from athena.affordances.validation import (
+    GeneratedSourceValidator,
+    SourceValidation,
+    ValidationCheck,
+    ValidationTier,
+)
 from athena.capabilities.synthesis import infer_input_schema
 
 
@@ -22,6 +27,15 @@ def test_task_source_validation_runs_contract_and_available_static_checks():
         "typecheck",
     }
     assert result.code.startswith("def run(args):")
+
+
+def test_source_validation_does_not_pass_without_mandatory_checks():
+    assert not SourceValidation(ValidationTier.TASK, "").passed
+    assert not SourceValidation(
+        ValidationTier.TASK,
+        "",
+        checks=(ValidationCheck("parse", "passed"),),
+    ).passed
 
 
 @pytest.mark.athena_scenario("AUTH-003")

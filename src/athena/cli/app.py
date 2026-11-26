@@ -31,7 +31,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from athena.execution.environment import VerificationEnvironment
 from athena.cli.operator_handlers import (
     cmd_artifacts,
     cmd_candidates,
@@ -44,8 +43,8 @@ from athena.cli.operator_handlers import (
 )
 from athena.protocol.tasks import AgentRequest, AutonomyLevel, WorkspaceSpec
 
-FREEINFERENCE_DEFAULT_BASE_URL = "https://freeinference.org/v1"
-FREEINFERENCE_DEFAULT_MODEL = "glm-5.3-flash"
+FREEINFERENCE_DEFAULT_BASE_URL = "http://127.0.0.1:18769/v1"
+FREEINFERENCE_DEFAULT_MODEL = "deepseek-v4-flash"
 OPENROUTER_DEFAULT_MODEL = "poolside/laguna-s-2.1:free"
 
 
@@ -62,9 +61,14 @@ def _env(*names: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def _autonomy(value: str | None) -> AutonomyLevel:
+def _autonomy(value: str | None) -> AutonomyLevel | None:
+    """Return None when the operator did not select autonomy.
+
+    ``None`` means the service resolves its configured default; transports
+    must not manufacture their own SUPERVISED fallback.
+    """
     if not value:
-        return AutonomyLevel.SUPERVISED
+        return None
     try:
         return AutonomyLevel(value.strip().lower())
     except ValueError:
@@ -122,7 +126,9 @@ def build_config(o: "Options"):
         cli_overrides={
             "db_path": o.db_path,
             "workspace_root": (os.path.abspath(os.path.expanduser(root)) if root else None),
-            "autonomy": _autonomy(o.autonomy).value if o.autonomy else None,
+            "autonomy": (
+                autonomy_val.value if (autonomy_val := _autonomy(o.autonomy)) is not None else None
+            ),
             "artifact_root": o.artifact_root,
             "mascot": o.mascot,
             "display": getattr(o, "display", None),
@@ -589,6 +595,77 @@ def _doctor_native(o: "Options", config: Any) -> int:
     return 0 if preflight.ok and binary_ok else 1
 
 
+def _doctor_startup(o: "Options", config: Any) -> int:
+    """Start the service briefly and report readiness-owned checks."""
+    del o
+    from athena.affordances.sandbox_doctor import (
+        profile_requires_restricted_execution,
+        sandbox_status,
+    )
+
+    sandbox = sandbox_status(config)
+    sandbox_ready = bool(sandbox["available"])
+    sandbox_detail = str(sandbox["detail"])
+    requires_sandbox = profile_requires_restricted_execution(config)
+    if sandbox_ready:
+        print(f"Sandbox: READY (bubblewrap {sandbox_detail})")
+    else:
+        print(f"Sandbox: UNAVAILABLE (fail-closed: {sandbox_detail})")
+    try:
+        service = build_service(config)
+    except ServiceUnavailable as exc:
+        print(f"startup health: failed ({exc})")
+        return 1
+
+    async def probe() -> dict[str, Any]:
+        try:
+            # Doctor is a passive preflight. It initializes the durable graph
+            # so readiness can be inspected, but must not start workers,
+            # schedulers, or ambient watch producers.
+            await service.start(activate_runtime=False)
+            health = service.startup_health()
+            health["operational_matrix"] = service.operational_matrix()
+            return health
+        finally:
+            await service.stop()
+
+    try:
+        health = asyncio.run(probe())
+    except Exception as exc:  # broad-exception: startup diagnostics fail closed
+        print(f"startup health: failed ({exc})")
+        return 1
+    print(f"startup health: {health.get('status', 'unknown')}")
+    for name, check in (health.get("checks") or {}).items():
+        status = check.get("status", "unknown") if isinstance(check, dict) else "unknown"
+        print(f"  {name}: {status}")
+    matrix = health.get("operational_matrix") or {}
+    for cell in matrix.get("execution") or ():
+        print(
+            "  execution/{backend}/{runtime}: available={available} persistent={persistent} "
+            "state={state} reattach={reattach} deps={deps}".format(
+                backend=cell.get("backend"),
+                runtime=cell.get("runtime"),
+                available="yes" if cell.get("available") else "no",
+                persistent="yes" if cell.get("persistent_session") else "no",
+                state="yes" if cell.get("persistent_runtime_state") else "no",
+                reattach="yes" if cell.get("reattach") else "no",
+                deps=",".join(cell.get("dependency_installation") or ()) or "none",
+            )
+        )
+    mcp = matrix.get("mcp") or {}
+    if isinstance(mcp, dict):
+        for name, status in sorted(mcp.items()):
+            state = status.get("state", "unknown") if isinstance(status, dict) else "unknown"
+            print(f"  mcp/{name}: {state}")
+    memory = matrix.get("memory") or {}
+    if isinstance(memory, dict):
+        print(f"  semantic-memory: {memory.get('state', 'unknown')}")
+    if requires_sandbox and not sandbox_ready:
+        print("  capability profile: restricted execution is not ready", file=sys.stderr)
+        return 1
+    return 0 if health.get("status") == "ok" else 1
+
+
 class ServiceUnavailable(Exception):
     pass
 
@@ -714,9 +791,7 @@ def dispatch(o: Options) -> int:
     if o.command == "doctor":
         target = o.args[0] if o.args else "startup"
         if target == "startup":
-            from athena.execution.sandbox_doctor import doctor_startup
-
-            return doctor_startup(o, config)
+            return _doctor_startup(o, config)
         if target == "native":
             return _doctor_native(o, config)
         if target != "display":
@@ -861,17 +936,21 @@ async def _cmd_run(o: Options, service: Any) -> int:
         model_policy=_model_policy(o.model),
         metadata=_criteria_metadata(o),
     )
-    admit = getattr(service, "require_agent_ready", None)
-    if callable(admit):
-        try:
-            admit(request)
-        except Exception as exc:
-            from athena.protocol.errors import ServiceNotReady
+    # Readiness is owned by service.submit().  The CLI must not call the
+    # async admission coroutine separately, or it probes readiness twice and
+    # can race a provider state change.
+    # Start submission before constructing the surface so service-owned
+    # readiness is the single admission check and no renderer is opened for
+    # work that cannot be admitted.
+    try:
+        task = await service.submit(request, wait=False)
+    except Exception as exc:
+        from athena.protocol.errors import ServiceNotReady
 
-            if isinstance(exc, ServiceNotReady):
-                print(f"athena run: {exc.message}", file=sys.stderr)
-                return 2
-            raise
+        if isinstance(exc, ServiceNotReady):
+            print(f"athena run: {exc.message}", file=sys.stderr)
+            return 2
+        raise
     surface = None
     from athena.cli.chat import _make_surface, _model_label
 
@@ -892,22 +971,14 @@ async def _cmd_run(o: Options, service: Any) -> int:
         # Start streaming before waiting so an interactive approval can wake
         # the parked task. Waiting first deadlocks supervised execution at the
         # service boundary and hides the OI-style operator surface.
-        try:
-            task = await service.submit(request, wait=False)
-        except Exception as exc:
-            from athena.protocol.errors import ServiceNotReady
-
-            if isinstance(exc, ServiceNotReady):
-                surface.render_notice(exc.message, status="NOT_READY")
-                return 2
-            raise
         task_id = getattr(task, "id", task)
         from athena.cli.chat import stream_task
 
+        autonomy = _autonomy(o.autonomy)
         result = await stream_task(
             service,
             task_id,
-            autonomy=_autonomy(o.autonomy),
+            autonomy=autonomy if autonomy is not None else service.config.autonomy_level,
             surface=surface,
         )
         if result is not None:
@@ -1011,18 +1082,16 @@ async def _cmd_self(o: Options, service: Any) -> int:
         return 2
     try:
         root = _athena_checkout_root()
-        verification = VerificationEnvironment.from_project(
-            root, include_project_root=True, include_rust=True
-        )
+        verification = service.self_host_preflight(workspace_root=root)
     except ValueError as exc:
         print(f"athena self: {exc}", file=sys.stderr)
         return 2
 
     print("SELF PREFLIGHT")
     print("  ✓ Athena source checkout")
-    print(f"  ✓ uv ({verification.uv})")
-    print(f"  ✓ Python ({verification.python})")
-    print(f"  ✓ .venv ({verification.environment_root})")
+    print(f"  ✓ uv ({verification.get('uv')})")
+    print(f"  ✓ Python ({verification.get('python')})")
+    print(f"  ✓ .venv ({verification.get('environment_root')})")
     print("  ✓ ruff / mypy / pytest")
     print("  ✓ cargo / rustc")
     if os.name == "posix":
@@ -1681,7 +1750,7 @@ async def _cmd_acp(service: Any) -> int:
 
     try:
         while True:
-            from athena.execution.async_call import run_blocking
+            from athena.concurrency import run_blocking
 
             line = await run_blocking(sys.stdin.readline)
             if not line:

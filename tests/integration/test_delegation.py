@@ -215,3 +215,112 @@ def _collect_request(parent_task_id: str, child_task_id: str):
         call_id=new_id("call"),
         arguments={"operation": "collect", "child_task_id": child_task_id},
     )
+
+
+@pytest.mark.asyncio
+async def test_delegation_matches_single_agent_outcome_with_child_evidence(make_service):
+    """Compare identical work with and without delegation on the real service."""
+    from athena.evaluation.neutral import (
+        EvaluationCase,
+        EvaluationOutcome,
+        compare_delegation_outcomes,
+    )
+    from athena.protocol.tasks import AgentRequest, AutonomyLevel, TaskStatus, TaskSpec
+    from athena.protocol.ids import new_id
+
+    objective = "DELEGATION_COMPARISON calculate the fixed value"
+    direct = await make_service(
+        scripts=[
+            {
+                "match": {"last_user_message_contains": "DELEGATION_COMPARISON"},
+                "respond": {"text": "DIRECT_RESULT: 41", "done": True},
+            }
+        ]
+    )
+    direct_task = await direct.submit(
+        AgentRequest(prompt=objective, autonomy=AutonomyLevel.AUTONOMOUS), wait=True
+    )
+    direct_result = await direct.get_result(direct_task.id)
+    assert direct_result is not None
+    assert direct_result.status is TaskStatus.COMPLETE
+
+    delegated = await make_service(
+        scripts=[
+            {
+                "match": {"user_contains": "calculate the fixed value"},
+                "respond": {"text": "CHILD_RESULT: 41", "done": True},
+            },
+        ]
+    )
+    parent = await delegated._task_manager.create(
+        TaskSpec(
+            id=new_id("task"),
+            objective=objective,
+            session_id=new_id("session"),
+            metadata={"autonomy": AutonomyLevel.AUTONOMOUS.value},
+        )
+    )
+    child_id = await delegated._delegation.spawn_child(
+        objective="calculate the fixed value",
+        parent_task_id=parent.id,
+    )
+    for _ in range(200):
+        if await delegated.get_task_status(child_id) == TaskStatus.COMPLETE.value:
+            break
+        from asyncio import sleep
+
+        await sleep(0.02)
+    child_result = await delegated.get_result(child_id)
+    assert child_result is not None
+    assert child_result.status is TaskStatus.COMPLETE
+    assert "CHILD_RESULT: 41" in child_result.summary
+
+    from athena.capabilities.delegate import DelegateCapability
+    from athena.protocol.capabilities import CapabilityRequest, CapabilityResultStatus
+
+    collected = await DelegateCapability(delegated._delegation).invoke(
+        CapabilityRequest(
+            capability_id="delegate",
+            task_id=parent.id,
+            call_id=new_id("call"),
+            arguments={"operation": "collect", "child_task_id": child_id, "timeout": 1.0},
+        )
+    )
+    assert collected.status is CapabilityResultStatus.OK, collected.error
+    assert "CHILD_RESULT: 41" in (collected.output or "")
+    await delegated._task_manager.enqueue(parent.id)
+    parent_result = await delegated._task_manager.finalize(
+        parent.id,
+        status=TaskStatus.COMPLETE,
+        summary="PARENT_RECEIVED_CHILD",
+    )
+    assert parent_result.status is TaskStatus.COMPLETE
+
+    case = EvaluationCase(
+        id="delegation-comparison",
+        prompt=objective,
+        required_evidence=("result-41",),
+    )
+    report = compare_delegation_outcomes(
+        case,
+        single_agent=EvaluationOutcome(
+            case_id=case.id,
+            status="complete",
+            evidence=("result-41",),
+            model_calls=1,
+        ),
+        delegated=EvaluationOutcome(
+            case_id=case.id,
+            status="complete",
+            evidence=("result-41",),
+            model_calls=1,
+            delegation_count=1,
+            metadata={"child_evidence": ("result-41",), "child_id": child_id},
+        ),
+    )
+    comparison = report["comparison"]
+    assert comparison["single_agent_completed"] is True
+    assert comparison["delegated_completed"] is True
+    assert comparison["child_evidence_verified"] is True
+    assert comparison["delegation_count"] == 1
+    assert comparison["materially_contributed"] is None

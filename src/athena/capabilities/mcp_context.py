@@ -1,12 +1,12 @@
 """Governed model-facing MCP resource and prompt context access."""
 
 from __future__ import annotations
+from athena.capabilities.operations import native_descriptor
 
 import json
 from typing import Any
 
 from athena.protocol.capabilities import (
-    CapabilityDescriptor,
     CapabilityOrigin,
     CapabilityRequest,
     CapabilityResult,
@@ -37,7 +37,7 @@ _INPUT_SCHEMA = {
 class MCPContextCapability:
     """Expose only explicitly selected, lower-authority MCP context."""
 
-    descriptor = CapabilityDescriptor(
+    descriptor = native_descriptor(
         id="mcp.context",
         description=(
             "Discover and explicitly materialize MCP resources and prompts. "

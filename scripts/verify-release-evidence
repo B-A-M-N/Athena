@@ -760,6 +760,8 @@ def main(argv: list[str] | None = None) -> int:
             return fail(f"scenario manifest record [{index}] source SHA does not match")
         if source_identity.get("release_run_id") != release_run_id:
             return fail(f"scenario manifest record [{index}] release run does not match")
+        if scenario.get("required") is True and scenario.get("status") != "passed":
+            return fail(f"required scenario record [{index}] did not pass")
         error = _check_records(
             scenario.get("evidence"),
             label=f"scenario records[{index}].evidence",

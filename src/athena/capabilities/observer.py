@@ -8,6 +8,7 @@ this capability only gives that machinery an observation-specific surface.
 """
 
 from __future__ import annotations
+from athena.capabilities.operations import native_descriptor
 
 import json
 from dataclasses import replace
@@ -15,7 +16,6 @@ from collections.abc import Mapping
 from typing import Any
 
 from athena.protocol.capabilities import (
-    CapabilityDescriptor,
     CapabilityOrigin,
     CapabilityRequest,
     CapabilityRequestOrigin,
@@ -27,7 +27,7 @@ from athena.protocol.ids import new_id
 
 
 class ObserverCapability:
-    descriptor = CapabilityDescriptor(
+    descriptor = native_descriptor(
         id="observer",
         description=(
             "Compile and run deterministic generated observers that turn raw "

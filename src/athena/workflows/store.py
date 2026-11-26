@@ -217,7 +217,7 @@ class WorkflowStore:
         existing = await self.find_candidate_by_signature(signature)
         if existing is not None:
             return existing
-        from athena.affordances.models import AffordanceScope
+        from athena.protocol.affordances import AffordanceScope
 
         rows = await self._observations_for_signature(signature, raw=True)
         task_rows: List[Any] = []
@@ -427,7 +427,7 @@ def _pending_workflow(
     verification: Mapping[str, Any] | None,
     observed_at: str,
 ) -> Workflow:
-    from athena.affordances.models import AffordanceScope
+    from athena.protocol.affordances import AffordanceScope
 
     return Workflow.create(
         name=f"pending-{task_id[:12]} procedure",

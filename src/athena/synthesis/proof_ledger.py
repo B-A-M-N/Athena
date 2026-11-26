@@ -18,7 +18,7 @@ from athena.affordances.models import GeneratedCapability
 from athena.protocol.events import EV, Event
 
 if TYPE_CHECKING:
-    from athena.synthesis.engine import SyntheticCapability
+    from athena.synthesis.models import SyntheticCapability
     from athena.synthesis.engine import SynthesisEngine
 
 _logger = logging.getLogger(__name__)
@@ -260,6 +260,38 @@ class ProofLedger:
                 "downstream_verifications": "canonical_passing_verification",
                 "latency_saved_ms": "not_measured",
                 "turns_saved": "not_measured",
+            },
+            "evidence_summary": {
+                "execution_success": {
+                    "uses": cap.uses,
+                    "successes": cap.successes,
+                    "failures": cap.failures,
+                    "status": "verified"
+                    if cap.uses and cap.successes == cap.uses
+                    else "incomplete",
+                },
+                "contract_success": {
+                    "status": "verified"
+                    if cap.validation.get("all_passed") is True
+                    else "failed_or_unverified",
+                    "semantic_verification": dict(
+                        cap.validation.get("semantic_verification") or {}
+                    ),
+                },
+                "downstream_task_verification": {
+                    "count": cap.downstream_verifications,
+                    "status": "verified" if cap.downstream_verifications else "unverified",
+                },
+                "reuse_on_new_inputs": {
+                    "count": cap.reuse_count,
+                    "distinct_inputs": len(cap.input_signatures),
+                    "status": "observed" if cap.reuse_count else "unobserved",
+                },
+                "observed_task_benefit": {
+                    "status": "verified" if cap.downstream_verifications else "unverified",
+                    "latency_saved_ms": round(cap.latency_saved_ms, 2),
+                    "turns_saved": cap.turns_saved,
+                },
             },
             "validation_strength": cap.validation.get("tier", "unknown"),
             "family_id": cap.family_id,

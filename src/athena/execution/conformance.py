@@ -10,14 +10,90 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
-from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-import tempfile
 from typing import Any, Mapping
 
+from athena.execution.conformance_probes import prove_containment
 from athena.protocol.execution import ExecutionRequest
 from athena.protocol.tasks import NetworkPolicy
+
+
+def proof_status(
+    *,
+    checks: tuple[str, ...] | list[str] = (),
+    failures: tuple[str, ...] | list[str] = (),
+    unverified_claims: tuple[str, ...] | list[str] = (),
+) -> str:
+    """Return the canonical status for one behavioral proof cell."""
+    if tuple(str(item) for item in unverified_claims):
+        return "unverified"
+    if not checks or "execution" not in checks or failures:
+        return "failed"
+    return "passed"
+
+
+def passport_binding_errors(
+    passport: Mapping[str, Any],
+    *,
+    backend: str,
+    expected_release_sha: str | None = None,
+    expected_release_run_id: str | None = None,
+    expected_environment: Mapping[str, Any] | None = None,
+) -> tuple[str, ...]:
+    """Validate the identity binding required before runtime certification."""
+    errors: list[str] = []
+    if passport.get("kind") != "athena_backend_passport":
+        errors.append("unsupported passport kind")
+    if str(passport.get("backend") or "") != str(backend):
+        errors.append("backend identity mismatch")
+    release_sha = str(passport.get("release_sha") or "").strip()
+    release_run_id = str(passport.get("release_run_id") or "").strip()
+    if not release_sha:
+        errors.append("missing release source identity")
+    if not release_run_id:
+        errors.append("missing release run identity")
+    if expected_release_sha is None or release_sha != str(expected_release_sha).strip():
+        errors.append("release source identity is not bound to the running deployment")
+    if expected_release_run_id is None or release_run_id != str(expected_release_run_id).strip():
+        errors.append("release run identity is not bound to the running deployment")
+    environment = passport.get("environment")
+    if not isinstance(environment, Mapping) or not environment:
+        errors.append("missing certification environment identity")
+    cells = passport.get("cells")
+    expected = passport.get("expected_runtimes")
+    if not isinstance(expected_environment, Mapping) or not expected_environment:
+        errors.append("certification environment expectation is not supplied")
+    elif not isinstance(environment, Mapping) or any(
+        environment.get(key) != value for key, value in expected_environment.items()
+    ):
+        errors.append("certification environment identity mismatch")
+    if not isinstance(cells, list) or not cells:
+        errors.append("missing backend runtime cells")
+    if not isinstance(expected, list) or not expected:
+        errors.append("missing advertised runtime inventory")
+    else:
+        cell_rows = cells if isinstance(cells, list) else []
+        runtimes = [
+            str(cell.get("runtime") or "") for cell in cell_rows if isinstance(cell, Mapping)
+        ]
+        if len(runtimes) != len(cell_rows) or len(set(runtimes)) != len(runtimes):
+            errors.append("backend runtime cells are duplicated or malformed")
+        expected_values = [str(item) for item in expected]
+        if len(expected_values) != len(set(expected_values)):
+            errors.append("advertised runtime inventory is duplicated")
+        if set(runtimes) != set(expected_values):
+            errors.append("backend runtime cells do not match advertised inventory")
+    if passport.get("status") != "PASS":
+        errors.append("passport status is not PASS")
+    for cell in cells if isinstance(cells, list) else ():
+        if not isinstance(cell, Mapping) or str(cell.get("backend") or "") != str(backend):
+            errors.append("backend runtime cell identity does not match passport")
+        if not isinstance(cell, Mapping) or cell.get("passed") is not True:
+            errors.append("backend runtime cell did not pass")
+        if cell.get("unverified_claims"):
+            errors.append("backend runtime cell has unverified claims")
+    return tuple(dict.fromkeys(errors))
 
 
 @dataclass(frozen=True)
@@ -29,8 +105,18 @@ class ConformanceReceipt:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     @property
+    def proof_status(self) -> str:
+        # A receipt with no executed checks is not evidence.  In particular,
+        # an advertised runtime cannot earn PASS from a vacuous probe.
+        return proof_status(
+            checks=self.checks,
+            failures=self.failures,
+            unverified_claims=self.unverified_claims,
+        )
+
+    @property
     def passed(self) -> bool:
-        return not self.failures
+        return self.proof_status == "passed"
 
     @property
     def unverified_claims(self) -> tuple[str, ...]:
@@ -44,6 +130,7 @@ class ConformanceReceipt:
             "failures": list(self.failures),
             "unverified_claims": list(self.unverified_claims),
             "metadata": dict(self.metadata),
+            "proof_status": self.proof_status,
             "passed": self.passed,
         }
 
@@ -61,6 +148,10 @@ class BackendPassport:
     release_sha: str
     environment: Mapping[str, Any] = field(default_factory=dict)
     receipts: tuple[ConformanceReceipt, ...] = ()
+    # ``None`` means the caller did not supply an advertised runtime contract.
+    # An explicit empty tuple means the backend advertised no runnable cells
+    # and must therefore fail certification.
+    expected_runtimes: tuple[str, ...] | None = None
     generated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     release_run_id: str | None = None
     schema_version: int = 1
@@ -75,9 +166,33 @@ class BackendPassport:
 
     @property
     def status(self) -> str:
+        observed = tuple(receipt.runtime for receipt in self.receipts)
+        observed_unique = len(observed) == len(set(observed))
+        if self.expected_runtimes is None:
+            complete = bool(observed) and observed_unique
+        else:
+            expected = tuple(self.expected_runtimes)
+            complete = (
+                bool(expected)
+                and len(expected) == len(set(expected))
+                and observed_unique
+                and set(observed) == set(expected)
+                and len(observed) == len(expected)
+            )
         return (
             "PASS"
-            if all(receipt.passed for receipt in self.receipts) and not self.unverified_claims
+            if complete
+            and bool(str(self.release_sha).strip())
+            and bool(str(self.release_run_id or "").strip())
+            and bool(self.environment)
+            and str(self.backend).strip() not in {"", "unknown"}
+            and all(receipt.proof_status == "passed" for receipt in self.receipts)
+            and not self.unverified_claims
+            and all(
+                str(receipt.backend).strip() == str(self.backend).strip()
+                and bool(str(receipt.runtime).strip())
+                for receipt in self.receipts
+            )
             else "FAIL"
         )
 
@@ -89,6 +204,7 @@ class BackendPassport:
         release_sha: str,
         environment: Mapping[str, Any] | None = None,
         release_run_id: str | None = None,
+        expected_runtimes: tuple[str, ...] | list[str] | None = None,
     ) -> "BackendPassport":
         values = tuple(receipts)
         backend = values[0].backend if values else "unknown"
@@ -97,6 +213,11 @@ class BackendPassport:
             release_sha=str(release_sha),
             environment=dict(environment or {}),
             receipts=values,
+            expected_runtimes=(
+                tuple(str(runtime) for runtime in expected_runtimes)
+                if expected_runtimes is not None
+                else None
+            ),
             release_run_id=release_run_id,
         )
 
@@ -110,6 +231,9 @@ class BackendPassport:
             "generated_at": self.generated_at,
             "environment": dict(self.environment),
             "status": self.status,
+            "expected_runtimes": (
+                list(self.expected_runtimes) if self.expected_runtimes is not None else None
+            ),
             "unverified_claims": list(self.unverified_claims),
             "cells": [receipt.to_record() for receipt in self.receipts],
         }
@@ -135,35 +259,6 @@ def _state_sources(runtime: str) -> tuple[str, str, str]:
             "41",
         )
     raise ValueError(f"no conformance probe for runtime {runtime!r}")
-
-
-def _containment_source(runtime: str, outside_path: str) -> str:
-    """Return a hostile probe for the two explicit containment boundaries."""
-    if runtime == "python":
-        return (
-            "from pathlib import Path\n"
-            "import socket\n"
-            f"p=Path({outside_path!r})\n"
-            "fs='ALLOWED' if p.exists() and p.read_text() == 'outside' else 'DENIED'\n"
-            "net='DENIED'\n"
-            "try:\n"
-            "    socket.create_connection(('198.51.100.1', 80), timeout=0.2)\n"
-            "    net='ALLOWED'\n"
-            "except OSError:\n"
-            "    pass\n"
-            "print('FS=' + fs + ' NET=' + net)"
-        )
-    if runtime == "shell":
-        return (
-            f'if [ -f {outside_path!r} ] && [ "$(cat {outside_path!r})" = outside ]; '
-            "then fs=ALLOWED; else fs=DENIED; fi; "
-            "if timeout 1 bash -c '</dev/tcp/198.51.100.1/80' 2>/dev/null; "
-            "then net=ALLOWED; else net=DENIED; fi; "
-            'printf \'FS=%%s NET=%%s\' "$fs" "$net"'
-        )
-    # The Node worker intentionally exposes no fs/net module to generated code.
-    # Node runtime capability cells therefore do not advertise containment.
-    raise ValueError(f"containment probe unavailable for runtime {runtime!r}")
 
 
 def _cancellation_source(runtime: str) -> str:
@@ -294,6 +389,15 @@ def _canonical_runtime(runtime: str) -> str:
     return aliases.get(runtime.casefold(), runtime.casefold())
 
 
+def _advertised_runtimes(capabilities: Any) -> tuple[str, ...]:
+    raw = (
+        capabilities.get("supported_runtimes", ())
+        if isinstance(capabilities, Mapping)
+        else getattr(capabilities, "supported_runtimes", ())
+    )
+    return tuple(dict.fromkeys(_canonical_runtime(str(item)) for item in raw))
+
+
 async def run_backend_conformance(
     manager: Any,
     *,
@@ -311,12 +415,7 @@ async def run_backend_conformance(
     release qualification without creating a second execution path.
     """
     capabilities = manager.backend_capabilities(backend)
-    advertised_raw = (
-        tuple(capabilities.get("supported_runtimes", ()))
-        if isinstance(capabilities, Mapping)
-        else tuple(getattr(capabilities, "supported_runtimes", ()))
-    )
-    advertised = tuple(dict.fromkeys(_canonical_runtime(str(item)) for item in advertised_raw))
+    advertised = _advertised_runtimes(capabilities)
     runtime_caps = (
         capabilities.get("runtime_capabilities", {})
         if isinstance(capabilities, Mapping)
@@ -338,7 +437,7 @@ async def run_backend_conformance(
         for runtime in advertised:
             checks: list[str] = []
             failures: list[str] = []
-            contract_checks: dict[str, dict[str, Any]] = {}
+            contract_checks: dict[str, Mapping[str, Any]] = {}
             session_id: str | None = None
             unverified: tuple[str, ...] = ()
             cell = runtime_caps.get(runtime, {}) if isinstance(runtime_caps, Mapping) else {}
@@ -468,63 +567,35 @@ async def run_backend_conformance(
                         failures.append(f"process-tree cancellation proof failed: {detail}")
 
                 containment_claims = {
-                    "filesystem_containment": "FS=DENIED",
-                    "network_containment": "NET=DENIED",
+                    "filesystem_containment": advertised_contract["filesystem_containment"],
+                    "network_containment": advertised_contract["network_containment"],
                 }
-                if any(advertised_contract[name] for name in containment_claims):
-                    with tempfile.TemporaryDirectory(prefix="athena-conformance-") as root:
-                        outside = Path(root).parent / f"{Path(root).name}-outside"
-                        outside.write_text("outside", encoding="utf-8")
-                        containment_session: str | None = None
-                        try:
-                            containment_session = await manager.create_session(
-                                task_id=f"conformance-boundary-{runtime}",
-                                runtime=str(runtime),
-                                backend=backend,
-                                workspace_root=root,
-                                network_policy=NetworkPolicy.DENY,
-                            )
-                            containment_result = await manager.execute(
-                                ExecutionRequest(
-                                    runtime=str(runtime),
-                                    source=_containment_source(str(runtime), str(outside)),
-                                    task_id=f"conformance-boundary-{runtime}",
-                                    workspace_id=workspace_id,
-                                    backend=backend,
-                                    runtime_session_id=containment_session,
-                                    workspace_root=root,
-                                    network_policy=NetworkPolicy.DENY,
-                                )
-                            )
-                            for name, marker in containment_claims.items():
-                                if not advertised_contract[name]:
-                                    continue
-                                ok = (
-                                    containment_result.exit_code == 0
-                                    and marker in containment_result.stdout
-                                )
+                if any(containment_claims.values()):
+                    if workspace_root is None:
+                        detail = "workspace root is required for containment proof"
+                        for name, claimed in containment_claims.items():
+                            if claimed:
                                 contract_checks[name] = {
-                                    "status": "passed" if ok else "failed",
-                                    "detail": containment_result.stdout[-500:],
+                                    "status": "failed",
+                                    "detail": detail,
                                 }
-                                if ok:
-                                    checks.append(name)
-                                    proven_contract[name] = True
-                                elif require_all_claims:
-                                    failures.append(f"{name} proof failed")
-                        except (OSError, RuntimeError, TypeError, ValueError) as exc:
-                            for name in containment_claims:
-                                if advertised_contract[name]:
-                                    contract_checks[name] = {
-                                        "status": "failed",
-                                        "detail": str(exc),
-                                    }
-                            if require_all_claims:
-                                failures.append(f"containment proof failed: {exc}")
-                        finally:
-                            if containment_session is not None:
-                                await manager.destroy_session(containment_session)
-                            outside.unlink(missing_ok=True)
+                                if require_all_claims:
+                                    failures.append(f"{name} proof failed: {detail}")
+                    else:
+                        proof = await prove_containment(
+                            manager,
+                            backend=backend,
+                            runtime=str(runtime),
+                            workspace_id=workspace_id,
+                            workspace_root=workspace_root,
+                            cwd=cwd,
+                            advertised=containment_claims,
+                            require_all_claims=require_all_claims,
+                        )
+                        checks.extend(proof.checks)
+                        failures.extend(proof.failures)
+                        proven_contract.update(proof.proven)
+                        contract_checks.update(proof.contract_checks)
                 unverified = tuple(
                     name
                     for name, claimed in advertised_contract.items()
@@ -587,17 +658,21 @@ async def run_backend_passport(
         workspace_root=workspace_root,
         require_all_claims=require_all_claims,
     )
+    expected_runtimes = _advertised_runtimes(manager.backend_capabilities(backend))
     return BackendPassport.from_receipts(
         receipts,
         release_sha=release_sha,
         environment=environment,
         release_run_id=release_run_id,
+        expected_runtimes=expected_runtimes,
     )
 
 
 __all__ = [
     "BackendPassport",
     "ConformanceReceipt",
+    "passport_binding_errors",
+    "proof_status",
     "run_backend_conformance",
     "run_backend_passport",
 ]

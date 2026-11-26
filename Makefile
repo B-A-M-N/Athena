@@ -1,4 +1,4 @@
-.PHONY: format format-check lint typecheck compile test check scenarios arch-lint demo native-check native-test native-smoke native-package release-check static-critical support-matrix-check migration-baseline
+.PHONY: format format-check static-critical lint typecheck compile test full-test check critical-contracts perf performance scenarios arch-lint demo native-build native-check native-test native-fmt native-clippy native-smoke native-package release-check support-matrix-check migration-baseline
 
 UV ?= uv
 UV_RUN_DEV := $(UV) run --frozen --extra dev
@@ -55,11 +55,20 @@ support-matrix-check:
 migration-baseline:
 	$(PYTHON) scripts/verify-migration-baseline
 
+native-build:
+	cargo build --manifest-path native/Cargo.toml --locked --offline
+
 native-check:
-	cargo check --manifest-path native/Cargo.toml --offline
+	cargo check --manifest-path native/Cargo.toml --locked --offline
+
+native-fmt:
+	cargo fmt --manifest-path native/Cargo.toml -- --check
+
+native-clippy:
+	cargo clippy --manifest-path native/Cargo.toml --all-targets --locked --offline -- -D warnings
 
 native-test:
-	cargo test --manifest-path native/Cargo.toml --offline
+	cargo test --manifest-path native/Cargo.toml --locked --offline
 
 native-package:
 	scripts/build-native-package
@@ -106,3 +115,27 @@ check: format-check lint typecheck compile static-critical support-matrix-check 
 		tests/unit/capabilities/test_dispatch_many_preflight.py; \
 	$(PYTHON) scripts/scenarios --exclude-family VHS --output "$(CHECK_ARTIFACT_DIR)/scenarios-manifest.json"; \
 	$(PYTHON) scripts/architecture-lint
+
+# Critical correctness contracts (P1.29): invariants protecting state
+# transactions, event idempotency, dispatcher controls/provenance, task
+# failure/finalization, and projection conformance.  Run on every PR.
+critical-contracts:
+	$(PYTEST) -q \
+		tests/unit/state/test_database.py \
+		tests/unit/state/test_task_metadata.py \
+		tests/unit/state/test_task_lease.py \
+		tests/unit/state/test_event_sequencing.py \
+		tests/unit/capabilities/test_dispatch_provenance_scoped.py \
+		tests/unit/capabilities/test_dispatcher_operation_contracts.py \
+		tests/unit/capabilities/test_dispatch_many_preflight.py \
+		tests/unit/tasks/test_failure_propagation.py \
+		tests/unit/cli/test_projection_conformance.py \
+		tests/unit/synthesis/test_generated_discipline.py
+
+# Performance lane: deterministic SLO counters (model-call counts, query
+# counts, data-structure cardinality).  No wall-clock assertions.
+performance:
+	$(PYTEST) -q tests/performance/
+
+full-test: format-check static-critical lint typecheck compile native-fmt native-clippy
+	$(PYTEST) -q

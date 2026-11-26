@@ -17,6 +17,7 @@ reader of a test file can trace it back to its release-gate scenario.
 from __future__ import annotations
 
 import os
+import socket
 import tempfile
 
 import pytest
@@ -28,12 +29,84 @@ from athena.service.config import AthenaConfig, ProviderConfig
 # concern; registering also silences the strict-marker warning.
 
 
+RUNNER_CAPABILITIES = frozenset(
+    {
+        "PURE",
+        "FS",
+        "PROCESS",
+        "LOCAL_SOCKET",
+        "TCP_LOOPBACK",
+        "NETWORK_EGRESS",
+        "DISPLAY",
+    }
+)
+
+
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "athena_scenario(*scenario_ids): 0.1 stable scenario family evidence "
         "(see tests/scenarios/registry.py); metadata only, never selects tests",
     )
+    config.addinivalue_line(
+        "markers",
+        "athena_capability(*capabilities): host capabilities required by this "
+        "test; see docs/scenario-capability-routing.md",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    """Make a denied host capability explicit instead of a product failure.
+
+    A test declaring ``athena_capability`` is probe-checked before setup.  A
+    missing capability emits ``ENVIRONMENT_UNAVAILABLE: <capabilities>`` and
+    is skipped; it is never reported as Athena evidence that failed.
+    """
+    for item in items:
+        marker = item.get_closest_marker("athena_capability")
+        if marker is None:
+            continue
+        requested = tuple(str(value) for value in marker.args)
+        unknown = set(requested) - RUNNER_CAPABILITIES
+        if unknown:
+            raise pytest.UsageError(
+                f"{item.nodeid}: unknown athena_capability {sorted(unknown)}; "
+                f"expected {sorted(RUNNER_CAPABILITIES)}"
+            )
+        unavailable: list[str] = []
+        for capability in requested:
+            if capability == "DISPLAY":
+                available = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+            elif capability == "TCP_LOOPBACK":
+                try:
+                    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    try:
+                        probe.bind(("127.0.0.1", 0))
+                        available = True
+                    finally:
+                        probe.close()
+                except OSError:
+                    available = False
+            elif capability == "LOCAL_SOCKET":
+                try:
+                    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    probe.close()
+                    available = True
+                except OSError:
+                    available = False
+            elif capability == "NETWORK_EGRESS":
+                try:
+                    available = socket.getaddrinfo("pypi.org", 443, type=socket.SOCK_STREAM) != []
+                except OSError:
+                    available = False
+            else:
+                # PURE, FS, and PROCESS are provided by the ordinary pytest
+                # runner/process model and have no extra host precondition.
+                available = True
+            if not available:
+                unavailable.append(capability)
+        if unavailable:
+            item.add_marker(pytest.mark.skip("ENVIRONMENT_UNAVAILABLE: " + ", ".join(unavailable)))
 
 
 @pytest.fixture

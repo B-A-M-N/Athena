@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import hashlib
 import inspect
 import logging
 from datetime import datetime
@@ -15,6 +16,18 @@ from athena.state.database import Database
 
 _logger = logging.getLogger("athena.events")
 
+
+class EventIdConflictError(RuntimeError):
+    """A stable event id already exists durably after deduplication failed."""
+
+
+class EventSequenceConflictError(RuntimeError):
+    """Residual sequence collision survived the bounded IMMEDIATE retry bound.
+
+    Callers must surface this as recovery-required rather than retry forever.
+    """
+
+
 FAST_EVENT_TYPES = frozenset(
     {
         "ModelDelta",
@@ -24,6 +37,54 @@ FAST_EVENT_TYPES = frozenset(
         "CapabilityProgress",
     }
 )
+
+
+EVENT_IDENTITY_VERSION = 2
+
+
+def _canonical_identity(event: Event) -> dict[str, Any]:
+    """Return implementation-independent event identity.
+
+    ``timestamp`` and ``sequence`` are intentionally excluded: the former is
+    transport/replay metadata and the latter is assigned by the durable log.
+    """
+    return {
+        "version": EVENT_IDENTITY_VERSION,
+        "schema_version": event.schema_version,
+        "type": event.type,
+        "task_id": event.task_id,
+        "session_id": event.session_id,
+        "causal_id": event.causal_id,
+        "payload": dict(event.payload or {}),
+    }
+
+
+def _identity_hash(event: Event) -> str:
+    encoded = json.dumps(
+        _canonical_identity(event), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _identity_json(event: Event) -> str:
+    return json.dumps(_canonical_identity(event), sort_keys=True, separators=(",", ":"))
+
+
+def _validate_batch_identities(events: tuple[Event, ...] | list[Event]) -> None:
+    """Reject reuse of one stable ID for different identities inside a batch."""
+    by_id: dict[str, tuple[dict[str, Any], str]] = {}
+    for event in events:
+        if not event.id:
+            continue
+        identity = _canonical_identity(event)
+        digest = _identity_hash(event)
+        existing = by_id.get(event.id)
+        if existing is None:
+            by_id[event.id] = (identity, digest)
+        elif existing[1] != digest:
+            raise EventIdConflictError(
+                f"duplicate event id {event.id!r} carries conflicting event identity"
+            )
 
 
 @dataclass
@@ -54,7 +115,10 @@ class EventStore:
     stable event id on append (section 81).
     """
 
-    _COLS = "id, task_id, session_id, type, sequence, timestamp, schema_version, payload, causal_id"
+    _COLS = (
+        "id, task_id, session_id, type, sequence, timestamp, schema_version, payload, "
+        "causal_id, identity_version, identity_hash, identity_fields"
+    )
 
     def __init__(self, db: Database) -> None:
         self._db = db
@@ -148,10 +212,18 @@ class EventStore:
         return await self._append_durable(event)
 
     async def _append_durable(self, event: Event) -> Event:
-        """Append control/evidence events after flushing prior stream data."""
+        """Append control/evidence events after flushing prior stream data.
+
+        Stable-ID idempotency can drop every member of the batch after a
+        process restart. Return the canonical durable event for that case so
+        a re-driven terminal transition is idempotent instead of failing on
+        an empty result.
+        """
         async with self._append_guard:
             pending = self._take_fast_locked(task_id=event.task_id)
             durable = await self._write_batch((*pending, event))
+        if not durable:
+            return event
         await self._publish(durable)
         return durable[-1]
 
@@ -175,7 +247,7 @@ class EventStore:
                 await self.flush_fast_events()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception:  # rationale: background flush must not kill producer tasks
                 _logger.exception("buffered event flush failed")
             finally:
                 # A producer can enqueue between _take_fast_locked() and the
@@ -213,47 +285,151 @@ class EventStore:
     async def _write_batch(self, events: tuple[Event, ...]) -> list[Event]:
         if not events:
             return []
+
+        # Stable-ID idempotency (contract section 81) applies to every event,
+        # including fast events whose append() path skips the precheck. Drop
+        # duplicates against durable rows and within the incoming batch BEFORE
+        # sequence allocation so a duplicate never consumes a sequence or
+        # enters the sequence-collision retry loop. Dedup queries run inside
+        # the transaction to keep them serialized with the write itself.
+        unique: list[Event] = []
+        seen_ids: set[str] = set()
+        for event in events:
+            if not event.id:
+                unique.append(event)
+            elif event.id not in seen_ids:
+                seen_ids.add(event.id)
+                unique.append(event)
+        _validate_batch_identities(events)
+
+        # The IMMEDIATE transaction owns sequence allocation for the task.
+        # A DEFERRED transaction would let two writers both read the same
+        # MAX(sequence) before either commits, then retry on UNIQUE collision.
+        # IMMEDIATE serializes writers at BEGIN so the first writer commits
+        # cleanly and a residual retry only handles a rare same-task race.
+        retries = 0
+        max_retries = 8
         while True:
             try:
-                async with self._db.transaction() as db:
+                async with self._db.transaction(mode="IMMEDIATE") as db:
+                    if seen_ids:
+                        placeholders = ",".join("?" for _ in seen_ids)
+                        rows = await db.fetch_all_raw(
+                            f"SELECT id, identity_hash FROM events WHERE id IN ({placeholders})",
+                            list(seen_ids),
+                        )
+                        existing = {
+                            str(row["id"]): (row.get("identity_hash") or "").strip() for row in rows
+                        }
+                        checked: list[Event] = []
+                        for event in unique:
+                            stored_hash = existing.get(event.id or "")
+                            if stored_hash is None:
+                                checked.append(event)
+                                continue
+                            if stored_hash != _identity_hash(event):
+                                raise EventIdConflictError(
+                                    f"conflicting event identity for stable id {event.id!r}"
+                                )
+                        unique = checked
+                    if not unique:
+                        return []
+
+                    pending = unique
                     next_sequences: dict[str | None, int] = {}
                     durable: list[Event] = []
-                    for pending in events:
-                        if pending.task_id not in next_sequences:
+                    for item in pending:
+                        if item.task_id not in next_sequences:
                             row = await db.fetch_one_raw(
                                 "SELECT COALESCE(MAX(sequence), 0) + 1 AS seq "
                                 "FROM events WHERE task_id = ?",
-                                (pending.task_id,),
+                                (item.task_id,),
                             )
-                            next_sequences[pending.task_id] = (
+                            next_sequences[item.task_id] = (
                                 int(row["seq"]) if row and row.get("seq") else 1
                             )
                         committed = replace(
-                            pending,
-                            sequence=next_sequences[pending.task_id],
+                            item,
+                            sequence=next_sequences[item.task_id],
                         )
                         durable.append(committed)
-                        next_sequences[pending.task_id] += 1
+                        next_sequences[item.task_id] += 1
                     await db.executemany_raw(
-                        f"INSERT INTO events({self._COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        f"INSERT INTO events({self._COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         [self._values(event) for event in durable],
                     )
                 return durable
             except IntegrityError as exc:
-                # Retry only on a genuine (task_id, sequence) UNIQUE collision
-                # from a concurrent writer. FK violations must propagate.
-                if "UNIQUE" not in str(exc):
+                # Retry only a genuine concurrent (task_id, sequence) UNIQUE
+                # collision. An events.id conflict means the stable-ID
+                # duplicate raced this batch: re-read the existing row and
+                # treat identical redelivery as idempotent success. Conflicting
+                # reuse of the same ID is a real contract violation.
+                message = str(exc)
+                if "events.task_id, events.sequence" not in message:
+                    if "events.id" in message:
+                        conflicting = [
+                            e for e in unique if e.id and await self._is_identical_event(e)
+                        ]
+                        if len(conflicting) == len([e for e in unique if e.id]):
+                            # Every conflicting ID is an identical redelivery.
+                            return []
+                        raise EventIdConflictError(
+                            "conflicting stable event id reuse rejected by database"
+                        ) from exc
                     raise
+                retries += 1
+                if retries >= max_retries:
+                    raise EventSequenceConflictError(
+                        f"event sequence allocation conflicted {retries} times "
+                        f"for task {item.task_id!r}"
+                    ) from exc
                 continue
 
+    async def _is_identical_event(self, event: Event) -> bool:
+        """Return whether the durable row for this event ID matches the payload."""
+        row = await self._db.fetch_one(
+            "SELECT type, task_id, session_id, payload, causal_id FROM events WHERE id = ?",
+            (event.id,),
+        )
+        if row is None:
+            return False
+        try:
+            stored_payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            stored_payload = {}
+        return (
+            str(row["type"] or "") == event.type
+            and str(row["task_id"] or "") == str(event.task_id or "")
+            and str(row["session_id"] or "") == str(event.session_id or "")
+            and str(row["causal_id"] or "") == str(event.causal_id or "")
+            and stored_payload == dict(event.payload)
+        )
+
     async def close(self) -> None:
-        """Flush presentation traffic and stop its delayed producer task."""
+        """Flush presentation traffic and stop all owned tasks.
+
+        Cancellation of subscriber workers is the EventStore's responsibility
+        (P1): ``unsubscribe()`` cannot await, so ``close()`` must gather every
+        still-running drain task to prevent orphaned ``queue.get()`` tasks.
+        """
         await self.flush_fast_events()
         task = self._fast_flush_task
         if task is not None and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         self._fast_flush_task = None
+
+        workers = [
+            subscription.worker
+            for subscription in self._subscribers
+            if subscription.worker is not None and not subscription.worker.done()
+        ]
+        for worker in workers:
+            worker.cancel()
+        if workers:
+            await asyncio.gather(*workers, return_exceptions=True)
+        self._subscribers.clear()
 
     async def _publish(self, events: list[Event]) -> None:
         if not events:
@@ -292,10 +468,7 @@ class EventStore:
             outcome = subscription.callback(event)
             if inspect.isawaitable(outcome):
                 await outcome
-        except Exception:
-            # Observers are projections. A broken observer must never turn a
-            # committed canonical event into a failed write or cause a
-            # producer to retry it.
+        except Exception:  # rationale: isolate broken projection from durable write
             _logger.warning(
                 "event subscriber failed for %s",
                 event.type,
@@ -345,6 +518,9 @@ class EventStore:
             event.schema_version,
             json.dumps(dict(event.payload)),
             event.causal_id,
+            EVENT_IDENTITY_VERSION,
+            _identity_hash(event),
+            _identity_json(event),
         )
 
     async def list_for_task(
@@ -458,4 +634,9 @@ def _coalesce_fast_events(events: list[Event]) -> list[Event]:
     return output
 
 
-__all__ = ["EventStore", "FAST_EVENT_TYPES"]
+__all__ = [
+    "EventIdConflictError",
+    "EventSequenceConflictError",
+    "EventStore",
+    "FAST_EVENT_TYPES",
+]

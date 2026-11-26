@@ -7,6 +7,7 @@ and its persistent runtimes (shell, python). Execution remains behind
 """
 
 from __future__ import annotations
+from athena.capabilities.operations import native_descriptor
 
 import os
 import hashlib
@@ -16,7 +17,6 @@ from datetime import datetime, timedelta, timezone
 
 from athena.execution.diagnostics import normalize_diagnostics
 from athena.protocol.capabilities import (
-    CapabilityDescriptor,
     CapabilityOrigin,
     CapabilityRequest,
     CapabilityResult,
@@ -28,6 +28,7 @@ from athena.protocol.execution import (
     ExecutionEventType,
     ExecutionExitStatus,
     ExecutionRequest,
+    RuntimePersistence,
 )
 from athena.protocol.tasks import NetworkPolicy
 
@@ -40,7 +41,6 @@ _INPUT_SCHEMA = {
     "properties": {
         "language": {"type": "string", "enum": list(_LANGUAGES)},
         "code": {"type": "string", "maxLength": 10_000_000},
-        "session": {"type": "string", "minLength": 1, "maxLength": 128},
         "cwd": {"type": "string", "maxLength": 4096},
         "timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": 3600},
     },
@@ -48,12 +48,13 @@ _INPUT_SCHEMA = {
 
 
 class ExecuteCapability:
-    descriptor = CapabilityDescriptor(
+    descriptor = native_descriptor(
         id="execute",
         description=(
             "Universal computation: run code in a language on the local system. "
-            "Persistent sessions preserve state across executions (e.g. python "
-            "or shell). Operations: execute."
+            "Omit session: Athena creates a task-scoped persistent session with "
+            "the current workspace identity. Do not invent or guess session IDs. "
+            "Operations: execute."
         ),
         input_schema=_INPUT_SCHEMA,
         effects=frozenset({EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS}),
@@ -124,6 +125,12 @@ class ExecuteCapability:
                 error="no workspace bound",
             )
         execution_task_id = request.task_id or f"direct:{request.call_id}"
+        verification_call = bool(getattr(context, "verification_call", False))
+        verification_scope = ""
+        if verification_call and request.task_id:
+            # Keep the durable task owner unchanged for receipt foreign keys;
+            # scope only the internal runtime session identity.
+            verification_scope = f"verify:{request.task_id}:{request.call_id}"
         try:
             cwd = self._resolve_cwd(ws, args.get("cwd"))
         except ValueError as exc:
@@ -213,6 +220,9 @@ class ExecuteCapability:
             runtime=runtime_name,
             source=code,
             task_id=execution_task_id,
+            persistence=(
+                RuntimePersistence.EPHEMERAL if verification_call else RuntimePersistence.PERSISTENT
+            ),
             workspace_id=ws.id,
             backend=ws.execution_backend or "local",
             cwd=cwd,
@@ -246,6 +256,7 @@ class ExecuteCapability:
                 if verification_environment is not None
                 else ()
             ),
+            metadata={"__runtime_session_scope": verification_scope},
         )
         execution_id = _new_id()
 
@@ -282,6 +293,17 @@ class ExecuteCapability:
                     timed_out = True
                 elif exit_status == ExecutionExitStatus.INTERRUPTED:
                     interrupted = True
+
+        # One-shot verification identities are task-owned but must not leak
+        # into the model's persistent runtime surface.
+        verification_session_id = str(execution_metadata.get("runtime_session_id") or "")
+        if verification_call and verification_session_id:
+            try:
+                await self.execution_manager.destroy_session(verification_session_id)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                # The verifier remains fail-closed; the finalizer will also
+                # reconcile the task-owned execution resource.
+                pass
 
         stdout = "".join(stdout_parts)
         stderr = "".join(stderr_parts)

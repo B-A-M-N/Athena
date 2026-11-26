@@ -6,14 +6,10 @@ from athena.reality.coordinator import (
     RealityCoordinator,
     ShadowCandidateVerifier,
 )
-from athena.reality.gate import (
-    ExecutionDisposition,
-    RealityClassification,
-    RealityGate,
-    RealityRoute,
-    TransactionRecoveryRequired,
-)
+from athena.protocol.reality import ExecutionDisposition
 from athena.reality.classification import RealityClassificationInput, RealityClassifier
+from athena.reality.gate import RealityGate, TransactionRecoveryRequired
+from athena.reality.routing import RealityRoute
 
 __all__ = [
     "CandidateVerifier",

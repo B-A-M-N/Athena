@@ -1,0 +1,524 @@
+{
+  "schema": 1,
+  "policy": "ratchet: widenings produced by the PR 6 x main integration are individually reviewed here; each entry names the integrated surface and must be retired by decomposition",
+  "waivers": [
+    {
+      "family": "python",
+      "path": "affordances/validation.py",
+      "old_budget": 453,
+      "new_budget": 459,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows affordances/validation.py: retained behavior from both sides ratcheted at the integrated total (old 453); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "api/app.py",
+      "old_budget": 1249,
+      "new_budget": 1259,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows api/app.py: retained behavior from both sides ratcheted at the integrated total (old 1249); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "capabilities/execute.py",
+      "old_budget": 531,
+      "new_budget": 553,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows capabilities/execute.py: retained behavior from both sides ratcheted at the integrated total (old 531); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "capabilities/fusion.py",
+      "old_budget": 305,
+      "new_budget": 373,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows capabilities/fusion.py: retained behavior from both sides ratcheted at the integrated total (old 305); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "capabilities/operations.py",
+      "old_budget": 466,
+      "new_budget": 479,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows capabilities/operations.py: retained behavior from both sides ratcheted at the integrated total (old 466); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "capabilities/reflection_availability.py",
+      "old_budget": 217,
+      "new_budget": 219,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows capabilities/reflection_availability.py: retained behavior from both sides ratcheted at the integrated total (old 217); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "capabilities/skills.py",
+      "old_budget": 133,
+      "new_budget": 149,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows capabilities/skills.py: retained behavior from both sides ratcheted at the integrated total (old 133); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "cli/app.py",
+      "old_budget": 2458,
+      "new_budget": 2484,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows cli/app.py: retained behavior from both sides ratcheted at the integrated total (old 2458); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "cli/operator_cli.py",
+      "old_budget": 1070,
+      "new_budget": 1075,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows cli/operator_cli.py: retained behavior from both sides ratcheted at the integrated total (old 1070); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "cli/operator_handlers.py",
+      "old_budget": 227,
+      "new_budget": 228,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows cli/operator_handlers.py: retained behavior from both sides ratcheted at the integrated total (old 227); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "context/contracts.py",
+      "old_budget": 90,
+      "new_budget": 102,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows context/contracts.py: retained behavior from both sides ratcheted at the integrated total (old 90); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "context/retrieval.py",
+      "old_budget": 658,
+      "new_budget": 717,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows context/retrieval.py: retained behavior from both sides ratcheted at the integrated total (old 658); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "evaluation/neutral.py",
+      "old_budget": 308,
+      "new_budget": 341,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows evaluation/neutral.py: retained behavior from both sides ratcheted at the integrated total (old 308); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "execution/backend.py",
+      "old_budget": 137,
+      "new_budget": 148,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows execution/backend.py: retained behavior from both sides ratcheted at the integrated total (old 137); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "execution/backend_catalog.py",
+      "old_budget": 101,
+      "new_budget": 181,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows execution/backend_catalog.py: retained behavior from both sides ratcheted at the integrated total (old 101); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "execution/conformance.py",
+      "old_budget": 603,
+      "new_budget": 678,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows execution/conformance.py: retained behavior from both sides ratcheted at the integrated total (old 603); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "execution/container.py",
+      "old_budget": 357,
+      "new_budget": 360,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows execution/container.py: retained behavior from both sides ratcheted at the integrated total (old 357); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "execution/local.py",
+      "old_budget": 85,
+      "new_budget": 90,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows execution/local.py: retained behavior from both sides ratcheted at the integrated total (old 85); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "execution/manager.py",
+      "old_budget": 440,
+      "new_budget": 482,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows execution/manager.py: retained behavior from both sides ratcheted at the integrated total (old 440); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "execution/runtime_host.py",
+      "old_budget": 558,
+      "new_budget": 650,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows execution/runtime_host.py: retained behavior from both sides ratcheted at the integrated total (old 558); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "execution/runtimes/base.py",
+      "old_budget": 327,
+      "new_budget": 375,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows execution/runtimes/base.py: retained behavior from both sides ratcheted at the integrated total (old 327); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "execution/runtimes/node.py",
+      "old_budget": 309,
+      "new_budget": 314,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows execution/runtimes/node.py: retained behavior from both sides ratcheted at the integrated total (old 309); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "execution/runtimes/powershell.py",
+      "old_budget": 267,
+      "new_budget": 272,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows execution/runtimes/powershell.py: retained behavior from both sides ratcheted at the integrated total (old 267); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "execution/runtimes/python.py",
+      "old_budget": 336,
+      "new_budget": 341,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows execution/runtimes/python.py: retained behavior from both sides ratcheted at the integrated total (old 336); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "execution/runtimes/shell.py",
+      "old_budget": 343,
+      "new_budget": 348,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows execution/runtimes/shell.py: retained behavior from both sides ratcheted at the integrated total (old 343); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "execution/ssh.py",
+      "old_budget": 309,
+      "new_budget": 317,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows execution/ssh.py: retained behavior from both sides ratcheted at the integrated total (old 309); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "fusion/comparison.py",
+      "old_budget": 141,
+      "new_budget": 185,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows fusion/comparison.py: retained behavior from both sides ratcheted at the integrated total (old 141); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "fusion/ports.py",
+      "old_budget": 69,
+      "new_budget": 72,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows fusion/ports.py: retained behavior from both sides ratcheted at the integrated total (old 69); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "fusion/selection.py",
+      "old_budget": 214,
+      "new_budget": 218,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows fusion/selection.py: retained behavior from both sides ratcheted at the integrated total (old 214); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "interpreter/extension.py",
+      "old_budget": 171,
+      "new_budget": 177,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows interpreter/extension.py: retained behavior from both sides ratcheted at the integrated total (old 171); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "kernel/kernel.py",
+      "old_budget": 1719,
+      "new_budget": 1730,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows kernel/kernel.py: retained behavior from both sides ratcheted at the integrated total (old 1719); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "kernel/termination.py",
+      "old_budget": 320,
+      "new_budget": 330,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows kernel/termination.py: retained behavior from both sides ratcheted at the integrated total (old 320); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "knowledge/pipeline.py",
+      "old_budget": 778,
+      "new_budget": 951,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows knowledge/pipeline.py: retained behavior from both sides ratcheted at the integrated total (old 778); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "models/compat/toolrepair.py",
+      "old_budget": 413,
+      "new_budget": 448,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows models/compat/toolrepair.py: retained behavior from both sides ratcheted at the integrated total (old 413); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "models/providers/anthropic.py",
+      "old_budget": 813,
+      "new_budget": 814,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows models/providers/anthropic.py: retained behavior from both sides ratcheted at the integrated total (old 813); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "models/providers/openai_compat.py",
+      "old_budget": 799,
+      "new_budget": 800,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows models/providers/openai_compat.py: retained behavior from both sides ratcheted at the integrated total (old 799); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "project/profile.py",
+      "old_budget": 443,
+      "new_budget": 448,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows project/profile.py: retained behavior from both sides ratcheted at the integrated total (old 443); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "protocol/capabilities.py",
+      "old_budget": 872,
+      "new_budget": 876,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows protocol/capabilities.py: retained behavior from both sides ratcheted at the integrated total (old 872); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "protocol/context.py",
+      "old_budget": 236,
+      "new_budget": 274,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows protocol/context.py: retained behavior from both sides ratcheted at the integrated total (old 236); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "protocol/execution.py",
+      "old_budget": 161,
+      "new_budget": 166,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows protocol/execution.py: retained behavior from both sides ratcheted at the integrated total (old 161); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "protocol/failure.py",
+      "old_budget": 169,
+      "new_budget": 198,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows protocol/failure.py: retained behavior from both sides ratcheted at the integrated total (old 169); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "protocol/task_codec.py",
+      "old_budget": 494,
+      "new_budget": 504,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows protocol/task_codec.py: retained behavior from both sides ratcheted at the integrated total (old 494); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "protocol/tasks.py",
+      "old_budget": 927,
+      "new_budget": 946,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows protocol/tasks.py: retained behavior from both sides ratcheted at the integrated total (old 927); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "reality/candidate_verification.py",
+      "old_budget": 472,
+      "new_budget": 487,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows reality/candidate_verification.py: retained behavior from both sides ratcheted at the integrated total (old 472); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "reality/completion.py",
+      "old_budget": 138,
+      "new_budget": 146,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows reality/completion.py: retained behavior from both sides ratcheted at the integrated total (old 138); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "reality/coordinator.py",
+      "old_budget": 878,
+      "new_budget": 885,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows reality/coordinator.py: retained behavior from both sides ratcheted at the integrated total (old 878); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "service/lifecycle.py",
+      "old_budget": 399,
+      "new_budget": 452,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows service/lifecycle.py: retained behavior from both sides ratcheted at the integrated total (old 399); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "service/operational_matrix.py",
+      "old_budget": 70,
+      "new_budget": 87,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows service/operational_matrix.py: retained behavior from both sides ratcheted at the integrated total (old 70); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "service/provider_recovery.py",
+      "old_budget": 422,
+      "new_budget": 482,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows service/provider_recovery.py: retained behavior from both sides ratcheted at the integrated total (old 422), then widened again by the qualification-phase provider sibling-attempt and raw-pending-outcome liability contracts required by the retry/billing recovery review; retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "service/reasoning_components.py",
+      "old_budget": 221,
+      "new_budget": 222,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows service/reasoning_components.py: retained behavior from both sides ratcheted at the integrated total (old 221); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "service/self_host.py",
+      "old_budget": 308,
+      "new_budget": 442,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows service/self_host.py: retained behavior from both sides ratcheted at the integrated total (old 308); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "service/stop_sequence.py",
+      "old_budget": 225,
+      "new_budget": 227,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows service/stop_sequence.py: retained behavior from both sides ratcheted at the integrated total (old 225); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "service/task_api.py",
+      "old_budget": 391,
+      "new_budget": 415,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows service/task_api.py: retained behavior from both sides ratcheted at the integrated total (old 391); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "service/task_intake.py",
+      "old_budget": 343,
+      "new_budget": 353,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows service/task_intake.py: retained behavior from both sides ratcheted at the integrated total (old 343); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "shadow/commit_mechanisms.py",
+      "old_budget": 415,
+      "new_budget": 417,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows shadow/commit_mechanisms.py: retained behavior from both sides ratcheted at the integrated total (old 415); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "skills/candidates.py",
+      "old_budget": 335,
+      "new_budget": 474,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows skills/candidates.py: retained behavior from both sides ratcheted at the integrated total (old 335); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "skills/lifecycle.py",
+      "old_budget": 600,
+      "new_budget": 744,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows skills/lifecycle.py: retained behavior from both sides ratcheted at the integrated total (old 600); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "skills/loader.py",
+      "old_budget": 332,
+      "new_budget": 409,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows skills/loader.py: retained behavior from both sides ratcheted at the integrated total (old 332); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "skills/models.py",
+      "old_budget": 96,
+      "new_budget": 130,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows skills/models.py: retained behavior from both sides ratcheted at the integrated total (old 96); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "skills/selector.py",
+      "old_budget": 93,
+      "new_budget": 406,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows skills/selector.py: retained behavior from both sides ratcheted at the integrated total (old 93); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "skills/validator.py",
+      "old_budget": 106,
+      "new_budget": 108,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows skills/validator.py: retained behavior from both sides ratcheted at the integrated total (old 106); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "state/model_responses.py",
+      "old_budget": 817,
+      "new_budget": 834,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows state/model_responses.py: retained behavior from both sides ratcheted at the integrated total (old 817); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "state/self_host.py",
+      "old_budget": 163,
+      "new_budget": 176,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows state/self_host.py: retained behavior from both sides ratcheted at the integrated total (old 163); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "strategy.py",
+      "old_budget": 1150,
+      "new_budget": 1299,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows strategy.py: retained behavior from both sides ratcheted at the integrated total (old 1150); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "synthesis/engine.py",
+      "old_budget": 890,
+      "new_budget": 909,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows synthesis/engine.py: retained behavior from both sides ratcheted at the integrated total (old 890); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "synthesis/helpers.py",
+      "old_budget": 577,
+      "new_budget": 638,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows synthesis/helpers.py: retained behavior from both sides ratcheted at the integrated total (old 577); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "synthesis/models.py",
+      "old_budget": 133,
+      "new_budget": 150,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows synthesis/models.py: retained behavior from both sides ratcheted at the integrated total (old 133); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "synthesis/promotion.py",
+      "old_budget": 435,
+      "new_budget": 467,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows synthesis/promotion.py: retained behavior from both sides ratcheted at the integrated total (old 435); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "synthesis/proof_corpus.py",
+      "old_budget": 114,
+      "new_budget": 115,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows synthesis/proof_corpus.py: retained behavior from both sides ratcheted at the integrated total (old 114); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "synthesis/proof_ledger.py",
+      "old_budget": 307,
+      "new_budget": 339,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows synthesis/proof_ledger.py: retained behavior from both sides ratcheted at the integrated total (old 307); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "synthesis/runtime.py",
+      "old_budget": 301,
+      "new_budget": 339,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows synthesis/runtime.py: retained behavior from both sides ratcheted at the integrated total (old 301); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "synthesis/verifier.py",
+      "old_budget": 43,
+      "new_budget": 73,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows synthesis/verifier.py: retained behavior from both sides ratcheted at the integrated total (old 43); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "tasks/budgets.py",
+      "old_budget": 1068,
+      "new_budget": 1177,
+      "rationale": "Integration of main's service/runtime hardening with PR 6 ports decomposition grows tasks/budgets.py: retained behavior from both sides ratcheted at the integrated total (old 1068); retire by decomposition."
+    },
+    {
+      "family": "python",
+      "path": "state/runtime_sessions.py",
+      "old_budget": 223,
+      "new_budget": 287,
+      "rationale": "RuntimeSessionStore.start gains durable reincarnation of dead rows after service restart: the deterministic session id (runtime_task) collided with the recovery-marked dead row, dropping the recovery record (UNIQUE violation swallowed; with durability_mandatory the new incarnation failed to persist). Identity checks (task/backed/runtime/cwd/workspace/network-policy) and merged metadata add ~64 lines; retire by extracting session identity validation into a dedicated module."
+    }
+  ]
+}

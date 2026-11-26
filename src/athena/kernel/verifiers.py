@@ -16,6 +16,7 @@ from dataclasses import replace
 from typing import Any, Protocol
 
 from athena.protocol.messages import TextBlock
+from athena.concurrency.autonomy import resolve_autonomy_value
 from athena.protocol.capabilities import CapabilityRequest, CapabilityRequestOrigin
 from athena.protocol.tasks import (
     Criterion,
@@ -26,7 +27,7 @@ from athena.protocol.tasks import (
     NetworkPolicy,
     PathRule,
 )
-from athena.causal.checkpoint import _run_worker as _run_checkpoint_worker
+from athena.causal.checkpoint import run_checkpoint_worker
 from athena.verification.identity import verification_proof_id
 
 _logger = logging.getLogger("athena.verifier")
@@ -86,7 +87,7 @@ class _CommandVerifier:
             result = await self._dispatcher.dispatch(
                 request,
                 workspace=task.workspace,
-                profile=(task.metadata or {}).get("autonomy"),
+                profile=resolve_autonomy_value((task.metadata or {}).get("autonomy")),
                 task_policy=task.capability_policy,
                 verification_environment=verification_environment,
             )
@@ -95,7 +96,7 @@ class _CommandVerifier:
             if not hasattr(result, "status"):
                 return False
             return result.status.value == "ok"
-        except Exception as exc:
+        except Exception as exc:  # rationale: boundary converts subordinate failure into observable recovery/fallback
             _logger.warning("command verifier failed: %s", exc)
             return False
 
@@ -153,7 +154,7 @@ class _FileVerifier:
                         return False
                     with open(real, "r", encoding="utf-8", errors="replace") as f:
                         return needle in f.read()
-            except Exception as exc:
+            except Exception as exc:  # rationale: boundary converts subordinate failure into observable recovery/fallback
                 _logger.warning("file verifier predicate failed: %s", exc)
                 return False
         return os.path.exists(real)
@@ -167,13 +168,13 @@ class _FileVerifier:
                     task_id=task.id,
                     session_id=task.session_id,
                     call_id=f"file_verify_{task.id}_{id(spec)}",
-                    origin=CapabilityRequestOrigin.SYSTEM,
+                    origin=CapabilityRequestOrigin.SYSTEM_VERIFICATION,
                 ),
                 workspace=task.workspace,
-                profile=(task.metadata or {}).get("autonomy"),
+                profile=resolve_autonomy_value((task.metadata or {}).get("autonomy")),
                 task_policy=task.capability_policy,
             )
-        except Exception as exc:
+        except Exception as exc:  # rationale: boundary converts subordinate failure into observable recovery/fallback
             _logger.warning("file verifier dispatch failed: %s", exc)
             return False
         if result.status.value != "ok":
@@ -198,10 +199,10 @@ class _FileVerifier:
                     task_id=task.id,
                     session_id=task.session_id,
                     call_id=f"file_verify_read_{task.id}_{id(spec)}",
-                    origin=CapabilityRequestOrigin.SYSTEM,
+                    origin=CapabilityRequestOrigin.SYSTEM_VERIFICATION,
                 ),
                 workspace=task.workspace,
-                profile=(task.metadata or {}).get("autonomy"),
+                profile=resolve_autonomy_value((task.metadata or {}).get("autonomy")),
                 task_policy=task.capability_policy,
             )
             if read.status.value != "ok":
@@ -231,7 +232,7 @@ class _ArtifactPredicateVerifier:
                 if ref.hash == ref_str or ref.uri == ref_str:
                     return True
             return False
-        except Exception as exc:
+        except Exception as exc:  # rationale: boundary converts subordinate failure into observable recovery/fallback
             _logger.warning("artifact predicate verifier failed: %s", exc)
             return False
 
@@ -255,7 +256,7 @@ class _CapabilityCheckVerifier:
                 project_id=metadata.get("project_id"),
                 user_id=metadata.get("user_id"),
             )
-        except Exception:
+        except Exception:  # rationale: availability fallback fails closed to unavailable
             return False
 
 
@@ -297,7 +298,7 @@ class _ModelJudgmentVerifier:
                     artifacts = provided.get("artifacts", artifacts)
                     unresolved = provided.get("unresolved_failures", unresolved)
                     world_state = provided.get("world_state", world_state)
-            except Exception as exc:
+            except Exception as exc:  # rationale: boundary converts subordinate failure into observable recovery/fallback
                 _logger.warning("model judgment: evidence collection failed: %s", exc)
         prompt = (
             f"Task objective: {task.objective}\n\n"
@@ -325,7 +326,7 @@ class _ModelJudgmentVerifier:
             ]
             answer = " ".join(text_parts).strip().upper()
             return answer.startswith("YES")
-        except Exception as exc:
+        except Exception as exc:  # rationale: boundary converts subordinate failure into observable recovery/fallback
             _logger.warning("model judgment: inference failed: %s", exc)
             return self._trusted
 
@@ -393,6 +394,16 @@ class CompositeVerifier:
                 # task environment. Generic callers must not turn a record in
                 # task metadata into a mount grant.
                 verification_environment = None
+        # The candidate verifier explicitly binds its disposable clone to the
+        # exact verified branch. Creating another throwaway view here would
+        # escape the active reality boundary, so only generic callers get the
+        # protected command-probe view.
+        if getattr(task.workspace, "execution_backend", None) in {"shadow", "verification"}:
+            return await self._verify_in_view(
+                task,
+                criteria,
+                verification_environment=verification_environment,
+            )
         async with _verification_view(
             task, enabled=self._command._dispatcher is not None
         ) as view_task:
@@ -501,7 +512,7 @@ async def _verification_manifest(workspace: Any) -> dict[str, str]:
     if workspace is None or not os.path.isdir(workspace.root):
         return {}
     try:
-        result = await _run_checkpoint_worker(
+        result = await run_checkpoint_worker(
             "manifest",
             root=workspace.root,
             workspace_root=workspace.root,
@@ -548,7 +559,7 @@ async def _verification_view(task: TaskSpec, *, enabled: bool):
     parent = tempfile.mkdtemp(prefix="athena-verify-")
     view_root = os.path.join(parent, "workspace")
     try:
-        await _run_checkpoint_worker(
+        await run_checkpoint_worker(
             "clone",
             root=parent,
             checkpoint_id="workspace",
@@ -567,7 +578,7 @@ async def _verification_view(task: TaskSpec, *, enabled: bool):
         yield replace(task, workspace=view)
     finally:
         try:
-            await _run_checkpoint_worker(
+            await run_checkpoint_worker(
                 "delete",
                 root=parent,
                 checkpoint_id="workspace",

@@ -6,11 +6,13 @@ EXECUTE for trigger.
 """
 
 from __future__ import annotations
+from athena.capabilities.operations import native_descriptor
 
 import json
 
 from athena.protocol.capabilities import (
-    CapabilityDescriptor,
+    CapabilityFailure,
+    CapabilityFailureCode,
     CapabilityOrigin,
     CapabilityRequest,
     CapabilityResult,
@@ -37,7 +39,7 @@ _INPUT_SCHEMA = {
 
 
 class SkillsCapability:
-    descriptor = CapabilityDescriptor(
+    descriptor = native_descriptor(
         id="skills",
         description=(
             "Skills: search the installed skill library, or trigger a skill by "
@@ -51,6 +53,11 @@ class SkillsCapability:
 
     def __init__(self, skills_store=None) -> None:
         self.skills_store = skills_store
+        self._events = None
+
+    def bind_events(self, events) -> None:
+        """Bind durable usage evidence without changing lifecycle authority."""
+        self._events = events
 
     async def invoke(
         self, request: CapabilityRequest, *, context=None, **kwargs
@@ -62,11 +69,10 @@ class SkillsCapability:
         op = args.get("operation", "search")
         call_id = request.call_id or new_id("call")
         if self.skills_store is None:
-            return CapabilityResult(
-                call_id,
-                request.capability_id,
-                CapabilityResultStatus.FAILED,
-                error="skills store not available",
+            return _failed(
+                request,
+                "skills store not available",
+                CapabilityFailureCode.DEPENDENCY_UNAVAILABLE,
             )
         if op in ("search", "select"):
             query = str(args.get("query") or "")
@@ -83,18 +89,44 @@ class SkillsCapability:
                 arguments=args.get("arguments") or {},
                 task_id=request.task_id,
             )
+            record = _skill_record(outcome)
+            if self._events is not None:
+                await self._events.append_event(
+                    "SkillApplied",
+                    {
+                        "skill_id": record.get("id", ""),
+                        "version": record.get("version", 1),
+                        "arguments": dict(args.get("arguments") or {}),
+                    },
+                    task_id=request.task_id,
+                )
             return CapabilityResult(
                 call_id,
                 request.capability_id,
                 CapabilityResultStatus.OK,
-                output=json.dumps(_skill_record(outcome), sort_keys=True),
+                output=json.dumps(record, sort_keys=True),
             )
-        return CapabilityResult(
-            call_id,
-            request.capability_id,
-            CapabilityResultStatus.FAILED,
-            error=f"unknown operation: {op}",
+        return _failed(
+            request,
+            f"unknown operation: {op}",
+            CapabilityFailureCode.UNSUPPORTED_OPERATION,
         )
+
+    def _conformance_failure_probe(self) -> dict:
+        """Return typed failure metadata for the generic conformance suite."""
+        failure = CapabilityFailure(
+            code=CapabilityFailureCode.UNSUPPORTED_OPERATION,
+            detail="conformance probe",
+            stage="invoke",
+        )
+        return failure.to_metadata()
+
+
+def _failed(request: CapabilityRequest, msg: str, code: CapabilityFailureCode) -> CapabilityResult:
+    return CapabilityResult.failure(
+        request,
+        CapabilityFailure(code=code, detail=msg, stage="invoke"),
+    )
 
 
 def _skill_record(skill) -> dict:

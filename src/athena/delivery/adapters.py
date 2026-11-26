@@ -170,10 +170,10 @@ class WebhookAdapter:
             return DeliveryOutcome(
                 ok=False, status=FAILED, error="webhook delivery requires a destination URL"
             )
-        from athena.capabilities.environment import _run_external_http_request
+        from athena.capabilities.environment import run_external_http_request
 
         destination = str(spec.destination)
-        runner = self._http_runner or _run_external_http_request
+        runner = self._http_runner or run_external_http_request
         capability_id = f"delivery.{self.channel}"
         request_digest = _delivery_digest(spec, result)
         idempotency_key = f"delivery:{result.task_id}:{request_digest[:24]}"

@@ -1,69 +1,35 @@
 """ModelRouter — policy-driven provider/model selection (BUILDSPEC 26-27, BHV-034..038).
 
-Selection is a pure function over declared ``ModelInfo``; the router holds NO
-provider knowledge (INV-006). Capability filtering (BHV-034), provider
-neutrality (BHV-035), privacy/offline discipline (BHV-037/038) and cost are
-evaluated here. Fallback is deterministic and inspectable — it never silently
-crosses a privacy, locality, or cost boundary that policy has not authorized.
+The router orchestrates normalized inventory, hard admission, and deterministic
+ranking; it holds NO provider-specific knowledge (INV-006). Capability
+filtering (BHV-034), provider neutrality (BHV-035), privacy/offline discipline
+(BHV-037/038), and cost remain explicit gates before ranking.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 import time
 from typing import Any, Protocol
 
+from athena.models.admission import (
+    CAP_AUDIO_INPUT,
+    CAP_AUDIO_OUTPUT,
+    CAP_REASONING,
+    CAP_STREAMING,
+    CAP_STRUCTURED,
+    CAP_TOOLS,
+    CAP_VISION,
+    ModelAdmission,
+)
+from athena.models.inventory import EffectiveModelDescriptor
+from athena.models.ranking import ModelRanking
 from athena.protocol.errors import ModelUnavailable, ProviderUnavailable
-from athena.protocol.models import ModelInfo, ModelQualityTier, PrivacyClass
+from athena.protocol.models import ModelInfo, ModelQualityTier, ModelRequirements
 from athena.protocol.tasks import ModelPolicy
 
-CAP_TOOLS = "tools"
-CAP_VISION = "vision"
-CAP_AUDIO_INPUT = "audio_input"
-CAP_AUDIO_OUTPUT = "audio_output"
-CAP_REASONING = "reasoning"
-CAP_STRUCTURED = "structured"
-CAP_STREAMING = "streaming"
-
-_CAPABILITY_FIELD: dict[str, str] = {
-    CAP_TOOLS: "tool_calling",
-    CAP_VISION: "vision",
-    CAP_AUDIO_INPUT: "audio_input",
-    CAP_AUDIO_OUTPUT: "audio_output",
-    CAP_REASONING: "reasoning",
-    CAP_STRUCTURED: "structured_output",
-    CAP_STREAMING: "streaming",
-}
-
-_OFFLINE_PRIVACY = frozenset({"local", "offline"})
 _NO_MODELS = ("__athena_no_model_intersection__",)
-
-_PRIVACY_RANK: dict[PrivacyClass, int] = {
-    PrivacyClass.LOCAL: 0,
-    PrivacyClass.UNKNOWN: 1,
-    PrivacyClass.HYBRID: 2,
-    PrivacyClass.REMOTE: 3,
-}
-
-_LATENCY_CLASS_RANK = {"fast": 0, "medium": 1, "slow": 2}
-_ROUTING_PREFERENCES = frozenset({"balanced", "latency", "cost"})
-_UNKNOWN_CONTEXT_FLOOR = 16_384
-_UNKNOWN_OUTPUT_FLOOR = 4_096
-
-
-@dataclass(frozen=True)
-class ModelRequirements:
-    """Declarative selection requirements (BUILDSPEC 27). All optional."""
-
-    required_capabilities: frozenset[str] = frozenset()
-    minimum_context_tokens: int | None = None
-    max_output_tokens: int | None = None
-    needs_tools: bool = False
-    vision: bool = False
-    audio: bool = False
-    reasoning: bool = False
-    reserved_output: int = 0
 
 
 @dataclass(frozen=True)
@@ -72,6 +38,7 @@ class ModelSelection:
     model: str
     info: ModelInfo
     rationale: tuple[str, ...] = ()
+    effective: EffectiveModelDescriptor | None = None
 
     def __str__(self) -> str:
         return f"{self.provider}/{self.model}"
@@ -82,35 +49,11 @@ class ModelSource(Protocol):
 
     async def list_models(self) -> Sequence[ModelInfo]: ...
 
+    async def list_effective_models(self) -> Sequence[EffectiveModelDescriptor]: ...
+
     def provider_for(self, provider_name: str) -> object: ...
 
     def readiness(self) -> Mapping[str, object]: ...
-
-
-def _privacy_rank(cls: PrivacyClass) -> int:
-    return _PRIVACY_RANK.get(cls, _PRIVACY_RANK[PrivacyClass.UNKNOWN])
-
-
-def _cost_sort_key(info: ModelInfo) -> tuple[int, float]:
-    """Sort known-free before known-paid before unknown pricing.
-
-    Missing rate cards are uncertainty, not a zero-dollar offer.
-    """
-    cost = info.cost
-    if (
-        cost is None
-        or cost.currency.upper() != "USD"
-        or cost.per_1m_input is None
-        or cost.per_1m_output is None
-    ):
-        return (2, float("inf"))
-    total = float(cost.per_1m_input) + float(cost.per_1m_output)
-    return (0 if total == 0 else 1, total)
-
-
-def _declared_latency_rank(info: ModelInfo) -> int:
-    """Return a conservative cold-start latency prior for a model."""
-    return _LATENCY_CLASS_RANK.get(str(info.latency_class or "medium").casefold(), 1)
 
 
 class ModelRouter:
@@ -133,6 +76,8 @@ class ModelRouter:
         self._registry = registry
         self._role_policies: dict[str, ModelPolicy] = dict(role_policies or {})
         self._usage_provider = usage_provider
+        self._admission = ModelAdmission()
+        self._ranking = ModelRanking()
         self._stats_cache: (
             tuple[float, dict[tuple[str, str, str], tuple[int, int, float]]] | None
         ) = None
@@ -206,66 +151,68 @@ class ModelRouter:
     ) -> ModelSelection:
         policy = self._resolve_policy(policy or ModelPolicy())
         requirements = requirements or ModelRequirements()
-        models = list(await self._registry.list_models())
+        models = list(await self._effective_models())
 
         if not models:
             raise ProviderUnavailable("no model providers registered")
         ready_providers = self._ready_provider_names()
-
-        offline = policy.privacy in _OFFLINE_PRIVACY
-        allowed = tuple(policy.allowed or ())
-        privacy_gate = self._privacy_gate(policy)
-
-        candidates: list[ModelInfo] = []
-        for info in models:
-            # Exclusion is model-granular (task #12): a bare provider name
-            # excludes that provider entirely (legacy/whole-provider ban), while
-            # a ``(provider, model)`` pair excludes only that specific model so
-            # healthy sibling models on the same provider survive a retry.
-            if info.provider in exclude or (info.provider, info.id) in exclude:
-                continue
-            if ready_providers is not None and info.provider not in ready_providers:
-                continue
-            if allowed and not self._is_allowed(info, allowed):
-                continue
-            if not self._meets_cap(info, policy, requirements):
-                continue
-            if not self._meets_capacity(info, requirements):
-                continue
-            if not self._meets_cost(info, policy, requirements):
-                continue
-            if not privacy_gate(info):
-                continue
-            if not self._meets_quality_floor(info, policy):
-                continue
-            candidates.append(info)
-
-        if not candidates:
+        admission = self._admission.admit(
+            models,
+            policy=policy,
+            requirements=requirements,
+            ready_providers=ready_providers,
+            exclude=exclude,
+        )
+        if not admission.eligible:
+            grouped = admission.by_reason()
+            details = "; ".join(
+                f"{reason} ({len(items)} candidate{'s' if len(items) != 1 else ''})"
+                for reason, items in grouped.items()
+            )
+            capacity = next(iter(grouped.get("capacity", ())), None)
+            capacity_detail = (
+                f" required_context={requirements.minimum_context_window_tokens} "
+                f"provider={capacity.provider} model={capacity.model} ({capacity.detail})"
+                if capacity
+                else ""
+            )
+            allowed = tuple(policy.allowed or ())
+            offline = str(policy.privacy).lower() in {"local", "offline"}
             raise ModelUnavailable(
-                "no model satisfies policy "
+                f"no eligible model: {len(models)} candidates rejected — {details}. "
                 f"(allowed={list(allowed)}, privacy={policy.privacy}, "
-                f"offline={offline})"
+                f"offline={offline},{capacity_detail})",
+                rejections=tuple(item.to_dict() for item in admission.rejected),
             )
 
         stats = await self._historical_stats(policy.role)
-        history_used = any((info.provider, info.id, policy.role) in stats for info in candidates)
-        best = min(
+        candidates = admission.eligible
+        history_used = any(
+            (descriptor.provider, descriptor.model, policy.role) in stats
+            for descriptor in candidates
+        )
+        best = self._ranking.choose(
             candidates,
-            key=lambda info: self._selection_key(
-                info, stats, policy.role, policy.routing_preference
-            ),
+            stats=stats,
+            role=policy.role,
+            routing_preference=policy.routing_preference,
         )
         return ModelSelection(
             provider=best.provider,
-            model=best.id,
-            info=best,
-            rationale=self._rationale(
-                best,
-                policy,
-                requirements,
+            model=best.model,
+            info=best.info,
+            rationale=self._ranking.rationale(
+                best.info,
+                policy=policy,
+                requirements=requirements,
                 history_used=history_used,
             ),
+            effective=best,
         )
+
+    async def _effective_models(self) -> Sequence[EffectiveModelDescriptor]:
+        """Read the normalized inventory without creating a second authority."""
+        return tuple(await self._registry.list_effective_models())
 
     def _ready_provider_names(self) -> set[str] | None:
         """Return provider names currently admitted for model selection.
@@ -337,171 +284,6 @@ class ModelRouter:
             )
         self._stats_cache = (now, stats)
         return {key: value for key, value in stats.items() if key[2] == role}
-
-    @staticmethod
-    def _selection_key(
-        info: ModelInfo,
-        stats: Mapping[tuple[str, str, str], tuple[int, int, float]],
-        role: str,
-        routing_preference: str = "balanced",
-    ) -> tuple:
-        attempts, successes, total_latency = stats.get((info.provider, info.id, role), (0, 0, 0.0))
-        # Use a small conservative prior (three successes, one failure).
-        # One transient failure therefore influences routing without making a
-        # previously viable provider permanently lose the role.
-        reliability_penalty = (attempts - successes + 1) / (attempts + 4) if attempts else 0.25
-        # Measured latency wins once a role has telemetry.  Before that, use
-        # the provider's declared class so a cold router does not select a
-        # known slow model merely because it has no history yet.
-        latency_observed = 0 if attempts else 1
-        latency_value = total_latency / attempts if attempts else _declared_latency_rank(info)
-        preference = str(routing_preference or "balanced").casefold()
-        if preference not in _ROUTING_PREFERENCES:
-            preference = "balanced"
-        operational: tuple[Any, ...]
-        if preference == "cost":
-            cost_class, cost_value = _cost_sort_key(info)
-            operational = (cost_class, cost_value, latency_observed, latency_value)
-        elif preference == "latency":
-            operational = (
-                latency_observed,
-                latency_value,
-                *_cost_sort_key(info),
-            )
-        else:
-            # Balanced keeps observed reliability first, then avoids a cold
-            # route to a declared slow model before using cost as a tie-break.
-            operational = (
-                latency_observed,
-                latency_value,
-                *_cost_sort_key(info),
-            )
-        return (
-            _privacy_rank(info.privacy_class),
-            reliability_penalty,
-            *operational,
-            f"{info.provider}/{info.id}",
-        )
-
-    def _privacy_gate(self, policy: ModelPolicy) -> Callable[[ModelInfo], bool]:
-        if str(policy.privacy).lower() in _OFFLINE_PRIVACY | {"local"}:
-            return lambda info: info.privacy_class is PrivacyClass.LOCAL
-        return lambda info: True
-
-    def _is_allowed(self, info: ModelInfo, allowed: tuple[str, ...]) -> bool:
-        return info.id in allowed or f"{info.provider}/{info.id}" in allowed
-
-    def _meets_cap(
-        self, info: ModelInfo, policy: ModelPolicy, requirements: ModelRequirements
-    ) -> bool:
-        for cap in requirements.required_capabilities:
-            attr = _CAPABILITY_FIELD.get(cap)
-            if attr is not None and not getattr(info, attr, False):
-                return False
-        return not (policy.require_tools and not info.tool_calling)
-
-    def _meets_capacity(self, info: ModelInfo, requirements: ModelRequirements) -> bool:
-        if requirements.minimum_context_tokens is not None:
-            limit = info.context_limit
-            if limit is None and requirements.minimum_context_tokens > _UNKNOWN_CONTEXT_FLOOR:
-                return False
-            if limit is not None and limit < requirements.minimum_context_tokens:
-                return False
-        if requirements.max_output_tokens is not None:
-            cap = info.max_output_tokens
-            if cap is None and requirements.max_output_tokens > _UNKNOWN_OUTPUT_FLOOR:
-                return False
-            if cap is not None and cap < requirements.max_output_tokens:
-                return False
-        return True
-
-    def _meets_quality_floor(self, info: ModelInfo, policy: ModelPolicy) -> bool:
-        """Quality-floor filter (P1-16).
-
-        Excludes only models that DECLARE a tier below the policy floor.
-        ``UNDECLARED`` survives every floor — the metadata is advisory and
-        a model cannot be held to a standard it never declared — so a
-        deployment without tier declarations routes exactly as before.
-        """
-        raw = getattr(policy, "min_quality_tier", None)
-        require_declared = bool(getattr(policy, "require_declared_quality", False))
-        if not raw and not require_declared:
-            return True
-        if not raw:
-            tier = getattr(info, "quality_tier", ModelQualityTier.UNDECLARED)
-            if isinstance(tier, str):
-                try:
-                    tier = ModelQualityTier(tier)
-                except ValueError:
-                    return not require_declared
-            return tier is not ModelQualityTier.UNDECLARED
-        try:
-            floor = ModelQualityTier(str(raw))
-        except ValueError:
-            return True  # invalid declarations are ignored, never widened
-        tier = getattr(info, "quality_tier", ModelQualityTier.UNDECLARED)
-        if isinstance(tier, str):
-            try:
-                tier = ModelQualityTier(tier)
-            except ValueError:
-                return True
-        if tier is ModelQualityTier.UNDECLARED:
-            return not require_declared
-        return tier.rank >= floor.rank
-
-    def _meets_cost(
-        self, info: ModelInfo, policy: ModelPolicy, requirements: ModelRequirements
-    ) -> bool:
-        if policy.max_cost_usd is None:
-            return True
-        cost = info.cost
-        if cost is None:
-            # Under a strict cost ceiling, unknown pricing is NOT equivalent to free.
-            # Treat as unavailable if the policy has a max_cost_usd constraint.
-            return False
-        if (
-            cost.currency.upper() != "USD"
-            or cost.per_1m_input is None
-            or cost.per_1m_output is None
-        ):
-            # A partial rate card, or a currency we cannot compare to the USD
-            # policy ceiling, is unknown rather than free.
-            return False
-        # The inference broker performs the authoritative check against the
-        # compiled request. This early filter only rejects a route when the
-        # caller supplied bounded compiled-token requirements; it must not
-        # invent a generic 10k/4k estimate and reject a valid small request.
-        input_tokens = max(int(requirements.minimum_context_tokens or 0), 0)
-        output_tokens = max(
-            int(requirements.max_output_tokens or requirements.reserved_output or 0), 0
-        )
-        if not input_tokens and not output_tokens:
-            return True
-        estimate = (
-            cost.per_1m_input * input_tokens + cost.per_1m_output * output_tokens
-        ) / 1_000_000
-        return estimate <= float(policy.max_cost_usd)
-
-    def _rationale(
-        self,
-        best: ModelInfo,
-        policy: ModelPolicy,
-        requirements: ModelRequirements,
-        *,
-        history_used: bool = False,
-    ) -> tuple[str, ...]:
-        parts = [f"model={best.id}", f"provider={best.provider}"]
-        if policy.privacy:
-            parts.append(f"privacy={best.privacy_class.value}")
-        floor = getattr(policy, "min_quality_tier", None)
-        if floor:
-            parts.append(f"quality_floor={floor}")
-        if requirements.required_capabilities:
-            parts.append("caps=" + ",".join(sorted(requirements.required_capabilities)))
-        if history_used:
-            parts.append("history=rolling_attempts")
-        parts.append(f"preference={policy.routing_preference}")
-        return tuple(parts)
 
 
 __all__ = [

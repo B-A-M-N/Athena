@@ -12,21 +12,19 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from athena.kernel.termination import TerminationDecision, result_qualifies_as_work_evidence
+from athena.evidence import result_qualifies_as_work_evidence
+from athena.kernel.termination import TerminationDecision
 from athena.protocol.artifacts import ArtifactRef
 from athena.protocol.messages import ArtifactRefBlock, CapabilityResultBlock
 from athena.protocol.models import ModelResponse
 from athena.protocol.tasks import TaskResult, TaskSpec, TaskStatus, UsageSummary
 
 
-def _mod():
-    from athena.kernel import kernel as m
-
-    return m
+from athena.kernel.messages import assistant_message, results_message as _base_results_message
 
 
 def _assistant_message(task, response):
-    return _mod()._assistant_message(task, response)
+    return assistant_message(task, response)
 
 
 def _results_message(task, blocks):
@@ -64,7 +62,7 @@ def _results_message(task, blocks):
                 ),
             )
         )
-    return _mod()._results_message(task, expanded)
+    return _base_results_message(task, expanded)
 
 
 if TYPE_CHECKING:

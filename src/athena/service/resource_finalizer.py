@@ -12,6 +12,7 @@ from typing import Any
 from athena.protocol.events import EV, make_event
 from athena.protocol.resources import TaskResourceCloseResult
 from athena.protocol.tasks import FINAL_STATUSES, TaskStatus
+from athena.service.resource_finalizer_ports import ResourceFinalizerPorts
 
 _logger = logging.getLogger("athena.service.resources")
 
@@ -209,8 +210,8 @@ class TaskResourceFinalizer:
             self._parked_release_tasks.pop(task_id, None)
 
     def bind_service(self, service: Any) -> None:
-        self._service = service
-        self._checkpoint_manager = getattr(service, "_checkpoints", None)
+        self._ports = ResourceFinalizerPorts(service)
+        self._checkpoint_manager = self._ports.checkpoints
 
     def bind_checkpoint_manager(self, manager: Any) -> None:
         self._checkpoint_manager = manager
@@ -219,8 +220,8 @@ class TaskResourceFinalizer:
         """Make resource release part of the durable resume contract."""
         if not outcome.get("released"):
             return
-        service = getattr(self, "_service", None)
-        task_store = getattr(service, "_store_tasks", None)
+        ports = getattr(self, "_ports", None)
+        task_store = getattr(ports, "store_tasks", None)
         persist = getattr(task_store, "persist_runtime_recovery_hint", None)
         if not callable(persist):
             return
@@ -251,8 +252,8 @@ class TaskResourceFinalizer:
 
     async def _checkpoint_parked_task(self, task_id: str) -> dict[str, Any] | None:
         manager = self._checkpoint_manager
-        service = getattr(self, "_service", None)
-        task_manager = getattr(service, "_task_manager", None)
+        ports = getattr(self, "_ports", None)
+        task_manager = getattr(ports, "task_manager", None)
         if manager is None or task_manager is None:
             return None
         try:
@@ -363,14 +364,14 @@ class TaskResourceFinalizer:
             "confirmed": False,
         }
         # Every process/session owner is closed through this one boundary.
-        service = getattr(self, "_service", None)
+        ports = getattr(self, "_ports", None)
         resources = (
-            ("debugger", getattr(service, "_debugger", None)),
-            ("terminal", getattr(service, "_terminals", None)),
-            ("browser", getattr(service, "_browser", None)),
-            ("external_delegate", getattr(service, "_external_delegate_manager", None)),
-            ("generated_runtime", getattr(service, "_synthesis", None)),
-            ("execution", getattr(service, "_execution", None)),
+            ("debugger", getattr(ports, "debugger", None)),
+            ("terminal", getattr(ports, "terminals", None)),
+            ("browser", getattr(ports, "browser", None)),
+            ("external_delegate", getattr(ports, "external_delegate_manager", None)),
+            ("generated_runtime", getattr(ports, "synthesis", None)),
+            ("execution", getattr(ports, "execution", None)),
         )
         for name, resource in resources:
             if resource is None:
@@ -412,14 +413,14 @@ class TaskResourceFinalizer:
         return outcome
 
     def _resource_for(self, resource_type: str) -> Any:
-        service = getattr(self, "_service", None)
+        ports = getattr(self, "_ports", None)
         return {
-            "debugger": getattr(service, "_debugger", None),
-            "terminal": getattr(service, "_terminals", None),
-            "browser": getattr(service, "_browser", None),
-            "external_delegate": getattr(service, "_external_delegate_manager", None),
-            "generated_runtime": getattr(service, "_synthesis", None),
-            "execution": getattr(service, "_execution", None),
+            "debugger": getattr(ports, "debugger", None),
+            "terminal": getattr(ports, "terminals", None),
+            "browser": getattr(ports, "browser", None),
+            "external_delegate": getattr(ports, "external_delegate_manager", None),
+            "generated_runtime": getattr(ports, "synthesis", None),
+            "execution": getattr(ports, "execution", None),
         }.get(resource_type)
 
     async def _record_unresolved(
@@ -600,6 +601,3 @@ def _ownership_identity(evidence: dict[str, Any]) -> dict[str, Any]:
             if item.get(field) is not None:
                 identity[field] = item[field]
     return identity
-
-
-__all__ = ["TaskResourceFinalizer", "TaskResourceRetentionPolicy"]

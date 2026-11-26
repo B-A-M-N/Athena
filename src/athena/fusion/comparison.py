@@ -1,0 +1,185 @@
+"""Comparison lifecycle mechanism subordinate to FusionOrchestrator.
+
+Owns how verified alternatives are classified and retained; the orchestrator
+remains the single entrypoint and never delegates authority to this helper.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import asyncio
+import time
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from athena.fusion.orchestrator import FusionOrchestrator
+
+__all__ = ["ComparisonLifecycle"]
+
+
+class ComparisonLifecycle:
+    """Classify candidates and persist exact selection evidence."""
+
+    def __init__(self, orchestrator: "FusionOrchestrator") -> None:
+        self._orchestrator = orchestrator
+
+    async def compare(
+        self,
+        *,
+        task_id: str,
+        proposals: list[list[dict]],
+        invariants: list[dict] | None,
+        profile: str | None,
+        parallel: bool = False,
+        max_parallel: int = 2,
+    ) -> dict[str, Any]:
+        orch = self._orchestrator
+        if len(proposals) < 2:
+            raise ValueError("compare requires at least two proposals")
+        if len(proposals) > 8:
+            raise ValueError("compare accepts at most eight proposals")
+
+        candidates: list[dict[str, Any]] = []
+        comparative_evidence: dict[str, dict] = {}
+
+        def _run(index: int, proposal: list[dict]):
+            if not proposal:
+                return {
+                    "candidate_index": index,
+                    "status": "FAILED",
+                    "verified": False,
+                    "error": "proposal must be non-empty",
+                }
+            return orch.run_experiment(
+                task_id=task_id,
+                proposal=proposal,
+                invariants=invariants,
+                profile=profile,
+                auto_fork_on_failure=False,
+            )
+
+        if parallel and len(proposals) > 1:
+            semaphore = asyncio.Semaphore(max(1, min(int(max_parallel), 4)))
+
+            async def _bounded(index: int, proposal: list[dict]):
+                async with semaphore:
+                    return await _run(index, proposal)
+
+            started = time.monotonic()
+            outcomes = await asyncio.gather(
+                *(_bounded(index, proposal) for index, proposal in enumerate(proposals))
+            )
+            elapsed_ms = round((time.monotonic() - started) * 1000, 3)
+        else:
+            outcomes = [await _run(index, proposal) for index, proposal in enumerate(proposals)]
+            elapsed_ms = None
+
+        for index, _proposal in enumerate(proposals):
+            outcome = outcomes[index]
+            if isinstance(outcome, dict):
+                candidates.append(outcome)
+                continue
+            record = {"candidate_index": index, **dataclasses.asdict(outcome)}
+            branch_id = str(outcome.branch_id or "")
+            evidence = {
+                "verified": bool(outcome.verified),
+                "elapsed_ms": outcome.elapsed_ms,
+                "changed_resource_count": len(outcome.changed_resources),
+                "changed_resources": list(outcome.changed_resources),
+                "verification_checks": len(outcome.verification),
+                "verification_passed": sum(
+                    1 for item in outcome.verification if item.get("passed") is True
+                ),
+                "failure_record": dict(outcome.failure_record),
+            }
+            record["comparative_evidence"] = evidence
+            if branch_id:
+                comparative_evidence[branch_id] = evidence
+            candidates.append(record)
+
+        attempted: list[str] = []
+        verified: list[str] = []
+        failed: list[str] = []
+        certificates: dict[str, dict] = {}
+        for record in candidates:
+            branch_id = str(record.get("branch_id") or "")
+            if not branch_id:
+                continue
+            attempted.append(str(branch_id))
+            if not record.get("verified"):
+                failed.append(str(branch_id))
+                continue
+            branch = orch.shadow.get_branch(str(branch_id))
+            certificate = getattr(branch, "verification_certificate", None)
+            to_record = getattr(certificate, "to_record", None)
+            certificate_record = to_record() if callable(to_record) else dict(certificate or {})
+            if not certificate_record:
+                failed.append(str(branch_id))
+                continue
+            verified.append(str(branch_id))
+            certificates[str(branch_id)] = {
+                "branch_id": branch_id,
+                "certificate_hash": certificate_record.get("certificate_hash"),
+                "certificate_id": certificate_record.get("certificate_id"),
+                "candidate_fingerprint": certificate_record.get("candidate_fingerprint"),
+                "proof_plan_id": certificate_record.get("proof_plan_id"),
+                "record": certificate_record,
+            }
+        comparison = orch.selection_store.create(
+            task_id=task_id,
+            candidate_branch_ids=attempted,
+            verified_branch_ids=verified,
+            verification_certificates=certificates,
+            comparative_evidence=comparative_evidence,
+        )
+        return {
+            "status": "COMPLETED",
+            "task_id": task_id,
+            "candidate_count": len(candidates),
+            "verified_count": len(verified),
+            "candidates": candidates,
+            "comparison_id": comparison.comparison_id,
+            "selection": "kernel_decision_required",
+            "reality_mutated": False,
+            "parallel": bool(parallel),
+            "elapsed_ms": elapsed_ms,
+        }
+
+    async def select_candidate(self, comparison_id: str, branch_id: str) -> dict:
+        orch = self._orchestrator
+        record = orch.selection_store.select(comparison_id, branch_id)
+        branch = orch.shadow.get_branch(branch_id)
+        if branch is None or branch.task_id != record.task_id:
+            raise RuntimeError(
+                f"selection_integrity_error: selected branch {branch_id} is unavailable"
+            )
+        if branch.status != "VERIFIED":
+            raise RuntimeError(
+                f"selection_integrity_error: selected branch {branch_id} is "
+                f"{branch.status}, not VERIFIED"
+            )
+        expected_fingerprint = record.selected_branch_fingerprint
+        if expected_fingerprint:
+            live_certificate = branch.verification_certificate
+            to_record = getattr(live_certificate, "to_record", None)
+            live_record = to_record() if callable(to_record) else dict(live_certificate or {})
+            if live_record.get("candidate_fingerprint") != expected_fingerprint:
+                raise RuntimeError(
+                    "selection_integrity_error: selected branch fingerprint no longer "
+                    "matches the comparison certificate"
+                )
+        discarded: list[dict] = []
+        for rejected_id in record.rejected_branch_ids:
+            rejected = orch.shadow.get_branch(rejected_id)
+            if rejected is not None and rejected.status == "VERIFIED":
+                outcome = await orch.shadow.discard(
+                    rejected, reason=f"lost comparison {comparison_id}"
+                )
+                discarded.append({"branch_id": rejected_id, "status": outcome.get("status")})
+        return {
+            "comparison_id": comparison_id,
+            "selected_branch_id": record.selected_branch_id,
+            "rejected_branch_ids": record.rejected_branch_ids,
+            "discarded": discarded,
+            "lifecycle": record.lifecycle,
+        }
